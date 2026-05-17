@@ -1,0 +1,12 @@
+[package]
+name = "drift-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drift-config = { path = "../drift-config" }
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { workspace = true, features = ["sync", "time"] }
+anyhow.workspace = true

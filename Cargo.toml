@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/drift-config",
+    "crates/drift-llm",
+    "crates/drift-core",
+    "crates/drift-tui",
+    "crates/drift-cli",
+    "crates/drift-tools",
+    "crates/drift-mcp",
+    "crates/drift-plugin",
+    "crates/drift-storage",
+    "crates/drift-security",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+directories = "6"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

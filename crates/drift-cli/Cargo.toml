@@ -1,0 +1,17 @@
+[package]
+name = "drift-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "drift"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+drift-config = { path = "../drift-config" }
+drift-core = { path = "../drift-core" }
+drift-tui = { path = "../drift-tui" }
+anyhow.workspace = true
+tokio.workspace = true

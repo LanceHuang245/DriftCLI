@@ -3,3 +3,8 @@ AGENTS.md
 
 # Dev
 dev-docs/
+.drift
+
+# Rust
+target/
+Cargo.lock

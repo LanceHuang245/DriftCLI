@@ -1,0 +1,15 @@
+[package]
+name = "drift-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drift-config = { path = "../drift-config" }
+drift-llm = { path = "../drift-llm" }
+tokio = { workspace = true, features = ["sync", "macros"] }
+serde.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
