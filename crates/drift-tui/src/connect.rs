@@ -1,19 +1,23 @@
 use drift_config::LlmConfig;
+use drift_llm::ModelInfo;
 
+// Form state for the /connect settings screen. Holds provider, URL, key, model, and list UX state.
 #[derive(Debug, Clone)]
 pub struct ConnectForm {
     pub provider_type: ProviderType,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub selected_field: usize,
     pub show_model_list: bool,
-    pub model_list: Vec<String>,
+    pub model_list: Vec<ModelInfo>,
     pub model_list_index: usize,
     pub fetching_models: bool,
     pub status_message: String,
 }
 
+// Tracks which LLM provider protocol to use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderType {
     Anthropic,
@@ -21,6 +25,7 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    // Human-readable label for the current provider variant.
     fn label(&self) -> &str {
         match self {
             ProviderType::Anthropic => "Anthropic",
@@ -30,17 +35,20 @@ impl ProviderType {
 }
 
 impl ConnectForm {
+    // Build a ConnectForm from an existing LlmConfig, preserving current settings.
     pub fn from_config(config: &LlmConfig) -> Self {
         match config {
             LlmConfig::Anthropic {
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
             } => Self {
                 provider_type: ProviderType::Anthropic,
                 base_url: base_url.clone(),
                 api_key: api_key.clone(),
                 model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
                 selected_field: 0,
                 show_model_list: false,
                 model_list: Vec::new(),
@@ -58,6 +66,7 @@ impl ConnectForm {
                 base_url: base_url.clone(),
                 api_key: api_key.clone(),
                 model: model.clone(),
+                reasoning_effort: None,
                 selected_field: 0,
                 show_model_list: false,
                 model_list: Vec::new(),
@@ -68,15 +77,18 @@ impl ConnectForm {
         }
     }
 
+    // Return the display name of the current provider.
     pub fn provider_label(&self) -> &str {
         self.provider_type.label()
     }
 
+    // Advance selection to the next form field (wrap around).
     pub fn next_field(&mut self) {
         self.selected_field = (self.selected_field + 1) % 6;
         self.show_model_list = false;
     }
 
+    // Move selection to the previous form field (wrap around).
     pub fn previous_field(&mut self) {
         if self.selected_field == 0 {
             self.selected_field = 5;
@@ -86,6 +98,7 @@ impl ConnectForm {
         self.show_model_list = false;
     }
 
+    // Toggle provider type when on the first field with Left arrow.
     pub fn on_left(&mut self) {
         if self.selected_field == 0 {
             self.provider_type = match self.provider_type {
@@ -95,6 +108,7 @@ impl ConnectForm {
         }
     }
 
+    // Toggle provider type when on the first field with Right arrow.
     pub fn on_right(&mut self) {
         if self.selected_field == 0 {
             self.provider_type = match self.provider_type {
@@ -104,6 +118,7 @@ impl ConnectForm {
         }
     }
 
+    // Append a typed character to the currently selected text field.
     pub fn on_char(&mut self, c: char) {
         match self.selected_field {
             1 => self.base_url.push(c),
@@ -113,6 +128,7 @@ impl ConnectForm {
         }
     }
 
+    // Remove the last character from the currently selected text field.
     pub fn on_backspace(&mut self) {
         match self.selected_field {
             1 => {
@@ -128,20 +144,23 @@ impl ConnectForm {
         }
     }
 
+    // Pick the currently highlighted model from the dropdown list.
     pub fn select_model(&mut self) {
         if let Some(selected) = self.model_list.get(self.model_list_index) {
-            self.model = selected.clone();
+            self.model = selected.id.clone();
             self.show_model_list = false;
-            self.status_message = format!("Selected: {}", selected);
+            self.status_message = format!("Selected: {}", selected.id);
         }
     }
 
+    // Convert the form state into a full LlmConfig for reconfiguration.
     pub fn to_llm_config(&self) -> LlmConfig {
         match self.provider_type {
             ProviderType::Anthropic => LlmConfig::Anthropic {
                 api_key: self.api_key.clone(),
                 model: self.model.clone(),
                 base_url: self.base_url.clone(),
+                reasoning_effort: self.reasoning_effort.clone(),
             },
             ProviderType::OpenAiCompatible => LlmConfig::OpenAiCompatible {
                 api_key: self.api_key.clone(),

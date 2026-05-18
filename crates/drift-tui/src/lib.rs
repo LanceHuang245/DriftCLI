@@ -8,6 +8,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use drift_config::LlmConfig;
+use drift_llm::ModelInfo;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position},
     style::{Color, Style},
@@ -18,6 +19,7 @@ use ratatui::{
 use std::io::{self, stdout};
 use tokio::sync::mpsc;
 
+// Events sent from the backend to the TUI via async channel.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Token(String),
@@ -25,9 +27,10 @@ pub enum AppEvent {
     AgentStatus(String),
     Error(String),
     Done,
-    ModelList(Vec<String>),
+    ModelList(Vec<ModelInfo>),
 }
 
+// Commands sent from the TUI to the backend (chat, fetch models, reconfigure).
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
     Chat(String),
@@ -39,26 +42,35 @@ pub enum TuiCommand {
     Reconfigure(LlmConfig),
 }
 
+// Central application state for the DriftCLI TUI.
 pub struct TuiApp {
     messages: Vec<ChatMessage>,
     current_response: String,
     current_reasoning: String,
     input_buffer: String,
+    cursor_position: usize,
     status_text: String,
     model_name: String,
     mode: TuiMode,
     connect_form: connect::ConnectForm,
+    variant_options: Vec<String>,
+    variant_selected: usize,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     cmd_tx: mpsc::UnboundedSender<TuiCommand>,
     should_quit: bool,
+    history: Vec<String>,
+    history_index: Option<usize>,
 }
 
+// Which screen/overlay the TUI is currently displaying.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TuiMode {
     Normal,
     ConnectSettings,
+    VariantPicker,
 }
 
+// A single chat message with optional reasoning/thinking content.
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -67,6 +79,7 @@ pub struct ChatMessage {
 }
 
 impl TuiApp {
+    // Create a new TuiApp from the current LLM config and async channels.
     pub fn new(
         llm_config: &LlmConfig,
         event_rx: mpsc::UnboundedReceiver<AppEvent>,
@@ -81,16 +94,22 @@ impl TuiApp {
             current_response: String::new(),
             current_reasoning: String::new(),
             input_buffer: String::new(),
+            cursor_position: 0,
             status_text: "Idle".into(),
             model_name,
             mode: TuiMode::Normal,
             connect_form: connect::ConnectForm::from_config(llm_config),
+            variant_options: Vec::new(),
+            variant_selected: 0,
             event_rx,
             cmd_tx,
             should_quit: false,
+            history: Vec::new(),
+            history_index: None,
         }
     }
 
+    // Enter raw mode, start the main loop, then restore the terminal on exit.
     pub fn run(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = stdout();
@@ -105,48 +124,103 @@ impl TuiApp {
         result
     }
 
+    // Main event loop: draws the frame, processes async events, and handles key input.
     fn main_loop(
         &mut self,
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
         while !self.should_quit {
+            // Draw the current frame.
             terminal.draw(|f| self.render(f))?;
 
+            // Drain any pending async events from the backend.
             if let Ok(event) = self.event_rx.try_recv() {
                 self.handle_app_event(event);
             }
 
+            // Poll for keyboard input (non-blocking with 16 ms timeout).
             if event::poll(std::time::Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
+                        // Dispatch key based on current TUI mode.
                         match self.mode {
                             TuiMode::Normal => {
-                                let action = input::process_key(key.code, &mut self.input_buffer);
-                                match action {
-                                    input::InputAction::Submit(text) => {
-                                        if !text.trim().is_empty() {
-                                            if text.starts_with('/') {
-                                                self.handle_command(&text);
-                                            } else {
-                                                self.messages.push(ChatMessage {
-                                                    role: "user".into(),
-                                                    content: text.clone(),
-                                                    reasoning: None,
-                                                });
-                                                self.input_buffer.clear();
-                                                self.current_response.clear();
-                                                self.current_reasoning.clear();
-                                                self.status_text = "Waiting...".into();
-                                                let _ = self.cmd_tx.send(TuiCommand::Chat(text));
-                                            }
+                                match key.code {
+                                    // Navigate up through input history.
+                                    KeyCode::Up => {
+                                        if self.history_index.is_none() && !self.input_buffer.is_empty() {
+                                            self.history.push(self.input_buffer.clone());
+                                        }
+                                        if !self.history.is_empty() {
+                                            let idx = self.history_index.map_or(self.history.len(), |i| i);
+                                            let new_idx = idx.saturating_sub(1);
+                                            self.history_index = Some(new_idx);
+                                            self.input_buffer = self.history[new_idx].clone();
+                                            self.cursor_position = self.input_buffer.len();
                                         }
                                     }
-                                    input::InputAction::Quit => self.should_quit = true,
-                                    input::InputAction::ToggleConnectInfo => {}
+                                    // Scroll down through input history.
+                                    KeyCode::Down => {
+                                        if let Some(idx) = self.history_index {
+                                            let new_idx = idx + 1;
+                                            if new_idx >= self.history.len() {
+                                                self.history_index = None;
+                                                self.input_buffer.clear();
+                                            } else {
+                                                self.history_index = Some(new_idx);
+                                                self.input_buffer = self.history[new_idx].clone();
+                                            }
+                                            self.cursor_position = self.input_buffer.len();
+                                        }
+                                    }
+                                    // Reset history position and delegate to normal input processing.
+                                    _ => {
+                                        self.history_index = None;
+                                        let action = input::process_key(
+                                            key.code,
+                                            key.modifiers,
+                                            &mut self.input_buffer,
+                                            &mut self.cursor_position,
+                                        );
+                                        match action {
+                                            // User submitted non-empty text — either a slash command or a chat message.
+                                            input::InputAction::Submit(text) => {
+                                                if !text.trim().is_empty() {
+                                                    if text.starts_with('/') {
+                                                        self.handle_command(&text);
+                                                    } else {
+                                                        // Store in history and send to backend as chat.
+                                                        if self.history.last() != Some(&text) {
+                                                            self.history.push(text.clone());
+                                                        }
+                                                        self.messages.push(ChatMessage {
+                                                            role: "user".into(),
+                                                            content: text.clone(),
+                                                            reasoning: None,
+                                                        });
+                                                        self.current_response.clear();
+                                                        self.current_reasoning.clear();
+                                                        self.status_text = "Waiting...".into();
+                                                        let _ = self.cmd_tx.send(TuiCommand::Chat(text));
+                                                    }
+                                                    self.input_buffer.clear();
+                                                    self.cursor_position = 0;
+                                                }
+                                            }
+                                            // Ctrl+D / Ctrl+C / Esc initiated quit.
+                                            input::InputAction::Quit => self.should_quit = true,
+                                            input::InputAction::ToggleConnectInfo => {}
+                                        }
+                                    }
                                 }
                             }
+                            // Delegate to the connection settings key handler.
                             TuiMode::ConnectSettings => {
                                 self.handle_connect_key(key.code);
+                            }
+                            // Delegate to the variant picker key handler.
+                            TuiMode::VariantPicker => {
+                                self.handle_variant_key(key.code);
                             }
                         }
                     }
@@ -156,19 +230,57 @@ impl TuiApp {
         Ok(())
     }
 
+    // Parse and execute slash commands like /connect, /variant, /clear, /quit.
     fn handle_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         match cmd {
+            // Enter connection settings form.
             "/connect" => {
                 self.mode = TuiMode::ConnectSettings;
             }
+            // Open the variant / reasoning-effort picker for the current model.
+            "/variant" => {
+                let model = &self.connect_form.model;
+                let from_caps: Vec<String> = self
+                    .connect_form
+                    .model_list
+                    .iter()
+                    .find(|m| m.id == *model)
+                    .map(|m| m.effort_levels.clone())
+                    .unwrap_or_default();
+                let mut efforts = vec!["(none)".to_string()];
+                if from_caps.is_empty() {
+                    efforts.extend(
+                        ["low", "medium", "high", "max"]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                } else {
+                    efforts.extend(from_caps);
+                }
+                let current = self.connect_form.reasoning_effort.clone();
+                let selected = if current.is_none() {
+                    0
+                } else {
+                    efforts
+                        .iter()
+                        .position(|e| Some(e) == current.as_ref())
+                        .unwrap_or(0)
+                };
+                self.variant_options = efforts;
+                self.variant_selected = selected;
+                self.mode = TuiMode::VariantPicker;
+            }
+            // Quit the application.
             "/quit" | "/exit" => {
                 self.should_quit = true;
             }
+            // Clear all chat messages and the in-progress response.
             "/clear" => {
                 self.messages.clear();
                 self.current_response.clear();
             }
+            // Unknown command — show a help message.
             _ => {
                 self.messages.push(ChatMessage {
                     role: "system".into(),
@@ -178,16 +290,21 @@ impl TuiApp {
             }
         }
         self.input_buffer.clear();
+        self.cursor_position = 0;
     }
 
+    // Handle key presses while the connect settings form is active.
     fn handle_connect_key(&mut self, key: KeyCode) {
         match key {
+            // Esc returns to normal chat mode.
             KeyCode::Esc => {
                 self.mode = TuiMode::Normal;
             }
+            // Tab moves to the next form field.
             KeyCode::Tab => {
                 self.connect_form.next_field();
             }
+            // Up: scroll model list up, or move to previous form field.
             KeyCode::Up => {
                 if self.connect_form.show_model_list {
                     self.connect_form.model_list_index =
@@ -196,6 +313,7 @@ impl TuiApp {
                     self.connect_form.previous_field();
                 }
             }
+            // Down: scroll model list down, or move to next form field.
             KeyCode::Down => {
                 if self.connect_form.show_model_list {
                     if self.connect_form.model_list_index + 1 < self.connect_form.model_list.len() {
@@ -205,23 +323,29 @@ impl TuiApp {
                     self.connect_form.next_field();
                 }
             }
+            // Left toggles provider type when on the provider field.
             KeyCode::Left => {
                 self.connect_form.on_left();
             }
+            // Right toggles provider type when on the provider field.
             KeyCode::Right => {
                 self.connect_form.on_right();
             }
+            // Type into the currently selected text field.
             KeyCode::Char(c) => {
                 self.connect_form.on_char(c);
             }
+            // Delete last character from the selected text field.
             KeyCode::Backspace => {
                 self.connect_form.on_backspace();
             }
+            // Enter: select from model list, fetch models, save, or cancel.
             KeyCode::Enter => {
                 if self.connect_form.show_model_list && !self.connect_form.model_list.is_empty() {
                     self.connect_form.select_model();
                 } else {
                     match self.connect_form.selected_field {
+                        // Field 3 (model): fetch the model list from the provider.
                         3 => {
                             let provider = self.connect_form.provider_label().to_string();
                             let base_url = self.connect_form.base_url.clone();
@@ -234,9 +358,11 @@ impl TuiApp {
                             self.connect_form.fetching_models = true;
                             self.connect_form.status_message = "Fetching models...".into();
                         }
+                        // Field 4 (save): apply and persist connection settings.
                         4 => {
                             self.save_connect_settings();
                         }
+                        // Field 5 (cancel): return to normal mode without saving.
                         5 => {
                             self.mode = TuiMode::Normal;
                         }
@@ -248,6 +374,50 @@ impl TuiApp {
         }
     }
 
+    // Handle key presses while the variant/reasoning-effort picker is active.
+    fn handle_variant_key(&mut self, key: KeyCode) {
+        match key {
+            // Esc cancels and returns to normal chat mode.
+            KeyCode::Esc => {
+                self.mode = TuiMode::Normal;
+            }
+            // Move selection up through the variant list.
+            KeyCode::Up => {
+                self.variant_selected = self.variant_selected.saturating_sub(1);
+            }
+            // Move selection down through the variant list.
+            KeyCode::Down => {
+                if self.variant_selected + 1 < self.variant_options.len() {
+                    self.variant_selected += 1;
+                }
+            }
+            // Enter confirms the selected effort level, sends reconfigure, and returns to normal mode.
+            KeyCode::Enter => {
+                let level = self
+                    .variant_options
+                    .get(self.variant_selected)
+                    .cloned();
+                let is_none = level.as_deref() == Some("(none)");
+                self.connect_form.reasoning_effort = if is_none { None } else { level.clone() };
+                let config = self.connect_form.to_llm_config();
+                self.model_name = self.connect_form.model.clone();
+                let _ = self.cmd_tx.send(TuiCommand::Reconfigure(config));
+                self.status_text = if is_none {
+                    format!("Reasoning effort cleared for {}", self.model_name)
+                } else {
+                    format!(
+                        "Variant set to {} for {}",
+                        level.unwrap_or_default(),
+                        self.model_name
+                    )
+                };
+                self.mode = TuiMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    // Build the LLM config from the form and send a Reconfigure command.
     fn save_connect_settings(&mut self) {
         let config = self.connect_form.to_llm_config();
         self.model_name = self.connect_form.model.clone();
@@ -261,8 +431,10 @@ impl TuiApp {
         self.mode = TuiMode::Normal;
     }
 
+    // Process an async event from the backend channel.
     fn handle_app_event(&mut self, event: AppEvent) {
         match event {
+            // Streaming response token — append to the in-progress assistant message.
             AppEvent::Token(text) => {
                 self.current_response.push_str(&text);
                 if let Some(last) = self.messages.last_mut() {
@@ -284,12 +456,15 @@ impl TuiApp {
                 }
                 self.status_text = "Generating...".into();
             }
+            // Accumulate reasoning/thinking text (displayed as dim text in response).
             AppEvent::Reasoning(text) => {
                 self.current_reasoning.push_str(&text);
             }
+            // Update the status bar text directly.
             AppEvent::AgentStatus(status) => {
                 self.status_text = status;
             }
+            // Display an error — in connect mode show in form, otherwise as system message.
             AppEvent::Error(msg) => {
                 if self.mode == TuiMode::ConnectSettings {
                     self.connect_form.fetching_models = false;
@@ -303,6 +478,7 @@ impl TuiApp {
                     self.status_text = "Error".into();
                 }
             }
+            // Response streaming complete — attach reasoning and clear buffers.
             AppEvent::Done => {
                 self.status_text = "Idle".into();
                 if !self.current_reasoning.is_empty() {
@@ -315,6 +491,7 @@ impl TuiApp {
                 self.current_response.clear();
                 self.current_reasoning.clear();
             }
+            // Received model list — populate the dropdown in connect mode.
             AppEvent::ModelList(models) => {
                 self.connect_form.model_list = models;
                 self.connect_form.show_model_list = true;
@@ -328,9 +505,11 @@ impl TuiApp {
         }
     }
 
+    // Render the full TUI frame: content area, input line, and status bar.
     fn render(&self, f: &mut ratatui::Frame) {
         let size = f.area();
 
+        // Split the screen into three rows: content, input, status bar.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -340,6 +519,7 @@ impl TuiApp {
             ])
             .split(size);
 
+        // Render the top content area depending on the current mode.
         match self.mode {
             TuiMode::Normal => {
                 self.render_chat_area(chunks[0], f);
@@ -347,16 +527,50 @@ impl TuiApp {
             TuiMode::ConnectSettings => {
                 f.render_widget(self.render_connect_settings(), chunks[0]);
             }
+            TuiMode::VariantPicker => {
+                f.render_widget(self.render_variant_picker(), chunks[0]);
+            }
         }
 
-        let prompt_text = format!("> {}", self.input_buffer);
-        let cursor_abs = self.input_buffer.len() + 2;
-        let cursor_x = (cursor_abs % size.width as usize) as u16;
-        let cursor_y = chunks[1].y;
-        let prompt = Paragraph::new(prompt_text).block(Block::default().borders(Borders::TOP));
-        f.render_widget(prompt, chunks[1]);
+        // Build the input line with cursor highlighting.
+        let mut input_spans = vec![Span::raw("> ")];
+        for (i, ch) in self.input_buffer.char_indices() {
+            if i == self.cursor_position {
+                // Highlight the character at cursor position with inverted colors.
+                input_spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().bg(Color::White).fg(Color::Black),
+                ));
+            } else {
+                input_spans.push(Span::raw(ch.to_string()));
+            }
+        }
+        // If cursor is past end of buffer, show a highlighted space.
+        if self.cursor_position >= self.input_buffer.len() {
+            input_spans.push(Span::styled(
+                " ",
+                Style::default().bg(Color::White).fg(Color::Black),
+            ));
+        }
+
+        // Render the input line widget with a top border.
+        let input_line = Line::from(input_spans);
+        let input_widget = Paragraph::new(input_line).block(Block::default().borders(Borders::TOP));
+        f.render_widget(input_widget, chunks[1]);
+
+        // Calculate cursor position accounting for unicode width and prompt prefix.
+        let before_cursor =
+            &self.input_buffer[..self.cursor_position.min(self.input_buffer.len())];
+        let prompt_width = 2;
+        let visual_before = unicode_width::UnicodeWidthStr::width(before_cursor);
+        let visual_total = prompt_width + visual_before;
+        let inner_width = chunks[1].width as usize;
+
+        let cursor_x = (visual_total % inner_width.max(1)) as u16;
+        let cursor_y = chunks[1].y + 1 + (visual_total / inner_width.max(1)) as u16;
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
+        // Status bar: color-coded status, model name, and keyboard shortcuts.
         let status_style = match self.status_text.as_str() {
             s if s.starts_with("Idle") => Style::default().fg(Color::Green),
             s if s.starts_with("Waiting")
@@ -383,11 +597,13 @@ impl TuiApp {
         f.render_widget(status, chunks[2]);
     }
 
+    // Render the scrollable chat message area with only visible messages.
     fn render_chat_area(&self, area: ratatui::layout::Rect, f: &mut ratatui::Frame) {
         if self.messages.is_empty() {
             return;
         }
 
+        // Calculate height of each message in lines.
         let mut heights: Vec<usize> = Vec::new();
         for msg in &self.messages {
             let content_lines = msg.content.lines().count().max(1);
@@ -396,6 +612,7 @@ impl TuiApp {
             heights.push(content_lines + reasoning_lines + frame_padding);
         }
 
+        // Determine which messages fit in the available vertical space (scrolled to bottom).
         let available = area.height as usize;
         let mut total = 0usize;
         let mut start_idx = heights.len();
@@ -434,9 +651,11 @@ impl TuiApp {
         }
     }
 
+    // Render a single chat message with optional reasoning and role-based styling.
     fn render_message(&self, msg: &ChatMessage) -> Paragraph<'_> {
         let mut lines: Vec<Line> = Vec::new();
 
+        // Display reasoning text in dark gray above the message content.
         if let Some(reasoning) = &msg.reasoning {
             for line in reasoning.lines() {
                 lines.push(Line::from(Span::styled(
@@ -450,6 +669,7 @@ impl TuiApp {
             lines.push(Line::from(Span::raw(line.to_string())));
         }
 
+        // Style the block border and text color based on message role.
         let block = match msg.role.as_str() {
             "user" => Block::default()
                 .borders(Borders::ALL)
@@ -469,9 +689,11 @@ impl TuiApp {
         Paragraph::new(lines).block(block).style(style)
     }
 
+    // Render the connection settings form with provider, URL, key, model fields, and buttons.
     fn render_connect_settings(&self) -> Paragraph<'_> {
         let form = &self.connect_form;
 
+        // Highlight flags for each form field.
         let provider_highlight = form.selected_field == 0;
         let url_highlight = form.selected_field == 1;
         let key_highlight = form.selected_field == 2;
@@ -479,6 +701,7 @@ impl TuiApp {
         let save_highlight = form.selected_field == 4;
         let cancel_highlight = form.selected_field == 5;
 
+        // Obfuscate the API key for display.
         let key_display = if form.api_key.is_empty() {
             "(not set)".to_string()
         } else {
@@ -494,6 +717,7 @@ impl TuiApp {
             }
         };
 
+        // Build styled spans for each form field based on highlight state.
         let provider_options = if provider_highlight {
             Span::styled(
                 format!("[ {} ]  (Left/Right to change)", form.provider_label()),
@@ -588,6 +812,7 @@ impl TuiApp {
         ]));
         lines.push(Line::from(Span::raw("")));
 
+        // Render the model list dropdown if visible.
         if form.show_model_list && !form.model_list.is_empty() {
             let start = form
                 .model_list_index
@@ -597,11 +822,11 @@ impl TuiApp {
                 let entry = &form.model_list[i];
                 let model_line = if i == form.model_list_index {
                     Line::from(Span::styled(
-                        format!("    > {}", entry),
+                        format!("    > {}", entry.id),
                         Style::default().fg(Color::White).bg(Color::DarkGray),
                     ))
                 } else {
-                    Line::from(Span::raw(format!("      {}", entry)))
+                    Line::from(Span::raw(format!("      {}", entry.id)))
                 };
                 lines.push(model_line);
             }
@@ -617,6 +842,7 @@ impl TuiApp {
             lines.push(Line::from(Span::raw("")));
         }
 
+        // Display status message (e.g. fetch result) if set.
         if !form.status_message.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("  {}", form.status_message),
@@ -633,10 +859,87 @@ impl TuiApp {
             Style::default().fg(Color::DarkGray),
         )));
 
+        // Decorative block border and title.
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" /connect — Configure Connection ")
             .border_style(Style::default().fg(Color::Cyan));
+        Paragraph::new(lines).block(block)
+    }
+
+    // Render the variant / reasoning-effort picker overlay.
+    fn render_variant_picker(&self) -> Paragraph<'_> {
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Select reasoning effort for the current model:",
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        // Check if the model has known capability info.
+        let has_capabilities = self
+            .connect_form
+            .model_list
+            .iter()
+            .find(|m| m.id == self.connect_form.model)
+            .map(|m| !m.effort_levels.is_empty())
+            .unwrap_or(false);
+
+        // Show a fallback warning if capabilities are unknown.
+        if !has_capabilities && self.variant_options.len() > 1 {
+            lines.push(Line::from(Span::styled(
+                "  (model capabilities unknown — showing all levels as fallback)",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(Span::raw("")));
+        }
+
+        if self.variant_options.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No effort levels available.",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            for (i, level) in self.variant_options.iter().enumerate() {
+                let label = if i == self.variant_selected {
+                    Span::styled(
+                        format!("    > {}", level),
+                        Style::default().fg(Color::Black).bg(Color::Green),
+                    )
+                } else if level == "(none)" {
+                    Span::styled(
+                        format!("      {}", level),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::styled(
+                        format!("      {}", level),
+                        Style::default().fg(Color::White),
+                    )
+                };
+                lines.push(Line::from(label));
+            }
+        }
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Up/Down: choose  Enter: confirm  Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        // Show the currently selected effort level.
+        let current = self.connect_form.reasoning_effort.as_deref().unwrap_or("none");
+        lines.push(Line::from(Span::styled(
+            format!("  Current: {}", current),
+            Style::default().fg(Color::Yellow),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" /variant — Reasoning Effort ")
+            .border_style(Style::default().fg(Color::Magenta));
         Paragraph::new(lines).block(block)
     }
 }
