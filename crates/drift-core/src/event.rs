@@ -1,3 +1,4 @@
+use drift_llm::ModelInfo;
 use serde::{Deserialize, Serialize};
 
 /// Events emitted by the Agent core and consumed by TUI/storage/telemetry.
@@ -20,7 +21,7 @@ pub enum EventMsg {
     /// Agent processing complete for this turn
     Done,
     /// Model list fetched from provider
-    ModelList(Vec<String>),
+    ModelList(Vec<ModelInfo>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 drift-config = { path = "../drift-config" }
+drift-llm = { path = "../drift-llm" }
 ratatui = "0.29"
 crossterm = "0.28"
 tokio = { workspace = true, features = ["sync", "time"] }
 anyhow.workspace = true
+unicode-width = "0.2"

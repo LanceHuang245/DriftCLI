@@ -19,6 +19,8 @@ pub struct AgentConfig {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub thinking_budget: Option<usize>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// The LLM provider configuration — only one active provider.
@@ -30,6 +32,8 @@ pub enum LlmConfig {
         model: String,
         #[serde(default = "default_anthropic_base_url")]
         base_url: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
     },
     OpenAiCompatible {
         api_key: String,
@@ -129,11 +133,13 @@ impl AppConfig {
                 max_iterations: default_max_iterations(),
                 temperature: None,
                 thinking_budget: None,
+                reasoning_effort: None,
             },
             llm: LlmConfig::Anthropic {
                 api_key: String::new(),
                 model: default_model(),
                 base_url: default_anthropic_base_url(),
+                reasoning_effort: None,
             },
         };
 
@@ -205,6 +211,9 @@ impl AppConfig {
             if let Some(t) = agent.get("thinking_budget").and_then(|v| v.as_integer()) {
                 config.agent.thinking_budget = Some(t as usize);
             }
+            if let Some(e) = agent.get("reasoning_effort").and_then(|v| v.as_str()) {
+                config.agent.reasoning_effort = Some(e.to_string());
+            }
         }
         if let Some(llm) = overlay.get("llm") {
             if let Some(provider) = llm.get("provider").and_then(|v| v.as_str()) {
@@ -225,10 +234,15 @@ impl AppConfig {
                             .and_then(|v| v.as_str())
                             .unwrap_or(&default_anthropic_base_url())
                             .to_string();
+                        let reasoning_effort = llm
+                            .get("reasoning_effort")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
                         config.llm = LlmConfig::Anthropic {
                             api_key,
                             model,
                             base_url,
+                            reasoning_effort,
                         };
                     }
                     "openai_compatible" | "openai-compatible" => {
@@ -292,6 +306,7 @@ base_url = "https://api.anthropic.com/v1"
                 api_key,
                 model,
                 base_url,
+                ..
             } => ("Anthropic", api_key.as_str(), model.as_str(), base_url.as_str()),
             LlmConfig::OpenAiCompatible {
                 api_key,
@@ -338,11 +353,16 @@ base_url = "https://api.anthropic.com/v1"
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
             } => {
-                format!(
+                let mut s = format!(
                     "provider = \"anthropic\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"",
                     model, api_key, base_url
-                )
+                );
+                if let Some(effort) = reasoning_effort {
+                    s.push_str(&format!("\nreasoning_effort = \"{}\"", effort));
+                }
+                s
             }
             LlmConfig::OpenAiCompatible {
                 api_key,
@@ -393,11 +413,13 @@ mod tests {
                 max_iterations: 50,
                 temperature: None,
                 thinking_budget: None,
+                reasoning_effort: None,
             },
             llm: LlmConfig::Anthropic {
                 api_key: "sk-ant-test1234".into(),
                 model: "test-model".into(),
                 base_url: "https://api.anthropic.com/v1".into(),
+                reasoning_effort: None,
             },
         };
         let summary = config.connection_summary();

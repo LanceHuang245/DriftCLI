@@ -10,15 +10,17 @@ pub struct AnthropicProvider {
     api_key: String,
     model: String,
     base_url: String,
+    reasoning_effort: Option<String>,
     client: Client,
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, model: String, base_url: String) -> Self {
+    pub fn new(api_key: String, model: String, base_url: String, reasoning_effort: Option<String>) -> Self {
         Self {
             api_key,
             model,
             base_url,
+            reasoning_effort,
             client: Client::new(),
         }
     }
@@ -71,6 +73,9 @@ impl LlmProvider for AnthropicProvider {
         }
         if let Some(t) = temperature {
             body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(ref effort) = self.reasoning_effort {
+            body["reasoning_effort"] = serde_json::Value::String(effort.clone());
         }
 
         let response = self

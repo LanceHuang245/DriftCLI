@@ -30,6 +30,12 @@ pub enum LlmChunk {
     Done,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub effort_levels: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("HTTP request failed: {0}")]

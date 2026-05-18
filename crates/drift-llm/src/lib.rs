@@ -114,10 +114,12 @@ pub fn create_provider(config: &drift_config::LlmConfig) -> Result<Box<dyn LlmPr
             api_key,
             model,
             base_url,
+            reasoning_effort,
         } => Ok(Box::new(anthropic::AnthropicProvider::new(
             api_key.clone(),
             model.clone(),
             base_url.clone(),
+            reasoning_effort.clone(),
         ))),
         drift_config::LlmConfig::OpenAiCompatible {
             api_key,
@@ -132,72 +134,189 @@ pub fn create_provider(config: &drift_config::LlmConfig) -> Result<Box<dyn LlmPr
     }
 }
 
+// ---------- Model fetching ----------
+
 #[derive(Deserialize)]
-struct RemoteModelEntry {
+struct SimpleModelEntry {
     id: String,
 }
 
-pub async fn fetch_anthropic_models(api_key: &str, base_url: &str) -> Result<Vec<String>, LlmError> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-
-    let response = client
-        .get(&url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        return if status.as_u16() == 401 {
-            Err(LlmError::Unauthorized)
-        } else {
-            Err(LlmError::Api {
-                status: status.as_u16(),
-                message: error_text,
-            })
-        };
-    }
-
-    #[derive(Deserialize)]
-    struct ModelsResponse {
-        data: Vec<RemoteModelEntry>,
-    }
-
-    let models: ModelsResponse = response.json().await?;
-    Ok(models.data.into_iter().map(|m| m.id).collect())
+#[derive(Deserialize)]
+struct AnthropicModelEntry {
+    id: String,
+    #[serde(default)]
+    capabilities: Option<AnthropicCapabilities>,
 }
 
-pub async fn fetch_openai_compat_models(api_key: &str, base_url: &str) -> Result<Vec<String>, LlmError> {
+#[derive(Deserialize)]
+struct AnthropicCapabilities {
+    #[serde(default)]
+    effort: Option<AnthropicEffort>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicEffort {
+    #[serde(default)]
+    supported: bool,
+    #[serde(default)]
+    low: CapabilitySupport,
+    #[serde(default)]
+    medium: CapabilitySupport,
+    #[serde(default)]
+    high: CapabilitySupport,
+    #[serde(default)]
+    max: CapabilitySupport,
+}
+
+#[derive(Deserialize, Default)]
+struct CapabilitySupport {
+    #[serde(default)]
+    supported: bool,
+}
+
+/// Try fetching models from an Anthropic or Anthropic-compatible endpoint.
+/// Tries multiple URLs and auth approaches to handle various proxy setups
+/// (e.g. https://api.deepseek.com/anthropic where /models is only at the root).
+pub async fn fetch_anthropic_models(
+    api_key: &str,
+    base_url: &str,
+) -> Result<Vec<ModelInfo>, LlmError> {
+    let base = base_url.trim_end_matches('/').to_string();
+
+    // Build fallback URLs:
+    //   1. {base}/models            (primary)
+    //   2. {base}/v1/models        (some proxies nest under /v1)
+    //   3. {parent}/models         (strip /anthropic suffix)
+    let mut urls = vec![format!("{}/models", base), format!("{}/v1/models", base)];
+    if let Some(slash) = base.rfind('/') {
+        let parent = &base[..slash];
+        urls.push(format!("{}/models", parent));
+        urls.push(format!("{}/v1/models", parent));
+    }
+
     let client = reqwest::Client::new();
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
 
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await?;
+    for url in &urls {
+        let response = client
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        return if status.as_u16() == 401 {
-            Err(LlmError::Unauthorized)
-        } else {
-            Err(LlmError::Api {
-                status: status.as_u16(),
-                message: error_text,
-            })
+        let status = response.status();
+        if !status.is_success() {
+            continue;
+        }
+
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
         };
+
+        if let Ok(models) = parse_anthropic_list(&body_text)
+            .or_else(|_| parse_simple_list(&body_text))
+        {
+            if !models.is_empty() {
+                return Ok(models);
+            }
+        }
     }
 
+    Err(LlmError::Config(format!(
+        "No model list found. Tried: {}",
+        urls.join(", ")
+    )))
+}
+
+fn parse_anthropic_list(body: &str) -> Result<Vec<ModelInfo>, serde_json::Error> {
     #[derive(Deserialize)]
-    struct ModelsResponse {
-        data: Vec<RemoteModelEntry>,
+    struct Wrapper {
+        data: Vec<AnthropicModelEntry>,
+    }
+    let resp: Wrapper = serde_json::from_str(body)?;
+    Ok(resp
+        .data
+        .into_iter()
+        .map(|m| {
+            let effort_levels = m
+                .capabilities
+                .and_then(|c| c.effort)
+                .filter(|e| e.supported)
+                .map(|e| {
+                    let mut levels = Vec::new();
+                    if e.low.supported { levels.push("low".into()); }
+                    if e.medium.supported { levels.push("medium".into()); }
+                    if e.high.supported { levels.push("high".into()); }
+                    if e.max.supported { levels.push("max".into()); }
+                    levels
+                })
+                .unwrap_or_default();
+            ModelInfo { id: m.id, effort_levels }
+        })
+        .collect())
+}
+
+fn parse_simple_list(body: &str) -> Result<Vec<ModelInfo>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        data: Vec<SimpleModelEntry>,
+    }
+    let resp: Wrapper = serde_json::from_str(body)?;
+    Ok(resp
+        .data
+        .into_iter()
+        .map(|m| ModelInfo { id: m.id, effort_levels: vec![] })
+        .collect())
+}
+
+pub async fn fetch_openai_compat_models(
+    api_key: &str,
+    base_url: &str,
+) -> Result<Vec<String>, LlmError> {
+    let base = base_url.trim_end_matches('/').to_string();
+    let mut urls = vec![format!("{}/models", base), format!("{}/v1/models", base)];
+    if let Some(slash) = base.rfind('/') {
+        let parent = &base[..slash];
+        urls.push(format!("{}/models", parent));
+        urls.push(format!("{}/v1/models", parent));
     }
 
-    let models: ModelsResponse = response.json().await?;
-    Ok(models.data.into_iter().map(|m| m.id).collect())
+    let client = reqwest::Client::new();
+
+    for url in &urls {
+        let response = client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            continue;
+        }
+
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        #[derive(Deserialize)]
+        struct ModelsResponse {
+            data: Vec<SimpleModelEntry>,
+        }
+
+        if let Ok(models) = serde_json::from_str::<ModelsResponse>(&body_text) {
+            let ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
+            if !ids.is_empty() {
+                return Ok(ids);
+            }
+        }
+    }
+
+    Err(LlmError::Config(format!(
+        "No model list found. Tried: {}",
+        urls.join(", ")
+    )))
 }

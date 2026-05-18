@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::event::{AgentState, EventMsg};
 use drift_config::{AppConfig, LlmConfig};
-use drift_llm::{create_provider, fetch_anthropic_models, fetch_openai_compat_models, LlmError, LlmMessage, LlmProvider};
+use drift_llm::{create_provider, fetch_anthropic_models, fetch_openai_compat_models, LlmError, LlmMessage, LlmProvider, ModelInfo};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -164,10 +164,13 @@ impl Agent {
         provider: &str,
         base_url: &str,
         api_key: &str,
-    ) -> Result<Vec<String>, LlmError> {
+    ) -> Result<Vec<ModelInfo>, LlmError> {
         match provider {
             "Anthropic" => fetch_anthropic_models(api_key, base_url).await,
-            "OpenAI Compatible" => fetch_openai_compat_models(api_key, base_url).await,
+            "OpenAI Compatible" => {
+                let ids = fetch_openai_compat_models(api_key, base_url).await?;
+                Ok(ids.into_iter().map(|id| ModelInfo { id, effort_levels: vec![] }).collect())
+            }
             _ => Err(LlmError::Config(format!(
                 "Unknown provider: {}",
                 provider
