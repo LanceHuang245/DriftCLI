@@ -16,9 +16,9 @@ pub struct Agent {
 }
 
 impl Agent {
-    // Create a new agent: builds the LLM provider, opens a broadcast channel, and logs the connection.
+    // Create a new agent: builds the LLM provider from the active config, opens a broadcast channel, and logs the connection.
     pub fn new(config: AppConfig, cwd: PathBuf) -> Result<Self, LlmError> {
-        let llm = create_provider(&config.llm)?;
+        let llm = create_provider(config.active_llm_config().unwrap())?;
         let (event_tx, _) = broadcast::channel(256);
 
         info!(
@@ -145,27 +145,76 @@ impl Agent {
     }
 
     // Reconfigure: swaps the LLM provider at runtime (e.g. from /connect) and persists the change to disk.
-    /// Reconfigure the LLM provider at runtime and persist to disk
+    /// Reconfigure the LLM provider at runtime and persist to disk (backward compat — delegates to save_provider).
     pub async fn reconfigure(&mut self, llm_config: LlmConfig) -> Result<(), LlmError> {
         let model = match &llm_config {
             LlmConfig::Anthropic { model, .. } => model.clone(),
             LlmConfig::OpenAiCompatible { model, .. } => model.clone(),
         };
         self.config.agent.model = model;
-        self.config.llm = llm_config;
-        self.llm = create_provider(&self.config.llm)?;
-        if let Err(e) = self.config.save_to_project(&self.cwd) {
-            let _ = self.event_tx.send(EventMsg::Error {
-                message: format!("Failed to save config: {}", e),
-                recoverable: true,
-            });
-        }
+        let name = self.config.active_provider.clone();
+        self.save_provider(name, llm_config).await
+    }
+
+    // Save a named provider config and activate it. Persists to disk.
+    /// Save a named provider config and activate it. Persists to disk.
+    pub async fn save_provider(&mut self, name: String, config: LlmConfig) -> Result<(), LlmError> {
+        self.config.save_provider(name.clone(), config);
+        let llm_config = self.config
+            .active_llm_config()
+            .ok_or(LlmError::Config("No provider config".into()))?;
+        self.llm = create_provider(llm_config)?;
+        self.config
+            .save_to_project(&self.cwd)
+            .map_err(|e| LlmError::Config(e.to_string()))?;
+        let _ = self.event_tx.send(EventMsg::ProviderSwitched {
+            name: self.config.active_provider.clone(),
+            model: self.llm.model_name().to_string(),
+        });
         info!(
             provider = %self.llm.provider_id(),
             model = %self.llm.model_name(),
-            "Agent reconfigured and config saved"
+            "Provider saved and activated"
         );
         Ok(())
+    }
+
+    // Switch to an existing named provider.
+    /// Switch to an existing named provider.
+    pub async fn activate_provider(&mut self, name: &str) -> Result<(), LlmError> {
+        self.config
+            .activate_provider(name)
+            .map_err(|e| LlmError::Config(e.to_string()))?;
+        let llm_config = self.config
+            .active_llm_config()
+            .ok_or(LlmError::Config("No config".into()))?;
+        self.llm = create_provider(llm_config)?;
+        let _ = self.event_tx.send(EventMsg::ProviderSwitched {
+            name: name.to_string(),
+            model: self.llm.model_name().to_string(),
+        });
+        info!("Switched to provider {}", name);
+        Ok(())
+    }
+
+    // Remove a named provider. Auto-switches to first remaining.
+    /// Remove a named provider. Auto-switches to first remaining.
+    pub async fn remove_provider(&mut self, name: &str) -> Result<(), LlmError> {
+        self.config.remove_provider(name);
+        if let Some(config) = self.config.active_llm_config() {
+            self.llm = create_provider(config)?;
+        }
+        self.config
+            .save_to_project(&self.cwd)
+            .map_err(|e| LlmError::Config(e.to_string()))?;
+        info!("Provider '{}' removed", name);
+        Ok(())
+    }
+
+    // Returns all provider names.
+    /// Returns all provider names.
+    pub fn list_providers(&self) -> Vec<String> {
+        self.config.list_provider_names()
     }
 
     // Static method: queries the provider's API for available model IDs without needing an Agent instance.

@@ -1,13 +1,29 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ---------- Core Config ----------
 
-// AppConfig: top-level configuration combining agent behaviour and LLM provider settings.
+// A named provider entry pairing a user-chosen label with the LLM configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntry {
+    pub name: String,
+    #[serde(flatten)]
+    pub config: LlmConfig,
+}
+
+// AppConfig: top-level configuration combining agent behaviour, active provider, and a named provider map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub agent: AgentConfig,
-    pub llm: LlmConfig,
+    #[serde(default)]
+    pub active_provider: String,
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderEntry>,
+    // Legacy migration marker
+    #[serde(skip)]
+    #[allow(dead_code)]
+    migrated: bool,
 }
 
 // AgentConfig: tunable parameters for the agent's behaviour — model, iteration cap, temperature, thinking budget.
@@ -137,9 +153,79 @@ impl AppConfig {
         cwd.join(".drift").join("config.toml")
     }
 
+    // Returns the LlmConfig of the currently active provider, or the first provider if active is unset.
+    pub fn active_llm_config(&self) -> Option<&LlmConfig> {
+        self.providers
+            .get(&self.active_provider)
+            .map(|e| &e.config)
+            .or_else(|| self.providers.values().next().map(|e| &e.config))
+    }
+
+    // Returns a mutable reference to the active provider's config.
+    pub fn active_llm_config_mut(&mut self) -> Option<&mut LlmConfig> {
+        self.providers
+            .get_mut(&self.active_provider)
+            .map(|e| &mut e.config)
+    }
+
+    // Returns a vector of all provider names for the /provider picker.
+    pub fn list_provider_names(&self) -> Vec<String> {
+        self.providers.keys().cloned().collect()
+    }
+
+    // Adds or updates a named provider. Sets it as active if it's the only one or explicitly requested.
+    pub fn save_provider(&mut self, name: String, config: LlmConfig) {
+        let is_first = self.providers.is_empty();
+        self.providers.insert(
+            name.clone(),
+            ProviderEntry {
+                name: name.clone(),
+                config,
+            },
+        );
+        if is_first || self.active_provider.is_empty() {
+            self.active_provider = name;
+        }
+    }
+
+    // Removes a named provider. If the active provider was removed, switches to the first remaining.
+    pub fn remove_provider(&mut self, name: &str) {
+        self.providers.remove(name);
+        if self.active_provider == name {
+            self.active_provider = self
+                .providers
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_default();
+        }
+    }
+
+    // Switches to the given provider name (must exist).
+    pub fn activate_provider(&mut self, name: &str) -> Result<(), ConfigError> {
+        if !self.providers.contains_key(name) {
+            return Err(ConfigError::NoLlmProvider);
+        }
+        self.active_provider = name.to_string();
+        Ok(())
+    }
+
     // Builds a config starting from hardcoded defaults, then merges global config on top.
     fn load_defaults_with_files() -> Result<Self, ConfigError> {
-        // Start with hardcoded defaults
+        let mut providers = HashMap::new();
+        let default_name = "default".to_string();
+        providers.insert(
+            default_name.clone(),
+            ProviderEntry {
+                name: default_name.clone(),
+                config: LlmConfig::Anthropic {
+                    api_key: String::new(),
+                    model: default_model(),
+                    base_url: default_anthropic_base_url(),
+                    reasoning_effort: None,
+                },
+            },
+        );
         let mut config = Self {
             agent: AgentConfig {
                 model: default_model(),
@@ -148,12 +234,9 @@ impl AppConfig {
                 thinking_budget: None,
                 reasoning_effort: None,
             },
-            llm: LlmConfig::Anthropic {
-                api_key: String::new(),
-                model: default_model(),
-                base_url: default_anthropic_base_url(),
-                reasoning_effort: None,
-            },
+            active_provider: default_name,
+            providers,
+            migrated: false,
         };
 
         // Layer 1: global config
@@ -183,9 +266,13 @@ impl AppConfig {
     // Overrides API key and model from DRIFT_API_KEY / DRIFT_MODEL environment variables.
     fn apply_env_overrides(&mut self) {
         if let Ok(key) = std::env::var("DRIFT_API_KEY") {
-            match &mut self.llm {
-                LlmConfig::Anthropic { api_key, .. }
-                | LlmConfig::OpenAiCompatible { api_key, .. } => *api_key = key,
+            if let Some(config) = self.active_llm_config_mut() {
+                match config {
+                    LlmConfig::Anthropic { api_key, .. }
+                    | LlmConfig::OpenAiCompatible { api_key, .. } => {
+                        *api_key = key;
+                    }
+                }
             }
         }
         if let Ok(model) = std::env::var("DRIFT_MODEL") {
@@ -199,9 +286,13 @@ impl AppConfig {
             self.agent.model = m.to_string();
         }
         if let Some(k) = cli_api_key {
-            match &mut self.llm {
-                LlmConfig::Anthropic { api_key, .. }
-                | LlmConfig::OpenAiCompatible { api_key, .. } => *api_key = k.to_string(),
+            if let Some(config) = self.active_llm_config_mut() {
+                match config {
+                    LlmConfig::Anthropic { api_key, .. }
+                    | LlmConfig::OpenAiCompatible { api_key, .. } => {
+                        *api_key = k.to_string();
+                    }
+                }
             }
         }
     }
@@ -214,8 +305,9 @@ impl AppConfig {
         Ok(base)
     }
 
-    // Merges a TOML value overlay into an AppConfig: selectively overwrites agent and llm fields.
+    // Merges a TOML value overlay into an AppConfig: selectively overwrites agent, providers, and active_provider fields.
     fn merge_toml_value(config: &mut Self, overlay: &toml::Value) {
+        // Merge [agent] section
         if let Some(agent) = overlay.get("agent") {
             if let Some(m) = agent.get("model").and_then(|v| v.as_str()) {
                 config.agent.model = m.to_string();
@@ -233,64 +325,144 @@ impl AppConfig {
                 config.agent.reasoning_effort = Some(e.to_string());
             }
         }
+
+        // Merge active_provider
+        if let Some(ap) = overlay.get("active_provider").and_then(|v| v.as_str()) {
+            config.active_provider = ap.to_string();
+        }
+
+        // Merge [[providers]] array
+        if let Some(providers_array) = overlay.get("providers").and_then(|v| v.as_array()) {
+            for entry_value in providers_array {
+                if let (Some(name), llm) = (
+                    entry_value.get("name").and_then(|v| v.as_str()),
+                    entry_value,
+                ) {
+                    let name = name.to_string();
+                    if let Some(provider) = llm.get("provider").and_then(|v| v.as_str()) {
+                        let provider_config = match provider {
+                            "anthropic" => LlmConfig::Anthropic {
+                                api_key: llm
+                                    .get("api_key")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .into(),
+                                model: llm
+                                    .get("model")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&default_model())
+                                    .into(),
+                                base_url: llm
+                                    .get("base_url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&default_anthropic_base_url())
+                                    .into(),
+                                reasoning_effort: llm
+                                    .get("reasoning_effort")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
+                            },
+                            "openai_compatible" | "openai-compatible" => {
+                                LlmConfig::OpenAiCompatible {
+                                    api_key: llm
+                                        .get("api_key")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                    model: llm
+                                        .get("model")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("gpt-4o")
+                                        .into(),
+                                    base_url: llm
+                                        .get("base_url")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&default_openai_compat_base_url())
+                                        .into(),
+                                    supports_thinking: llm
+                                        .get("supports_thinking")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                }
+                            }
+                            _ => continue,
+                        };
+                        config.providers.insert(
+                            name.clone(),
+                            ProviderEntry {
+                                name,
+                                config: provider_config,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Backward compat: handle old [llm] format
         if let Some(llm) = overlay.get("llm") {
-            if let Some(provider) = llm.get("provider").and_then(|v| v.as_str()) {
-                match provider {
-                    "anthropic" => {
-                        let api_key = llm
-                            .get("api_key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let model = llm
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&default_model())
-                            .to_string();
-                        let base_url = llm
-                            .get("base_url")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&default_anthropic_base_url())
-                            .to_string();
-                        let reasoning_effort = llm
-                            .get("reasoning_effort")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        config.llm = LlmConfig::Anthropic {
-                            api_key,
-                            model,
-                            base_url,
-                            reasoning_effort,
-                        };
+            if config.providers.is_empty() {
+                if let Some(provider) = llm.get("provider").and_then(|v| v.as_str()) {
+                    let config_llm = match provider {
+                        "anthropic" => Some(LlmConfig::Anthropic {
+                            api_key: llm
+                                .get("api_key")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .into(),
+                            model: llm
+                                .get("model")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&default_model())
+                                .into(),
+                            base_url: llm
+                                .get("base_url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&default_anthropic_base_url())
+                                .into(),
+                            reasoning_effort: llm
+                                .get("reasoning_effort")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        }),
+                        "openai_compatible" | "openai-compatible" => {
+                            Some(LlmConfig::OpenAiCompatible {
+                                api_key: llm
+                                    .get("api_key")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .into(),
+                                model: llm
+                                    .get("model")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("gpt-4o")
+                                    .into(),
+                                base_url: llm
+                                    .get("base_url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&default_openai_compat_base_url())
+                                    .into(),
+                                supports_thinking: llm
+                                    .get("supports_thinking")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(config_llm) = config_llm {
+                        let name = "default".to_string();
+                        config.providers.insert(
+                            name.clone(),
+                            ProviderEntry {
+                                name: name.clone(),
+                                config: config_llm,
+                            },
+                        );
+                        if config.active_provider.is_empty() {
+                            config.active_provider = name;
+                        }
                     }
-                    "openai_compatible" | "openai-compatible" => {
-                        let api_key = llm
-                            .get("api_key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let model = llm
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("gpt-4o")
-                            .to_string();
-                        let base_url = llm
-                            .get("base_url")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&default_openai_compat_base_url())
-                            .to_string();
-                        let supports_thinking = llm
-                            .get("supports_thinking")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        config.llm = LlmConfig::OpenAiCompatible {
-                            api_key,
-                            model,
-                            base_url,
-                            supports_thinking,
-                        };
-                    }
-                    _ => {}
                 }
             }
         }
@@ -299,62 +471,59 @@ impl AppConfig {
     // Returns a default TOML config template string used for initializing new config files.
     fn default_template() -> String {
         r###"# DriftCLI Configuration
-# See dev-docs/11-configuration.md for all options
+active_provider = "default"
 
 [agent]
 model = "claude-sonnet-4-5-20250101"
 max_iterations = 50
 
-# Set your LLM provider:
-#   provider = "anthropic"   — Anthropic Claude
-#   provider = "openai_compatible"  — OpenAI or any OpenAI-compatible endpoint
-
-[llm]
+[[providers]]
+name = "default"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250101"
 api_key = ""
 base_url = "https://api.anthropic.com/v1"
 "###
-        .to_string()
+            .to_string()
     }
 
     // Builds a display string summarizing the active provider, model, endpoint, and masked API key.
     /// Extract a display summary for the /connect command
     pub fn connection_summary(&self) -> String {
-        let (provider_name, api_key, model, base_url) = match &self.llm {
-            LlmConfig::Anthropic {
-                api_key,
-                model,
-                base_url,
-                ..
-            } => ("Anthropic", api_key.as_str(), model.as_str(), base_url.as_str()),
-            LlmConfig::OpenAiCompatible {
-                api_key,
-                model,
-                base_url,
-                ..
-            } => (
-                "OpenAI Compatible",
-                api_key.as_str(),
-                model.as_str(),
-                base_url.as_str(),
-            ),
-        };
-        let key_masked = if api_key.is_empty() {
-            "(not set)".to_string()
-        } else if api_key.len() <= 8 {
-            "***".to_string()
-        } else {
+        if let Some(config) = self.active_llm_config() {
+            let (provider_name, api_key, model, base_url) = match config {
+                LlmConfig::Anthropic {
+                    api_key,
+                    model,
+                    base_url,
+                    ..
+                } => ("Anthropic", api_key.as_str(), model.as_str(), base_url.as_str()),
+                LlmConfig::OpenAiCompatible {
+                    api_key,
+                    model,
+                    base_url,
+                    ..
+                } => (
+                    "OpenAI Compatible",
+                    api_key.as_str(),
+                    model.as_str(),
+                    base_url.as_str(),
+                ),
+            };
+            let key_masked = if api_key.is_empty() {
+                "(not set)".to_string()
+            } else if api_key.len() <= 8 {
+                "***".to_string()
+            } else {
+                format!("{}...{}", &api_key[..4], &api_key[api_key.len() - 4..])
+            };
             format!(
-                "{}...{}",
-                &api_key[..4],
-                &api_key[api_key.len() - 4..]
+                "Provider: {}\nModel: {}\nEndpoint: {}\nAPI Key: {}",
+                provider_name, model, base_url, key_masked
             )
-        };
-        format!(
-            "Provider: {}\nModel: {}\nEndpoint: {}\nAPI Key: {}",
-            provider_name, model, base_url, key_masked
-        )
+        } else {
+            "No providers configured.".into()
+        }
     }
 
     // Serializes the current config and writes it to .drift/config.toml in the given project directory.
@@ -370,46 +539,45 @@ base_url = "https://api.anthropic.com/v1"
 
     // Converts the current AppConfig into a human-readable TOML string with inline comments.
     fn to_toml_string(&self) -> String {
-        let provider_str = match &self.llm {
-            LlmConfig::Anthropic {
-                api_key,
-                model,
-                base_url,
-                reasoning_effort,
-            } => {
-                let mut s = format!(
-                    "provider = \"anthropic\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"",
-                    model, api_key, base_url
-                );
-                if let Some(effort) = reasoning_effort {
-                    s.push_str(&format!("\nreasoning_effort = \"{}\"", effort));
+        let mut providers_str = String::new();
+        for entry in self.providers.values() {
+            let name = &entry.name;
+            let inner = match &entry.config {
+                LlmConfig::Anthropic {
+                    api_key,
+                    model,
+                    base_url,
+                    reasoning_effort,
+                } => {
+                    let mut s = format!(
+                        "provider = \"anthropic\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"",
+                        model, api_key, base_url
+                    );
+                    if let Some(e) = reasoning_effort {
+                        s.push_str(&format!("\nreasoning_effort = \"{}\"", e));
+                    }
+                    s
                 }
-                s
-            }
-            LlmConfig::OpenAiCompatible {
-                api_key,
-                model,
-                base_url,
-                supports_thinking,
-            } => {
-                format!(
-                    "provider = \"openai_compatible\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"\nsupports_thinking = {}",
-                    model, api_key, base_url, supports_thinking
-                )
-            }
-        };
+                LlmConfig::OpenAiCompatible {
+                    api_key,
+                    model,
+                    base_url,
+                    supports_thinking,
+                } => {
+                    format!(
+                        "provider = \"openai_compatible\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"\nsupports_thinking = {}",
+                        model, api_key, base_url, supports_thinking
+                    )
+                }
+            };
+            providers_str.push_str(&format!(
+                "[[providers]]\nname = \"{}\"\n{}\n\n",
+                name, inner
+            ));
+        }
         format!(
-            "# DriftCLI Configuration — saved by TUI /connect\n\
-             \n\
-             [agent]\n\
-             model = \"{}\"\n\
-             max_iterations = {}\n\
-             \n\
-             [llm]\n\
-             {}\n",
-            self.agent.model,
-            self.agent.max_iterations,
-            provider_str,
+            "# DriftCLI Configuration\n\nactive_provider = \"{}\"\n\n[agent]\nmodel = \"{}\"\nmax_iterations = {}\n\n{}",
+            self.active_provider, self.agent.model, self.agent.max_iterations, providers_str,
         )
     }
 }
@@ -420,15 +588,27 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        // Test that load with no files and no env works
-        // We can't fully test load() without filesystem, but test the template
         let tmpl = AppConfig::default_template();
         assert!(tmpl.contains("[agent]"));
-        assert!(tmpl.contains("[llm]"));
+        assert!(tmpl.contains("[[providers]]"));
+        assert!(tmpl.contains("active_provider"));
     }
 
     #[test]
     fn test_connection_summary() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test".into(),
+            ProviderEntry {
+                name: "test".into(),
+                config: LlmConfig::Anthropic {
+                    api_key: "sk-ant-test1234".into(),
+                    model: "test-model".into(),
+                    base_url: "https://api.anthropic.com/v1".into(),
+                    reasoning_effort: None,
+                },
+            },
+        );
         let config = AppConfig {
             agent: AgentConfig {
                 model: "test-model".into(),
@@ -437,12 +617,9 @@ mod tests {
                 thinking_budget: None,
                 reasoning_effort: None,
             },
-            llm: LlmConfig::Anthropic {
-                api_key: "sk-ant-test1234".into(),
-                model: "test-model".into(),
-                base_url: "https://api.anthropic.com/v1".into(),
-                reasoning_effort: None,
-            },
+            active_provider: "test".into(),
+            providers,
+            migrated: false,
         };
         let summary = config.connection_summary();
         assert!(summary.contains("Anthropic"));

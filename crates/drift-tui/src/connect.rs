@@ -1,9 +1,11 @@
 use drift_config::LlmConfig;
 use drift_llm::ModelInfo;
 
-// Form state for the /connect settings screen. Holds provider, URL, key, model, and list UX state.
+// Form state for the /connect settings screen. Holds provider, URL, key, model, name, and list UX state.
 #[derive(Debug, Clone)]
 pub struct ConnectForm {
+    // User-chosen label for this provider configuration.
+    pub provider_name: String,
     pub provider_type: ProviderType,
     pub base_url: String,
     pub api_key: String,
@@ -37,6 +39,11 @@ impl ProviderType {
 impl ConnectForm {
     // Build a ConnectForm from an existing LlmConfig, preserving current settings.
     pub fn from_config(config: &LlmConfig) -> Self {
+        Self::from_entry("default", config)
+    }
+
+    // Build a ConnectForm from an explicit provider name and LlmConfig.
+    pub fn from_entry(name: &str, config: &LlmConfig) -> Self {
         match config {
             LlmConfig::Anthropic {
                 api_key,
@@ -44,6 +51,7 @@ impl ConnectForm {
                 base_url,
                 reasoning_effort,
             } => Self {
+                provider_name: name.to_string(),
                 provider_type: ProviderType::Anthropic,
                 base_url: base_url.clone(),
                 api_key: api_key.clone(),
@@ -62,6 +70,7 @@ impl ConnectForm {
                 base_url,
                 ..
             } => Self {
+                provider_name: name.to_string(),
                 provider_type: ProviderType::OpenAiCompatible,
                 base_url: base_url.clone(),
                 api_key: api_key.clone(),
@@ -82,25 +91,30 @@ impl ConnectForm {
         self.provider_type.label()
     }
 
-    // Advance selection to the next form field (wrap around).
+    // Return the provider_name field value.
+    pub fn to_provider_name(&self) -> String {
+        self.provider_name.clone()
+    }
+
+    // Advance selection to the next form field (wrap around). 7 fields: name, provider, url, key, model, save, cancel.
     pub fn next_field(&mut self) {
-        self.selected_field = (self.selected_field + 1) % 6;
+        self.selected_field = (self.selected_field + 1) % 7;
         self.show_model_list = false;
     }
 
     // Move selection to the previous form field (wrap around).
     pub fn previous_field(&mut self) {
         if self.selected_field == 0 {
-            self.selected_field = 5;
+            self.selected_field = 6;
         } else {
             self.selected_field -= 1;
         }
         self.show_model_list = false;
     }
 
-    // Toggle provider type when on the first field with Left arrow.
+    // Toggle provider type when on field 1 (provider) with Left arrow.
     pub fn on_left(&mut self) {
-        if self.selected_field == 0 {
+        if self.selected_field == 1 {
             self.provider_type = match self.provider_type {
                 ProviderType::Anthropic => ProviderType::OpenAiCompatible,
                 ProviderType::OpenAiCompatible => ProviderType::Anthropic,
@@ -108,9 +122,9 @@ impl ConnectForm {
         }
     }
 
-    // Toggle provider type when on the first field with Right arrow.
+    // Toggle provider type when on field 1 (provider) with Right arrow.
     pub fn on_right(&mut self) {
-        if self.selected_field == 0 {
+        if self.selected_field == 1 {
             self.provider_type = match self.provider_type {
                 ProviderType::Anthropic => ProviderType::OpenAiCompatible,
                 ProviderType::OpenAiCompatible => ProviderType::Anthropic,
@@ -121,9 +135,10 @@ impl ConnectForm {
     // Append a typed character to the currently selected text field.
     pub fn on_char(&mut self, c: char) {
         match self.selected_field {
-            1 => self.base_url.push(c),
-            2 => self.api_key.push(c),
-            3 => self.model.push(c),
+            0 => self.provider_name.push(c),
+            2 => self.base_url.push(c),
+            3 => self.api_key.push(c),
+            4 => self.model.push(c),
             _ => {}
         }
     }
@@ -131,13 +146,16 @@ impl ConnectForm {
     // Remove the last character from the currently selected text field.
     pub fn on_backspace(&mut self) {
         match self.selected_field {
-            1 => {
-                self.base_url.pop();
+            0 => {
+                self.provider_name.pop();
             }
             2 => {
-                self.api_key.pop();
+                self.base_url.pop();
             }
             3 => {
+                self.api_key.pop();
+            }
+            4 => {
                 self.model.pop();
             }
             _ => {}

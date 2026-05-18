@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut agent = Agent::new(config.clone(), cwd.clone())?;
             let event_tx = agent.event_sender();
-            let llm_config = config.llm.clone();
+            let llm_config = config.active_llm_config().cloned().unwrap();
 
             let (tui_tx, tui_rx) = mpsc::unbounded_channel();
             let mut core_rx = agent.subscribe();
@@ -96,12 +96,18 @@ async fn main() -> anyhow::Result<()> {
                         Ok(EventMsg::ModelList(models)) => {
                             let _ = tui_tx.send(AppEvent::ModelList(models));
                         }
+                        Ok(EventMsg::ProviderList(names)) => {
+                            let _ = tui_tx.send(AppEvent::ProviderList(names));
+                        }
+                        Ok(EventMsg::ProviderSwitched { name, model }) => {
+                            let _ = tui_tx.send(AppEvent::ProviderSwitched { name, model });
+                        }
                         _ => {}
                     }
                 }
             });
 
-            // Command handling task: receives TUI commands (chat, fetch models, reconfigure) and dispatches to the agent.
+            // Command handling task: receives TUI commands (chat, fetch models, reconfigure, provider management) and dispatches to the agent.
             tokio::spawn(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
@@ -135,6 +141,54 @@ async fn main() -> anyhow::Result<()> {
                                 });
                             }
                         },
+                        TuiCommand::SaveProvider { name, config } => {
+                            match agent.save_provider(name, config).await {
+                                Ok(()) => {
+                                    let _ = event_tx
+                                        .send(EventMsg::AgentState(drift_core::AgentState::Idle));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(EventMsg::Error {
+                                        message: format!("Save failed: {}", e),
+                                        recoverable: true,
+                                    });
+                                }
+                            }
+                        }
+                        TuiCommand::SetActiveProvider(name) => {
+                            match agent.activate_provider(&name).await {
+                                Ok(()) => {
+                                    let _ = event_tx
+                                        .send(EventMsg::AgentState(drift_core::AgentState::Idle));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(EventMsg::Error {
+                                        message: format!("Switch failed: {}", e),
+                                        recoverable: true,
+                                    });
+                                }
+                            }
+                        }
+                        TuiCommand::GetProviders => {
+                            let names = agent.list_providers();
+                            let _ = event_tx.send(EventMsg::ProviderList(names));
+                        }
+                        TuiCommand::DeleteProvider(name) => {
+                            match agent.remove_provider(&name).await {
+                                Ok(()) => {
+                                    let names = agent.list_providers();
+                                    let _ = event_tx.send(EventMsg::ProviderList(names));
+                                    let _ = event_tx
+                                        .send(EventMsg::AgentState(drift_core::AgentState::Idle));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(EventMsg::Error {
+                                        message: format!("Delete failed: {}", e),
+                                        recoverable: true,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             });

@@ -28,9 +28,13 @@ pub enum AppEvent {
     Error(String),
     Done,
     ModelList(Vec<ModelInfo>),
+    // Response with provider name list for the picker.
+    ProviderList(Vec<String>),
+    // Provider was switched (with name and model).
+    ProviderSwitched { name: String, model: String },
 }
 
-// Commands sent from the TUI to the backend (chat, fetch models, reconfigure).
+// Commands sent from the TUI to the backend (chat, fetch models, reconfigure, provider management).
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
     Chat(String),
@@ -40,6 +44,14 @@ pub enum TuiCommand {
         api_key: String,
     },
     Reconfigure(LlmConfig),
+    // Save or update a named provider configuration.
+    SaveProvider { name: String, config: LlmConfig },
+    // Switch to a different configured provider.
+    SetActiveProvider(String),
+    // Request the list of configured provider names.
+    GetProviders,
+    // Delete a named provider from the configuration.
+    DeleteProvider(String),
 }
 
 // Central application state for the DriftCLI TUI.
@@ -55,6 +67,10 @@ pub struct TuiApp {
     connect_form: connect::ConnectForm,
     variant_options: Vec<String>,
     variant_selected: usize,
+    // Multi-provider support: configured providers, selection index, and active name.
+    providers: Vec<String>,
+    provider_selected: usize,
+    provider_name: String,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     cmd_tx: mpsc::UnboundedSender<TuiCommand>,
     should_quit: bool,
@@ -68,6 +84,8 @@ pub enum TuiMode {
     Normal,
     ConnectSettings,
     VariantPicker,
+    // Provider switcher overlay (list configured providers with delete option)
+    ProviderPicker,
 }
 
 // A single chat message with optional reasoning/thinking content.
@@ -101,6 +119,9 @@ impl TuiApp {
             connect_form: connect::ConnectForm::from_config(llm_config),
             variant_options: Vec::new(),
             variant_selected: 0,
+            providers: Vec::new(),
+            provider_selected: 0,
+            provider_name: "default".to_string(),
             event_rx,
             cmd_tx,
             should_quit: false,
@@ -222,6 +243,10 @@ impl TuiApp {
                             TuiMode::VariantPicker => {
                                 self.handle_variant_key(key.code);
                             }
+                            // Delegate to the provider picker key handler.
+                            TuiMode::ProviderPicker => {
+                                self.handle_provider_key(key.code);
+                            }
                         }
                     }
                 }
@@ -230,7 +255,7 @@ impl TuiApp {
         Ok(())
     }
 
-    // Parse and execute slash commands like /connect, /variant, /clear, /quit.
+    // Parse and execute slash commands like /connect, /variant, /provider, /clear, /quit.
     fn handle_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         match cmd {
@@ -271,6 +296,10 @@ impl TuiApp {
                 self.variant_selected = selected;
                 self.mode = TuiMode::VariantPicker;
             }
+            // Open the provider picker overlay.
+            "/provider" => {
+                let _ = self.cmd_tx.send(TuiCommand::GetProviders);
+            }
             // Quit the application.
             "/quit" | "/exit" => {
                 self.should_quit = true;
@@ -284,7 +313,7 @@ impl TuiApp {
             _ => {
                 self.messages.push(ChatMessage {
                     role: "system".into(),
-                    content: format!("Unknown command: {}. Try /connect, /clear, /quit", cmd),
+                    content: format!("Unknown command: {}. Try /connect, /provider, /clear, /quit", cmd),
                     reasoning: None,
                 });
             }
@@ -345,8 +374,8 @@ impl TuiApp {
                     self.connect_form.select_model();
                 } else {
                     match self.connect_form.selected_field {
-                        // Field 3 (model): fetch the model list from the provider.
-                        3 => {
+                        // Field 4 (model): fetch the model list from the provider.
+                        4 => {
                             let provider = self.connect_form.provider_label().to_string();
                             let base_url = self.connect_form.base_url.clone();
                             let api_key = self.connect_form.api_key.clone();
@@ -358,16 +387,51 @@ impl TuiApp {
                             self.connect_form.fetching_models = true;
                             self.connect_form.status_message = "Fetching models...".into();
                         }
-                        // Field 4 (save): apply and persist connection settings.
-                        4 => {
+                        // Field 5 (save): apply and persist connection settings.
+                        5 => {
                             self.save_connect_settings();
                         }
-                        // Field 5 (cancel): return to normal mode without saving.
-                        5 => {
+                        // Field 6 (cancel): return to normal mode without saving.
+                        6 => {
                             self.mode = TuiMode::Normal;
                         }
                         _ => {}
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Handle key presses while the provider picker is active.
+    fn handle_provider_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = TuiMode::Normal,
+            KeyCode::Up => {
+                self.provider_selected = self.provider_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = self.providers.len(); // allow selection of [+ New Provider]
+                if self.provider_selected < max {
+                    self.provider_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if self.provider_selected < self.providers.len() {
+                    let name = self.providers[self.provider_selected].clone();
+                    let _ = self.cmd_tx.send(TuiCommand::SetActiveProvider(name));
+                    self.mode = TuiMode::Normal;
+                } else {
+                    // [+ New Provider]
+                    self.mode = TuiMode::ConnectSettings;
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.provider_selected < self.providers.len() {
+                    let name = self.providers[self.provider_selected].clone();
+                    let _ = self.cmd_tx.send(TuiCommand::DeleteProvider(name));
+                    // Re-request list
+                    let _ = self.cmd_tx.send(TuiCommand::GetProviders);
                 }
             }
             _ => {}
@@ -417,17 +481,18 @@ impl TuiApp {
         }
     }
 
-    // Build the LLM config from the form and send a Reconfigure command.
+    // Build the LLM config from the form and send a SaveProvider command.
     fn save_connect_settings(&mut self) {
+        let name = self.connect_form.to_provider_name();
         let config = self.connect_form.to_llm_config();
         self.model_name = self.connect_form.model.clone();
-        let summary = format!(
-            "{} @ {}",
-            self.connect_form.model,
+        self.provider_name = name.clone();
+        let _ = self.cmd_tx.send(TuiCommand::SaveProvider { name, config });
+        self.status_text = format!(
+            "Connected: {} @ {}",
+            self.model_name,
             self.connect_form.base_url
         );
-        let _ = self.cmd_tx.send(TuiCommand::Reconfigure(config));
-        self.status_text = format!("Connected: {}", summary);
         self.mode = TuiMode::Normal;
     }
 
@@ -502,6 +567,21 @@ impl TuiApp {
                     self.connect_form.model_list.len()
                 );
             }
+            // Received provider name list — enter provider picker mode.
+            AppEvent::ProviderList(names) => {
+                self.providers = names.clone();
+                self.provider_selected = names
+                    .iter()
+                    .position(|n| n == &self.provider_name)
+                    .unwrap_or(0);
+                self.mode = TuiMode::ProviderPicker;
+            }
+            // Provider was switched externally — update active name and model.
+            AppEvent::ProviderSwitched { name, model } => {
+                self.provider_name = name.clone();
+                self.model_name = model;
+                self.status_text = format!("Switched to {}", name);
+            }
         }
     }
 
@@ -529,6 +609,9 @@ impl TuiApp {
             }
             TuiMode::VariantPicker => {
                 f.render_widget(self.render_variant_picker(), chunks[0]);
+            }
+            TuiMode::ProviderPicker => {
+                f.render_widget(self.render_provider_picker(), chunks[0]);
             }
         }
 
@@ -570,12 +653,13 @@ impl TuiApp {
         let cursor_y = chunks[1].y + 1 + (visual_total / inner_width.max(1)) as u16;
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
-        // Status bar: color-coded status, model name, and keyboard shortcuts.
+        // Status bar: color-coded status, provider name, model name, and keyboard shortcuts.
         let status_style = match self.status_text.as_str() {
             s if s.starts_with("Idle") => Style::default().fg(Color::Green),
             s if s.starts_with("Waiting")
                 || s.starts_with("Thinking")
-                || s.starts_with("Connected") =>
+                || s.starts_with("Connected")
+                || s.starts_with("Switched") =>
             {
                 Style::default().fg(Color::Yellow)
             }
@@ -590,9 +674,19 @@ impl TuiApp {
             ),
             Span::raw(" | "),
             Span::styled(self.status_text.clone(), status_style),
-            Span::raw(" | model: "),
+            Span::raw(" | "),
+            Span::styled(&self.provider_name, Style::default().fg(Color::Cyan)),
+            Span::raw(" | "),
             Span::styled(&self.model_name, Style::default().fg(Color::Magenta)),
-            Span::raw(" | Ctrl+C: Interrupt | Ctrl+D: Quit | /connect: Configure"),
+            Span::styled(
+                self.connect_form
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|e| format!(" [{}]", e))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(" | Ctrl+C: Interrupt | Ctrl+D: Quit | /connect: Configure | /provider: Switch"),
         ]));
         f.render_widget(status, chunks[2]);
     }
@@ -643,7 +737,9 @@ impl TuiApp {
             .split(area);
 
         for (j, msg_index) in (start_idx..self.messages.len()).enumerate() {
-            if j >= chunks.len() { break; }
+            if j >= chunks.len() {
+                break;
+            }
             let msg = &self.messages[msg_index];
             let rect = chunks[j];
 
@@ -689,17 +785,18 @@ impl TuiApp {
         Paragraph::new(lines).block(block).style(style)
     }
 
-    // Render the connection settings form with provider, URL, key, model fields, and buttons.
+    // Render the connection settings form with provider name, type, URL, key, model fields, and buttons.
     fn render_connect_settings(&self) -> Paragraph<'_> {
         let form = &self.connect_form;
 
-        // Highlight flags for each form field.
-        let provider_highlight = form.selected_field == 0;
-        let url_highlight = form.selected_field == 1;
-        let key_highlight = form.selected_field == 2;
-        let model_highlight = form.selected_field == 3;
-        let save_highlight = form.selected_field == 4;
-        let cancel_highlight = form.selected_field == 5;
+        // Highlight flags for each form field. Fields: 0=name, 1=provider, 2=url, 3=key, 4=model, 5=save, 6=cancel.
+        let name_highlight = form.selected_field == 0;
+        let provider_highlight = form.selected_field == 1;
+        let url_highlight = form.selected_field == 2;
+        let key_highlight = form.selected_field == 3;
+        let model_highlight = form.selected_field == 4;
+        let save_highlight = form.selected_field == 5;
+        let cancel_highlight = form.selected_field == 6;
 
         // Obfuscate the API key for display.
         let key_display = if form.api_key.is_empty() {
@@ -718,6 +815,18 @@ impl TuiApp {
         };
 
         // Build styled spans for each form field based on highlight state.
+        let name_field = if name_highlight {
+            Span::styled(
+                format!("> {}", form.provider_name),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            )
+        } else {
+            Span::styled(
+                format!("  {}", form.provider_name),
+                Style::default().fg(Color::White),
+            )
+        };
+
         let provider_options = if provider_highlight {
             Span::styled(
                 format!("[ {} ]  (Left/Right to change)", form.provider_label()),
@@ -785,6 +894,10 @@ impl TuiApp {
 
         let mut lines = Vec::new();
         lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(vec![
+            Span::raw("  Name:       "),
+            name_field,
+        ]));
         lines.push(Line::from(vec![
             Span::raw("  Provider:   "),
             provider_options,
@@ -863,6 +976,59 @@ impl TuiApp {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" /connect — Configure Connection ")
+            .border_style(Style::default().fg(Color::Cyan));
+        Paragraph::new(lines).block(block)
+    }
+
+    // Render the provider picker overlay for switching between configured providers.
+    fn render_provider_picker(&self) -> Paragraph<'_> {
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Select provider:",
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        for (i, name) in self.providers.iter().enumerate() {
+            let active = name == &self.provider_name;
+            let arrow = if i == self.provider_selected { ">" } else { " " };
+            let text = if active {
+                format!("  {} * {}", arrow, name)
+            } else {
+                format!("    {} {}", arrow, name)
+            };
+            let style = if i == self.provider_selected {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            } else if active {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+
+        // [+ New Provider] option
+        let new_idx = self.providers.len();
+        let arrow = if self.provider_selected == new_idx { ">" } else { " " };
+        lines.push(Line::from(Span::raw("")));
+        let text = format!("    {} [+ New Provider]", arrow);
+        let style = if self.provider_selected == new_idx {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Up/Down: choose  Enter: switch  d: delete  Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" /provider — Switch Provider ")
             .border_style(Style::default().fg(Color::Cyan));
         Paragraph::new(lines).block(block)
     }

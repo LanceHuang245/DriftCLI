@@ -22,7 +22,10 @@ pub enum EventMsg {
     Done,
     // Retrieved list of available model IDs from the provider's API.
     ModelList(Vec<ModelInfo>),
-
+    // List of configured provider names for the /provider picker.
+    ProviderList(Vec<String>),
+    // Notification that the provider was switched, carrying the new provider name and model.
+    ProviderSwitched { name: String, model: String },
 }
 
 // AgentState: lifecycle states the agent transitions through during a processing turn.
