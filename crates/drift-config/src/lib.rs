@@ -3,12 +3,14 @@ use std::path::PathBuf;
 
 // ---------- Core Config ----------
 
+// AppConfig: top-level configuration combining agent behaviour and LLM provider settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub agent: AgentConfig,
     pub llm: LlmConfig,
 }
 
+// AgentConfig: tunable parameters for the agent's behaviour — model, iteration cap, temperature, thinking budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_model")]
@@ -23,10 +25,12 @@ pub struct AgentConfig {
     pub reasoning_effort: Option<String>,
 }
 
+// LlmConfig: tagged enum selecting the active LLM provider — one variant per backend family.
 /// The LLM provider configuration — only one active provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum LlmConfig {
+    // Anthropic Claude models via the Anthropic Messages API.
     Anthropic {
         api_key: String,
         model: String,
@@ -35,6 +39,7 @@ pub enum LlmConfig {
         #[serde(default)]
         reasoning_effort: Option<String>,
     },
+    // OpenAI or any OpenAI-compatible endpoint (vLLM, LocalAI, etc.) via the chat completions API.
     OpenAiCompatible {
         api_key: String,
         model: String,
@@ -62,6 +67,7 @@ fn default_openai_compat_base_url() -> String {
 
 // ---------- Config Loading ----------
 
+// ConfigError: exhaustive error set covering I/O, parse failures, and missing configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("Failed to read config: {0}")]
@@ -77,6 +83,7 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
+    // Load config with layered merge: CLI args → env vars → project .drift/ → global → hardcoded defaults.
     /// Load config with merge: CLI args > env vars > .drift/config.toml > ~/.config/drift/config.toml > defaults
     pub fn load(cli_model: Option<&str>, cli_api_key: Option<&str>) -> Result<Self, ConfigError> {
         let mut config = Self::load_defaults_with_files()?;
@@ -85,6 +92,7 @@ impl AppConfig {
         Ok(config)
     }
 
+    // Creates the global config directory and writes a default template if no config exists yet.
     /// Generate a default config and write it to disk
     pub fn init_global() -> Result<PathBuf, ConfigError> {
         let dir = Self::global_config_dir().ok_or(ConfigError::NoHomeDirectory)?;
@@ -97,6 +105,7 @@ impl AppConfig {
         Ok(path)
     }
 
+    // Creates the project-level .drift/ directory and writes a default config template.
     /// Init project-level config
     pub fn init_project(cwd: &PathBuf) -> Result<PathBuf, ConfigError> {
         let dir = cwd.join(".drift");
@@ -109,22 +118,26 @@ impl AppConfig {
         Ok(path)
     }
 
+    // Returns the platform-aware global config directory (e.g. ~/.config/drift on Linux).
     /// Global config directory (platform-aware via `directories` crate)
     pub fn global_config_dir() -> Option<PathBuf> {
         directories::ProjectDirs::from("com", "driftcli", "DriftCLI")
             .map(|d| d.config_dir().to_path_buf())
     }
 
+    // Returns the path to the global config.toml file.
     /// Global config file path
     pub fn global_config_path() -> Option<PathBuf> {
         Self::global_config_dir().map(|d| d.join("config.toml"))
     }
 
+    // Returns the path to the project-level .drift/config.toml file.
     /// Project config file path
     pub fn project_config_path(cwd: &PathBuf) -> PathBuf {
         cwd.join(".drift").join("config.toml")
     }
 
+    // Builds a config starting from hardcoded defaults, then merges global config on top.
     fn load_defaults_with_files() -> Result<Self, ConfigError> {
         // Start with hardcoded defaults
         let mut config = Self {
@@ -155,6 +168,7 @@ impl AppConfig {
         Ok(config)
     }
 
+    // Merges a project-level .drift/config.toml on top of the currently loaded config.
     /// Apply project-level config override (call after determining workspace)
     pub fn apply_project_override(&mut self, cwd: &PathBuf) -> Result<(), ConfigError> {
         let project_path = Self::project_config_path(cwd);
@@ -166,6 +180,7 @@ impl AppConfig {
         Ok(())
     }
 
+    // Overrides API key and model from DRIFT_API_KEY / DRIFT_MODEL environment variables.
     fn apply_env_overrides(&mut self) {
         if let Ok(key) = std::env::var("DRIFT_API_KEY") {
             match &mut self.llm {
@@ -178,6 +193,7 @@ impl AppConfig {
         }
     }
 
+    // Applies --model and --api-key CLI flags as the highest-priority overrides.
     fn apply_cli_overrides(&mut self, cli_model: Option<&str>, cli_api_key: Option<&str>) {
         if let Some(m) = cli_model {
             self.agent.model = m.to_string();
@@ -190,6 +206,7 @@ impl AppConfig {
         }
     }
 
+    // Reads a TOML file and merges its contents into a base config via merge_toml_value.
     fn merge_toml_file(mut base: Self, path: &PathBuf) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let overlay: toml::Value = toml::from_str(&content)?;
@@ -197,6 +214,7 @@ impl AppConfig {
         Ok(base)
     }
 
+    // Merges a TOML value overlay into an AppConfig: selectively overwrites agent and llm fields.
     fn merge_toml_value(config: &mut Self, overlay: &toml::Value) {
         if let Some(agent) = overlay.get("agent") {
             if let Some(m) = agent.get("model").and_then(|v| v.as_str()) {
@@ -278,6 +296,7 @@ impl AppConfig {
         }
     }
 
+    // Returns a default TOML config template string used for initializing new config files.
     fn default_template() -> String {
         r###"# DriftCLI Configuration
 # See dev-docs/11-configuration.md for all options
@@ -299,6 +318,7 @@ base_url = "https://api.anthropic.com/v1"
         .to_string()
     }
 
+    // Builds a display string summarizing the active provider, model, endpoint, and masked API key.
     /// Extract a display summary for the /connect command
     pub fn connection_summary(&self) -> String {
         let (provider_name, api_key, model, base_url) = match &self.llm {
@@ -337,6 +357,7 @@ base_url = "https://api.anthropic.com/v1"
         )
     }
 
+    // Serializes the current config and writes it to .drift/config.toml in the given project directory.
     /// Write the current config to the project .drift/config.toml
     pub fn save_to_project(&self, cwd: &std::path::PathBuf) -> Result<(), ConfigError> {
         let dir = cwd.join(".drift");
@@ -347,6 +368,7 @@ base_url = "https://api.anthropic.com/v1"
         Ok(())
     }
 
+    // Converts the current AppConfig into a human-readable TOML string with inline comments.
     fn to_toml_string(&self) -> String {
         let provider_str = match &self.llm {
             LlmConfig::Anthropic {

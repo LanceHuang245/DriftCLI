@@ -1,37 +1,39 @@
 use drift_llm::ModelInfo;
 use serde::{Deserialize, Serialize};
 
-/// Events emitted by the Agent core and consumed by TUI/storage/telemetry.
+// EventMsg: typed events emitted by the Agent core and consumed by the TUI event bridge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventMsg {
-    /// A text token in the streaming response
+    // A single text token from the streaming LLM response, forwarded to TUI.
     Token(String),
-    /// Reasoning/thinking text (for thinking models)
+    // Reasoning/thinking text chunk (for extended-thinking models), streamed before the final answer.
     Reasoning(String),
-    /// Token usage stats for this turn
+    // Token usage stats (input + output) reported after a turn completes.
     TokenUsage { input: usize, output: usize },
-    /// Agent state change
+    // Agent state transition notification (idle → thinking → generating → error).
     AgentState(AgentState),
-    /// Context is being compacted
+    // Context compaction has started — TUI may display a "compacting" indicator.
     ContextCompacting,
-    /// Context compaction complete
+    // Context compaction finished with a summary and the number of tokens saved.
     ContextCompacted { summary: String, saved_tokens: usize },
-    /// Error occurred
+    // A recoverable or non-recoverable error occurred during processing.
     Error { message: String, recoverable: bool },
-    /// Agent processing complete for this turn
+    // Agent finished processing for the current turn; TUI can accept new input.
     Done,
-    /// Model list fetched from provider
+    // Retrieved list of available model IDs from the provider's API.
     ModelList(Vec<ModelInfo>),
+
 }
 
+// AgentState: lifecycle states the agent transitions through during a processing turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AgentState {
-    /// Waiting for user input
+    // Waiting for the next user input; ready to accept commands.
     Idle,
-    /// LLM is thinking (before any text or tool call)
+    // LLM is thinking — the request has been sent but no tokens have been returned yet.
     Thinking,
-    /// Streaming text response
+    // Streaming a text response; the inner string accumulates generated content.
     Generating(String),
-    /// Error state
+    // Agent entered an error state with a human-readable description.
     Error(String),
 }

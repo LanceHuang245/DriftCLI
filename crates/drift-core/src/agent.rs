@@ -6,6 +6,7 @@ use drift_llm::{create_provider, fetch_anthropic_models, fetch_openai_compat_mod
 use tokio::sync::broadcast;
 use tracing::info;
 
+// Agent: orchestrates a chat session — holds config, LLM provider, event bus, and message history.
 pub struct Agent {
     config: AppConfig,
     llm: Box<dyn LlmProvider>,
@@ -15,6 +16,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    // Create a new agent: builds the LLM provider, opens a broadcast channel, and logs the connection.
     pub fn new(config: AppConfig, cwd: PathBuf) -> Result<Self, LlmError> {
         let llm = create_provider(&config.llm)?;
         let (event_tx, _) = broadcast::channel(256);
@@ -34,11 +36,13 @@ impl Agent {
         })
     }
 
+    // Subscribe returns a new broadcast receiver for consuming agent events in the TUI bridge.
     /// Get a receiver for agent events (for the TUI to subscribe to).
     pub fn subscribe(&self) -> broadcast::Receiver<EventMsg> {
         self.event_tx.subscribe()
     }
 
+    // Submit: sends user input to the LLM, streams chunks as events, and appends the reply to history.
     /// Submit user input and stream the response.
     /// Returns immediately; events are sent via the broadcast channel.
     pub async fn submit(&mut self, user_input: String) {
@@ -116,26 +120,31 @@ impl Agent {
         let _ = self.event_tx.send(EventMsg::Done);
     }
 
+    // Returns a human-readable summary of the current connection (provider, model, endpoint, key).
     /// Get the connection summary (for /connect display)
     pub fn connection_summary(&self) -> String {
         self.config.connection_summary()
     }
 
+    // Returns a static identifier string for the current LLM provider (e.g. "Anthropic").
     /// Provider ID
     pub fn provider_id(&self) -> &str {
         self.llm.provider_id()
     }
 
+    // Returns the currently configured model name string.
     /// Model name
     pub fn model_name(&self) -> &str {
         self.llm.model_name()
     }
 
+    // Clones the broadcast sender so external consumers can emit events through the agent's channel.
     /// Get the event sender for this agent
     pub fn event_sender(&self) -> broadcast::Sender<EventMsg> {
         self.event_tx.clone()
     }
 
+    // Reconfigure: swaps the LLM provider at runtime (e.g. from /connect) and persists the change to disk.
     /// Reconfigure the LLM provider at runtime and persist to disk
     pub async fn reconfigure(&mut self, llm_config: LlmConfig) -> Result<(), LlmError> {
         let model = match &llm_config {
@@ -159,6 +168,7 @@ impl Agent {
         Ok(())
     }
 
+    // Static method: queries the provider's API for available model IDs without needing an Agent instance.
     /// Fetch available models from the given provider params
     pub async fn fetch_models(
         provider: &str,
@@ -178,6 +188,7 @@ impl Agent {
         }
     }
 
+    // Builds the system prompt injected at the start of every conversation turn.
     fn get_system_prompt(&self) -> Option<String> {
         Some(format!(
             "You are DriftCLI, a helpful AI coding assistant running in the terminal.\n\

@@ -5,6 +5,7 @@ use drift_tui::{AppEvent, TuiApp, TuiCommand};
 use std::env;
 use tokio::sync::mpsc;
 
+// Cli: top-level argument struct parsed by clap — model, api_key, subcommands, and runtime options.
 #[derive(Parser)]
 #[command(name = "drift", version, about = "High-performance terminal AI coding agent")]
 struct Cli {
@@ -22,17 +23,20 @@ struct Cli {
     command: Option<Command>,
 }
 
+// Command: subcommands for one-shot operations (init project config, show connection info).
 #[derive(Subcommand)]
 enum Command {
     Init,
     Config,
 }
 
+// Main entry point: parses CLI, loads config, and either runs a subcommand or boots the TUI with an event bridge.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        // `drift init` — create a .drift/config.toml in the current directory.
         Some(Command::Init) => {
             let cwd = env::current_dir()?;
             let path = AppConfig::init_project(&cwd)?;
@@ -40,11 +44,13 @@ async fn main() -> anyhow::Result<()> {
             println!("Edit this file to set your LLM provider and API key.");
             return Ok(());
         }
+        // `drift config` — load config and print the current connection summary.
         Some(Command::Config) => {
             let config = AppConfig::load(cli.model.as_deref(), cli.api_key.as_deref())?;
             println!("{}", config.connection_summary());
             return Ok(());
         }
+        // Default: interactive mode — load config, start the agent, bridge events to the TUI, and run.
         None => {
             let mut config = AppConfig::load(cli.model.as_deref(), cli.api_key.as_deref())?;
 
@@ -59,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
             let (tui_tx, tui_rx) = mpsc::unbounded_channel();
             let mut core_rx = agent.subscribe();
+            // Event bridge task: subscribes to core Agent events and forwards them to the TUI via an mpsc channel.
             tokio::spawn(async move {
                 loop {
                     match core_rx.recv().await {
@@ -94,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
+            // Command handling task: receives TUI commands (chat, fetch models, reconfigure) and dispatches to the agent.
             tokio::spawn(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
@@ -131,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
+            // Start the TUI app on the main thread — blocks until the user exits.
             let mut tui = TuiApp::new(&llm_config, tui_rx, cmd_tx);
             tui.run()?;
         }
