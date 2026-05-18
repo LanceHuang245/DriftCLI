@@ -686,7 +686,7 @@ impl TuiApp {
                     .unwrap_or_default(),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::raw(" | Ctrl+C: Interrupt | Ctrl+D: Quit | /connect: Configure | /provider: Switch"),
+
         ]));
         f.render_widget(status, chunks[2]);
     }
