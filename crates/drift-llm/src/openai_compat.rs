@@ -100,13 +100,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         use futures::StreamExt;
 
-        let byte_stream = response.bytes_stream();
-        let line_stream = byte_stream.filter_map(|result| async move {
-            match result {
-                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
-                Err(_) => None,
-            }
-        });
+        let line_stream = crate::sse_text_stream(response);
 
         let event_stream = line_stream.filter_map(|line| async move {
             if let Some(data) = line.strip_prefix("data: ") {

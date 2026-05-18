@@ -26,6 +26,7 @@ impl LlmMessage {
 #[derive(Debug, Clone)]
 pub enum LlmChunk {
     TextDelta(String),
+    ReasoningDelta(String),
     Done,
 }
 

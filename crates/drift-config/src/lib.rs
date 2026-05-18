@@ -321,6 +321,55 @@ base_url = "https://api.anthropic.com/v1"
             provider_name, model, base_url, key_masked
         )
     }
+
+    /// Write the current config to the project .drift/config.toml
+    pub fn save_to_project(&self, cwd: &std::path::PathBuf) -> Result<(), ConfigError> {
+        let dir = cwd.join(".drift");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        let toml_str = self.to_toml_string();
+        std::fs::write(&path, toml_str)?;
+        Ok(())
+    }
+
+    fn to_toml_string(&self) -> String {
+        let provider_str = match &self.llm {
+            LlmConfig::Anthropic {
+                api_key,
+                model,
+                base_url,
+            } => {
+                format!(
+                    "provider = \"anthropic\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"",
+                    model, api_key, base_url
+                )
+            }
+            LlmConfig::OpenAiCompatible {
+                api_key,
+                model,
+                base_url,
+                supports_thinking,
+            } => {
+                format!(
+                    "provider = \"openai_compatible\"\nmodel = \"{}\"\napi_key = \"{}\"\nbase_url = \"{}\"\nsupports_thinking = {}",
+                    model, api_key, base_url, supports_thinking
+                )
+            }
+        };
+        format!(
+            "# DriftCLI Configuration — saved by TUI /connect\n\
+             \n\
+             [agent]\n\
+             model = \"{}\"\n\
+             max_iterations = {}\n\
+             \n\
+             [llm]\n\
+             {}\n",
+            self.agent.model,
+            self.agent.max_iterations,
+            provider_str,
+        )
+    }
 }
 
 #[cfg(test)]

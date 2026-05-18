@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use crate::event::{AgentState, EventMsg};
-use drift_config::AppConfig;
-use drift_llm::{create_provider, LlmError, LlmMessage, LlmProvider};
+use drift_config::{AppConfig, LlmConfig};
+use drift_llm::{create_provider, fetch_anthropic_models, fetch_openai_compat_models, LlmError, LlmMessage, LlmProvider};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -9,11 +11,11 @@ pub struct Agent {
     llm: Box<dyn LlmProvider>,
     event_tx: broadcast::Sender<EventMsg>,
     messages: Vec<LlmMessage>,
+    cwd: PathBuf,
 }
 
 impl Agent {
-    /// Create a new Agent from the loaded configuration.
-    pub fn new(config: AppConfig) -> Result<Self, LlmError> {
+    pub fn new(config: AppConfig, cwd: PathBuf) -> Result<Self, LlmError> {
         let llm = create_provider(&config.llm)?;
         let (event_tx, _) = broadcast::channel(256);
 
@@ -28,6 +30,7 @@ impl Agent {
             llm,
             event_tx,
             messages: Vec::new(),
+            cwd,
         })
     }
 
@@ -62,12 +65,16 @@ impl Agent {
         {
             Ok(mut stream) => {
                 let mut full_response = String::new();
+                let mut full_reasoning = String::new();
                 let mut streaming = false;
 
                 loop {
                     match stream.next().await {
                         Some(Ok(drift_llm::LlmChunk::TextDelta(text))) => {
                             if !streaming {
+                                if !full_reasoning.is_empty() {
+                                    let _ = self.event_tx.send(EventMsg::Reasoning(full_reasoning.clone()));
+                                }
                                 let _ = self.event_tx.send(EventMsg::AgentState(
                                     AgentState::Generating(String::new()),
                                 ));
@@ -75,6 +82,10 @@ impl Agent {
                             }
                             full_response.push_str(&text);
                             let _ = self.event_tx.send(EventMsg::Token(text));
+                        }
+                        Some(Ok(drift_llm::LlmChunk::ReasoningDelta(text))) => {
+                            full_reasoning.push_str(&text);
+                            let _ = self.event_tx.send(EventMsg::Reasoning(text));
                         }
                         Some(Ok(drift_llm::LlmChunk::Done)) => break,
                         Some(Err(e)) => {
@@ -118,6 +129,50 @@ impl Agent {
     /// Model name
     pub fn model_name(&self) -> &str {
         self.llm.model_name()
+    }
+
+    /// Get the event sender for this agent
+    pub fn event_sender(&self) -> broadcast::Sender<EventMsg> {
+        self.event_tx.clone()
+    }
+
+    /// Reconfigure the LLM provider at runtime and persist to disk
+    pub async fn reconfigure(&mut self, llm_config: LlmConfig) -> Result<(), LlmError> {
+        let model = match &llm_config {
+            LlmConfig::Anthropic { model, .. } => model.clone(),
+            LlmConfig::OpenAiCompatible { model, .. } => model.clone(),
+        };
+        self.config.agent.model = model;
+        self.config.llm = llm_config;
+        self.llm = create_provider(&self.config.llm)?;
+        if let Err(e) = self.config.save_to_project(&self.cwd) {
+            let _ = self.event_tx.send(EventMsg::Error {
+                message: format!("Failed to save config: {}", e),
+                recoverable: true,
+            });
+        }
+        info!(
+            provider = %self.llm.provider_id(),
+            model = %self.llm.model_name(),
+            "Agent reconfigured and config saved"
+        );
+        Ok(())
+    }
+
+    /// Fetch available models from the given provider params
+    pub async fn fetch_models(
+        provider: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<Vec<String>, LlmError> {
+        match provider {
+            "Anthropic" => fetch_anthropic_models(api_key, base_url).await,
+            "OpenAI Compatible" => fetch_openai_compat_models(api_key, base_url).await,
+            _ => Err(LlmError::Config(format!(
+                "Unknown provider: {}",
+                provider
+            ))),
+        }
     }
 
     fn get_system_prompt(&self) -> Option<String> {

@@ -1,3 +1,4 @@
+use crate::sse_text_stream;
 use crate::types::*;
 use crate::LlmProvider;
 use async_trait::async_trait;
@@ -95,13 +96,7 @@ impl LlmProvider for AnthropicProvider {
             };
         }
 
-        let byte_stream = response.bytes_stream();
-        let line_stream = byte_stream.filter_map(|result| async move {
-            match result {
-                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
-                Err(_) => None,
-            }
-        });
+        let line_stream = sse_text_stream(response);
 
         let event_stream = line_stream.filter_map(|line| async move {
             if let Some(data) = line.strip_prefix("data: ") {
@@ -113,7 +108,9 @@ impl LlmProvider for AnthropicProvider {
                     Ok(event) => match event.event_type.as_str() {
                         "content_block_delta" => {
                             if let Some(delta) = &event.delta {
-                                if let Some(text) = &delta.text {
+                                if let Some(thinking) = &delta.thinking {
+                                    Some(Ok(LlmChunk::ReasoningDelta(thinking.clone())))
+                                } else if let Some(text) = &delta.text {
                                     Some(Ok(LlmChunk::TextDelta(text.clone())))
                                 } else {
                                     None
@@ -146,4 +143,5 @@ struct AnthropicStreamEvent {
 #[derive(Debug, Deserialize)]
 struct AnthropicDelta {
     text: Option<String>,
+    thinking: Option<String>,
 }

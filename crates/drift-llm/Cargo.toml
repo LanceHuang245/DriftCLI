@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 drift-config = { path = "../drift-config" }
+bytes = "1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { workspace = true, features = ["macros"] }
 tokio-stream = "0.1"

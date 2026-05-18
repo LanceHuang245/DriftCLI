@@ -19,6 +19,8 @@ pub enum EventMsg {
     Error { message: String, recoverable: bool },
     /// Agent processing complete for this turn
     Done,
+    /// Model list fetched from provider
+    ModelList(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
