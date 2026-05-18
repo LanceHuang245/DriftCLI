@@ -334,11 +334,28 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .split(size);
+
+        match self.mode {
+            TuiMode::Normal => {
+                self.render_chat_area(chunks[0], f);
+            }
+            TuiMode::ConnectSettings => {
+                f.render_widget(self.render_connect_settings(), chunks[0]);
+            }
+        }
+
+        let prompt_text = format!("> {}", self.input_buffer);
+        let cursor_abs = self.input_buffer.len() + 2;
+        let cursor_x = (cursor_abs % size.width as usize) as u16;
+        let cursor_y = chunks[1].y;
+        let prompt = Paragraph::new(prompt_text).block(Block::default().borders(Borders::TOP));
+        f.render_widget(prompt, chunks[1]);
+        f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
         let status_style = match self.status_text.as_str() {
             s if s.starts_with("Idle") => Style::default().fg(Color::Green),
@@ -363,61 +380,93 @@ impl TuiApp {
             Span::styled(&self.model_name, Style::default().fg(Color::Magenta)),
             Span::raw(" | Ctrl+C: Interrupt | Ctrl+D: Quit | /connect: Configure"),
         ]));
-        f.render_widget(status, chunks[0]);
-
-        match self.mode {
-            TuiMode::Normal => {
-                f.render_widget(self.render_chat(), chunks[1]);
-            }
-            TuiMode::ConnectSettings => {
-                f.render_widget(self.render_connect_settings(), chunks[1]);
-            }
-        }
-
-        let prompt_text = format!("> {}", self.input_buffer);
-        let cursor_pos = self.input_buffer.len() + 2;
-        let prompt = Paragraph::new(prompt_text).block(Block::default().borders(Borders::TOP));
-        f.render_widget(prompt, chunks[2]);
-
-        f.set_cursor_position(Position::new(
-            (cursor_pos % size.width as usize) as u16,
-            chunks[2].y,
-        ));
+        f.render_widget(status, chunks[2]);
     }
 
-    fn render_chat(&self) -> Paragraph<'_> {
+    fn render_chat_area(&self, area: ratatui::layout::Rect, f: &mut ratatui::Frame) {
+        if self.messages.is_empty() {
+            return;
+        }
+
+        let mut heights: Vec<usize> = Vec::new();
+        for msg in &self.messages {
+            let content_lines = msg.content.lines().count().max(1);
+            let reasoning_lines = msg.reasoning.as_ref().map(|r| r.lines().count()).unwrap_or(0);
+            let frame_padding = if msg.role == "user" { 2 } else { 0 };
+            heights.push(content_lines + reasoning_lines + frame_padding);
+        }
+
+        let available = area.height as usize;
+        let mut total = 0usize;
+        let mut start_idx = heights.len();
+        for i in (0..heights.len()).rev() {
+            if total + heights[i] > available {
+                break;
+            }
+            total += heights[i];
+            start_idx = i;
+        }
+        if start_idx >= self.messages.len() {
+            return;
+        }
+
+        let visible_heights: Vec<usize> = heights[start_idx..].to_vec();
+        if visible_heights.is_empty() {
+            return;
+        }
+
+        let constraints: Vec<Constraint> = visible_heights
+            .iter()
+            .map(|&h| Constraint::Length(h as u16))
+            .collect();
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+
+        for (j, msg_index) in (start_idx..self.messages.len()).enumerate() {
+            if j >= chunks.len() { break; }
+            let msg = &self.messages[msg_index];
+            let rect = chunks[j];
+
+            f.render_widget(self.render_message(msg), rect);
+        }
+    }
+
+    fn render_message(&self, msg: &ChatMessage) -> Paragraph<'_> {
         let mut lines: Vec<Line> = Vec::new();
 
-        for msg in &self.messages {
-            let prefix = match msg.role.as_str() {
-                "user" => Span::styled("You: ", Style::default().fg(Color::Green)),
-                "assistant" => Span::styled("Drift: ", Style::default().fg(Color::Cyan)),
-                "system" => Span::styled("System: ", Style::default().fg(Color::Yellow)),
-                _ => Span::raw(""),
-            };
-
-            if let Some(reasoning) = &msg.reasoning {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "  [thinking]",
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-                for line in reasoning.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-
-            for line in msg.content.lines() {
-                lines.push(Line::from(vec![prefix.clone(), Span::raw(line.to_string())]));
+        if let Some(reasoning) = &msg.reasoning {
+            for line in reasoning.lines() {
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
         }
 
-        let block = Block::default().borders(Borders::NONE);
-        Paragraph::new(lines).block(block)
+        for line in msg.content.lines() {
+            lines.push(Line::from(Span::raw(line.to_string())));
+        }
+
+        let block = match msg.role.as_str() {
+            "user" => Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+            "system" => Block::default()
+                .borders(Borders::NONE)
+                .style(Style::default().fg(Color::Yellow)),
+            _ => Block::default().borders(Borders::NONE),
+        };
+
+        let style = match msg.role.as_str() {
+            "user" => Style::default().fg(Color::White),
+            "system" => Style::default().fg(Color::Yellow),
+            _ => Style::default(),
+        };
+
+        Paragraph::new(lines).block(block).style(style)
     }
 
     fn render_connect_settings(&self) -> Paragraph<'_> {
