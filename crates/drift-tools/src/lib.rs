@@ -1,5 +1,7 @@
 //! drift-tools: Tool execution framework — core types, `Tool` trait, and `ToolRegistry`.
 
+pub mod tools;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
