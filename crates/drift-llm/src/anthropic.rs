@@ -64,11 +64,13 @@ impl LlmProvider for AnthropicProvider {
                             Some(serde_json::json!({"type": "text", "text": t}))
                         }
                         ContentPart::ToolCall { id, name, arguments } => {
+                            let input = serde_json::from_str::<serde_json::Value>(arguments)
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                             Some(serde_json::json!({
                                 "type": "tool_use",
                                 "id": id,
                                 "name": name,
-                                "input": serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default(),
+                                "input": input,
                             }))
                         }
                         ContentPart::ToolResult { tool_use_id, content, is_error } => {
