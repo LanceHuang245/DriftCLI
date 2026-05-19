@@ -81,7 +81,10 @@ impl LlmProvider for AnthropicProvider {
             body["reasoning_effort"] = serde_json::Value::String(effort.clone());
         }
         if let Some(ref tool_list) = tools {
+            tracing::info!(count = tool_list.len(), "anthropic: adding tools to request");
             body["tools"] = serde_json::json!(tool_list);
+        } else {
+            tracing::info!("anthropic: no tools in request");
         }
 
         let response = self

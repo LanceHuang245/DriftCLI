@@ -96,6 +96,7 @@ impl Agent {
             let tools = if tools_json.is_empty() {
                 None
             } else {
+                tracing::info!(tool_count = tools_json.len(), "sending tools to LLM");
                 Some(tools_json)
             };
 
