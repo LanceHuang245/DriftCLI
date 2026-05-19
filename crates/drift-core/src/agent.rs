@@ -185,7 +185,15 @@ impl Agent {
                             completed_tool_calls.push(tc);
                         }
                     }
-                    Some(Ok(LlmChunk::Done)) => break,
+                    Some(Ok(LlmChunk::Done)) => {
+                        // Drain remaining active tool calls — some providers
+                        // (OpenAI compat) don't emit ToolCallEnd, so everything
+                        // left in active_tool_calls is a complete tool call.
+                        for (_, tc) in active_tool_calls.drain() {
+                            completed_tool_calls.push(tc);
+                        }
+                        break;
+                    }
                     Some(Err(e)) => {
                         let _ = self.event_tx.send(EventMsg::Error {
                             message: e.to_string(),
@@ -205,28 +213,34 @@ impl Agent {
                 break;
             }
 
-            // Build the assistant message content (text + tool_use blocks)
-            let mut assistant_content = Vec::new();
-            if !full_response.is_empty() {
-                assistant_content.push(serde_json::json!({
-                    "type": "text",
-                    "text": full_response,
-                }));
+            // Build assistant message — provider-aware format.
+            let is_openai = self.llm.provider_id() == "openai_compatible";
+            if is_openai {
+                if !full_response.is_empty() {
+                    self.messages.push(LlmMessage::assistant(full_response));
+                }
+            } else {
+                let mut assistant_content = Vec::new();
+                if !full_response.is_empty() {
+                    assistant_content.push(serde_json::json!({
+                        "type": "text",
+                        "text": full_response,
+                    }));
+                }
+                for tc in &completed_tool_calls {
+                    assistant_content.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": serde_json::from_str::<serde_json::Value>(&tc.args_string()).unwrap_or_default(),
+                    }));
+                }
+                self.messages.push(LlmMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::Array(assistant_content),
+                    tool_call_id: None,
+                });
             }
-            for tc in &completed_tool_calls {
-                assistant_content.push(serde_json::json!({
-                    "type": "tool_use",
-                    "id": tc.id,
-                    "name": tc.name,
-                    "input": serde_json::from_str::<serde_json::Value>(&tc.args_string()).unwrap_or_default(),
-                }));
-            }
-
-            // Store assistant message with tool_use blocks as native JSON array
-            self.messages.push(LlmMessage {
-                role: "assistant".to_string(),
-                content: serde_json::Value::Array(assistant_content),
-            });
 
             // Execute each tool call sequentially
             let mut tool_results_content = Vec::new();
@@ -282,11 +296,22 @@ impl Agent {
                 }
             }
 
-            // Add tool results as a user message with native JSON array
-            self.messages.push(LlmMessage {
-                role: "user".to_string(),
-                content: serde_json::Value::Array(tool_results_content),
-            });
+            // Add tool results — provider-aware format.
+            if is_openai {
+                for r in &tool_results_content {
+                    self.messages.push(LlmMessage {
+                        role: "tool".to_string(),
+                        content: r["content"].clone(),
+                        tool_call_id: Some(r["tool_use_id"].as_str().unwrap_or("").to_string()),
+                    });
+                }
+            } else {
+                self.messages.push(LlmMessage {
+                    role: "user".to_string(),
+                    content: serde_json::Value::Array(tool_results_content),
+                    tool_call_id: None,
+                });
+            }
 
             // Warn if we're approaching the iteration limit
             if iteration >= max_iterations.saturating_sub(2) {

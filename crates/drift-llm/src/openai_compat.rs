@@ -56,12 +56,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
         for m in &messages {
             let role = match m.role.as_str() {
                 "assistant" => "assistant",
+                "tool" => "tool",
                 _ => "user",
             };
-            api_messages.push(serde_json::json!({
+            let mut msg = serde_json::json!({
                 "role": role,
                 "content": m.content,
-            }));
+            });
+            if let Some(ref tci) = m.tool_call_id {
+                msg["tool_call_id"] = serde_json::json!(tci);
+            }
+            api_messages.push(msg);
         }
 
         let mut body = serde_json::json!({

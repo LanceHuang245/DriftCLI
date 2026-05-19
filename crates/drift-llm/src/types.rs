@@ -6,6 +6,7 @@ use tokio_stream::Stream;
 pub struct LlmMessage {
     pub role: String,
     pub content: serde_json::Value,
+    pub tool_call_id: Option<String>,
 }
 
 impl LlmMessage {
@@ -13,12 +14,21 @@ impl LlmMessage {
         Self {
             role: "user".into(),
             content: serde_json::Value::String(content.into()),
+            tool_call_id: None,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
             content: serde_json::Value::String(content.into()),
+            tool_call_id: None,
+        }
+    }
+    pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: serde_json::Value::String(content.into()),
+            tool_call_id: Some(tool_call_id),
         }
     }
 }
