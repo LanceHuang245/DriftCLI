@@ -2,70 +2,78 @@ use pin_project_lite::pin_project;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
+/// Provider-agnostic content part — the unified message content format.
+/// Each provider converts these to/from its native wire format.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolCallInfo {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
+pub enum ContentPart {
+    Text(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    Reasoning(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct LlmMessage {
     pub role: String,
-    pub content: serde_json::Value,
-    pub tool_call_id: Option<String>,
-    pub tool_calls: Option<Vec<ToolCallInfo>>,
-    pub reasoning_content: Option<String>,
+    pub content: Vec<ContentPart>,
 }
 
 impl LlmMessage {
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: serde_json::Value::String(content.into()),
-            tool_call_id: None,
-            tool_calls: None,
-            reasoning_content: None,
+            content: vec![ContentPart::Text(text.into())],
         }
     }
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
-            content: serde_json::Value::String(content.into()),
-            tool_call_id: None,
-            tool_calls: None,
-            reasoning_content: None,
-        }
-    }
-    pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".into(),
-            content: serde_json::Value::String(content.into()),
-            tool_call_id: Some(tool_call_id),
-            tool_calls: None,
-            reasoning_content: None,
-        }
-    }
-    pub fn assistant_with_tools(
-        text: impl Into<String>,
-        reasoning: Option<String>,
-        tool_calls: Vec<ToolCallInfo>,
-    ) -> Self {
-        let text = text.into();
-        Self {
-            role: "assistant".into(),
-            content: if text.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(text)
-            },
-            tool_call_id: None,
-            tool_calls: Some(tool_calls),
-            reasoning_content: reasoning,
+            content: vec![ContentPart::Text(text.into())],
         }
     }
 }
 
+/// Convenience: extract all Text parts as a single string.
+pub fn extract_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|p| {
+            if let ContentPart::Text(t) = p {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Convenience: extract all Reasoning parts as a single string.
+pub fn extract_reasoning(parts: &[ContentPart]) -> Option<String> {
+    let r: String = parts
+        .iter()
+        .filter_map(|p| {
+            if let ContentPart::Reasoning(t) = p {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if r.is_empty() {
+        None
+    } else {
+        Some(r)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum LlmChunk {

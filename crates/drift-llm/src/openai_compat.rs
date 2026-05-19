@@ -54,38 +54,60 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
 
         for m in &messages {
-            let role = match m.role.as_str() {
-                "assistant" => "assistant",
-                "tool" => "tool",
-                _ => "user",
-            };
-            let mut msg = serde_json::json!({
-                "role": role,
-                "content": m.content,
-            });
-            if let Some(ref tci) = m.tool_call_id {
-                msg["tool_call_id"] = serde_json::json!(tci);
+            match m.role.as_str() {
+                "tool" => {
+                    for part in &m.content {
+                        if let ContentPart::ToolResult { tool_use_id, content, .. } = part {
+                            api_messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": content,
+                            }));
+                        }
+                    }
+                }
+                _ => {
+                    let role = if m.role.as_str() == "assistant" {
+                        "assistant"
+                    } else {
+                        "user"
+                    };
+                    let text = extract_text(&m.content);
+                    let reasoning = extract_reasoning(&m.content);
+                    let tc_list: Vec<ContentPart> = m
+                        .content
+                        .iter()
+                        .filter(|p| matches!(p, ContentPart::ToolCall { .. }))
+                        .cloned()
+                        .collect();
+
+                    let mut msg = serde_json::json!({
+                        "role": role,
+                        "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text) },
+                    });
+                    if let Some(r) = reasoning {
+                        msg["reasoning_content"] = serde_json::json!(r);
+                    }
+                    if !tc_list.is_empty() {
+                        let tc_json: Vec<serde_json::Value> = tc_list
+                            .iter()
+                            .map(|tc| {
+                                if let ContentPart::ToolCall { id, name, arguments } = tc {
+                                    serde_json::json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": arguments }
+                                    })
+                                } else {
+                                    unreachable!()
+                                }
+                            })
+                            .collect();
+                        msg["tool_calls"] = serde_json::json!(tc_json);
+                    }
+                    api_messages.push(msg);
+                }
             }
-            if let Some(ref tool_calls) = m.tool_calls {
-                let tc_json: Vec<serde_json::Value> = tool_calls
-                    .iter()
-                    .map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments,
-                            }
-                        })
-                    })
-                    .collect();
-                msg["tool_calls"] = serde_json::json!(tc_json);
-            }
-            if let Some(ref reasoning) = m.reasoning_content {
-                msg["reasoning_content"] = serde_json::json!(reasoning);
-            }
-            api_messages.push(msg);
         }
 
         let mut body = serde_json::json!({

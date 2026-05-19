@@ -56,10 +56,37 @@ impl LlmProvider for AnthropicProvider {
                     "assistant" => "assistant",
                     _ => "user",
                 };
-                // Pass content as-is — supports both plain string and structured content blocks
+                let content_blocks: Vec<serde_json::Value> = m
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text(t) => {
+                            Some(serde_json::json!({"type": "text", "text": t}))
+                        }
+                        ContentPart::ToolCall { id, name, arguments } => {
+                            Some(serde_json::json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default(),
+                            }))
+                        }
+                        ContentPart::ToolResult { tool_use_id, content, is_error } => {
+                            Some(serde_json::json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": content,
+                                "is_error": is_error,
+                            }))
+                        }
+                        ContentPart::Reasoning(r) => {
+                            Some(serde_json::json!({"type": "thinking", "thinking": r}))
+                        }
+                    })
+                    .collect();
                 serde_json::json!({
                     "role": role,
-                    "content": m.content,
+                    "content": content_blocks,
                 })
             })
             .collect();

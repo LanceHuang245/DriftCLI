@@ -213,41 +213,32 @@ impl Agent {
                 break;
             }
 
-            // Build assistant message — provider-aware format.
-            let is_openai = self.llm.provider_id() == "openai_compatible";
-            if is_openai {
-                // Plain text: don't include tool_calls in history for max model compatibility.
-                // The tool results are injected as a plain user message below.
-                if !full_response.is_empty() {
-                    self.messages.push(LlmMessage::assistant(full_response));
-                }
-            } else {
-                let mut assistant_content = Vec::new();
-                if !full_response.is_empty() {
-                    assistant_content.push(serde_json::json!({
-                        "type": "text",
-                        "text": full_response,
-                    }));
-                }
-                for tc in &completed_tool_calls {
-                    assistant_content.push(serde_json::json!({
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.name,
-                        "input": serde_json::from_str::<serde_json::Value>(&tc.args_string()).unwrap_or_default(),
-                    }));
-                }
-                self.messages.push(LlmMessage {
-                    role: "assistant".to_string(),
-                    content: serde_json::Value::Array(assistant_content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
+            // Build assistant message with unified ContentParts (provider-agnostic).
+            let mut content_parts: Vec<drift_llm::ContentPart> = Vec::new();
+            if !full_reasoning.is_empty() {
+                content_parts.push(drift_llm::ContentPart::Reasoning(std::mem::take(
+                    &mut full_reasoning,
+                )));
+            }
+            if !full_response.is_empty() {
+                content_parts.push(drift_llm::ContentPart::Text(std::mem::take(
+                    &mut full_response,
+                )));
+            }
+            for tc in &completed_tool_calls {
+                content_parts.push(drift_llm::ContentPart::ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.args_string(),
                 });
             }
+            self.messages.push(LlmMessage {
+                role: "assistant".into(),
+                content: content_parts,
+            });
 
             // Execute each tool call sequentially
-            let mut tool_results_content = Vec::new();
+            let mut tool_result_parts: Vec<drift_llm::ContentPart> = Vec::new();
             for tc in &completed_tool_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.args_string()).unwrap_or_default();
@@ -276,12 +267,11 @@ impl Agent {
                             success: r.success,
                             error: r.error.clone(),
                         });
-                        tool_results_content.push(serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": tc.id,
-                            "content": r.content,
-                            "is_error": !r.success,
-                        }));
+                        tool_result_parts.push(drift_llm::ContentPart::ToolResult {
+                            tool_use_id: tc.id.clone(),
+                            content: r.content,
+                            is_error: !r.success,
+                        });
                     }
                     Err(e) => {
                         let _ = self.event_tx.send(EventMsg::ToolExecEnd {
@@ -290,45 +280,20 @@ impl Agent {
                             success: false,
                             error: Some(e.to_string()),
                         });
-                        tool_results_content.push(serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": tc.id,
-                            "content": format!("Error: {}", e),
-                            "is_error": true,
-                        }));
+                        tool_result_parts.push(drift_llm::ContentPart::ToolResult {
+                            tool_use_id: tc.id.clone(),
+                            content: format!("Error: {}", e),
+                            is_error: true,
+                        });
                     }
                 }
             }
 
-            // Add tool results — provider-aware format.
-            // OpenAI-compatible: plain text user message (more broadly compatible than role:"tool")
-            if is_openai {
-                let mut result_text = String::from("Tool results:\n\n");
-                for r in &tool_results_content {
-                    let tool_name = completed_tool_calls
-                        .iter()
-                        .find(|tc| tc.id == r["tool_use_id"].as_str().unwrap_or(""))
-                        .map(|tc| tc.name.as_str())
-                        .unwrap_or("unknown");
-                    let content = r["content"].as_str().unwrap_or("");
-                    let is_error = r["is_error"].as_bool().unwrap_or(false);
-                    result_text.push_str(&format!(
-                        "--- {} ({}) ---\n{}\n\n",
-                        tool_name,
-                        if is_error { "FAILED" } else { "OK" },
-                        content,
-                    ));
-                }
-                self.messages.push(LlmMessage::user(result_text));
-            } else {
-                self.messages.push(LlmMessage {
-                    role: "user".to_string(),
-                    content: serde_json::Value::Array(tool_results_content),
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                });
-            }
+            // Add tool results as a user message (provider-agnostic).
+            self.messages.push(LlmMessage {
+                role: "user".into(),
+                content: tool_result_parts,
+            });
 
             // Warn if we're approaching the iteration limit
             if iteration >= max_iterations.saturating_sub(2) {
