@@ -5,20 +5,20 @@ use tokio_stream::Stream;
 #[derive(Debug, Clone)]
 pub struct LlmMessage {
     pub role: String,
-    pub content: String,
+    pub content: serde_json::Value,
 }
 
 impl LlmMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: content.into(),
+            content: serde_json::Value::String(content.into()),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
-            content: content.into(),
+            content: serde_json::Value::String(content.into()),
         }
     }
 }

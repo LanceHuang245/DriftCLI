@@ -221,11 +221,10 @@ impl Agent {
                 }));
             }
 
-            // Store assistant message with tool_use blocks
-            let assistant_json = serde_json::to_string(&assistant_content).unwrap_or_default();
+            // Store assistant message with tool_use blocks as native JSON array
             self.messages.push(LlmMessage {
                 role: "assistant".to_string(),
-                content: assistant_json,
+                content: serde_json::Value::Array(assistant_content),
             });
 
             // Execute each tool call sequentially
@@ -282,11 +281,10 @@ impl Agent {
                 }
             }
 
-            // Add tool results as a user message
-            let results_json = serde_json::to_string(&tool_results_content).unwrap_or_default();
+            // Add tool results as a user message with native JSON array
             self.messages.push(LlmMessage {
                 role: "user".to_string(),
-                content: results_json,
+                content: serde_json::Value::Array(tool_results_content),
             });
 
             // Warn if we're approaching the iteration limit
@@ -415,8 +413,7 @@ impl Agent {
 
     // Builds the system prompt for every conversation turn.
     fn get_system_prompt(&self) -> Option<String> {
-        // Count tools synchronously for the prompt
-        let tool_count = self.tool_registry.definitions_sync().len();
+        let tool_count = self.tool_registry.builtin_count();
         Some(format!(
             "You are DriftCLI, a helpful AI coding assistant running in the terminal.\n\
              You are powered by {} (model: {}).\n\

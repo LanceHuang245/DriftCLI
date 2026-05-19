@@ -96,6 +96,11 @@ impl ToolRegistry {
         self.builtins.insert(tool.name().to_string(), tool);
     }
 
+    /// Number of built-in tools registered.
+    pub fn builtin_count(&self) -> usize {
+        self.builtins.len()
+    }
+
     /// Register a tool whose lifecycle can be managed at runtime.
     pub async fn register_dynamic(&self, tool: Arc<dyn Tool>) {
         self.dynamic.write().await.insert(tool.name().to_string(), tool);
@@ -127,17 +132,6 @@ impl ToolRegistry {
         let mut defs: Vec<ToolDefinition> =
             self.builtins.values().map(|t| t.definition()).collect();
         let dynamic = self.dynamic.read().await;
-        for tool in dynamic.values() {
-            defs.push(tool.definition());
-        }
-        defs
-    }
-
-    /// Synchronous version — uses blocking read for dynamic tools.
-    pub fn definitions_sync(&self) -> Vec<ToolDefinition> {
-        let mut defs: Vec<ToolDefinition> =
-            self.builtins.values().map(|t| t.definition()).collect();
-        let dynamic = self.dynamic.blocking_read();
         for tool in dynamic.values() {
             defs.push(tool.definition());
         }

@@ -56,6 +56,7 @@ impl LlmProvider for AnthropicProvider {
                     "assistant" => "assistant",
                     _ => "user",
                 };
+                // Pass content as-is — supports both plain string and structured content blocks
                 serde_json::json!({
                     "role": role,
                     "content": m.content,
