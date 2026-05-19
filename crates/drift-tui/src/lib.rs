@@ -509,23 +509,18 @@ impl TuiApp {
         match event {
             // Streaming response token — append to the in-progress assistant message.
             AppEvent::Token(text) => {
+                let was_empty = self.current_response.is_empty();
                 self.current_response.push_str(&text);
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == "assistant" {
-                        last.content = self.current_response.clone();
-                    } else {
-                        self.messages.push(ChatMessage {
-                            role: "assistant".into(),
-                            content: self.current_response.clone(),
-                            reasoning: None,
-                        });
-                    }
-                } else {
+                if was_empty {
                     self.messages.push(ChatMessage {
                         role: "assistant".into(),
-                        content: self.current_response.clone(),
+                        content: text,
                         reasoning: None,
                     });
+                } else if let Some(last) = self.messages.last_mut() {
+                    if last.role == "assistant" {
+                        last.content = self.current_response.clone();
+                    }
                 }
                 self.status_text = "Generating...".into();
             }
@@ -551,18 +546,10 @@ impl TuiApp {
                     self.status_text = "Error".into();
                 }
             }
-            // Response streaming complete — attach reasoning and clear buffers.
+            // Response streaming complete — finalize the message and reset.
             AppEvent::Done => {
+                self.commit_current_response();
                 self.status_text = "Idle".into();
-                if !self.current_reasoning.is_empty() {
-                    if let Some(last) = self.messages.last_mut() {
-                        if last.role == "assistant" {
-                            last.reasoning = Some(self.current_reasoning.clone());
-                        }
-                    }
-                }
-                self.current_response.clear();
-                self.current_reasoning.clear();
             }
             // Received model list — populate the dropdown in connect mode.
             AppEvent::ModelList(models) => {
@@ -590,8 +577,9 @@ impl TuiApp {
                 self.model_name = model;
                 self.status_text = format!("Switched to {}", name);
             }
-            // Tool call requested by LLM — show in status bar.
+            // Tool call requested by LLM — commit in-progress text and prepare for tool execution.
             AppEvent::ToolCallStart { name, .. } => {
+                self.commit_current_response();
                 self.status_text = format!("Calling tool: {}", name);
             }
             // Tool call args streaming — not surfaced to TUI yet.
@@ -604,9 +592,28 @@ impl TuiApp {
             }
             // Tool execution finished — update status with result.
             AppEvent::ToolExecEnd { name, success, .. } => {
-                let status = if success { "Idle" } else { &format!("Tool {} failed", name) };
-                self.status_text = status.to_string();
+                self.status_text = if success {
+                    format!("Tool {} completed", name)
+                } else {
+                    format!("Tool {} failed", name)
+                };
             }
+        }
+    }
+
+    // Save the current in-progress response as a complete message and clear for the next turn.
+    fn commit_current_response(&mut self) {
+        if !self.current_response.is_empty() || !self.current_reasoning.is_empty() {
+            if let Some(last) = self.messages.last_mut() {
+                if last.role == "assistant" {
+                    last.content = self.current_response.clone();
+                    if !self.current_reasoning.is_empty() {
+                        last.reasoning = Some(self.current_reasoning.clone());
+                    }
+                }
+            }
+            self.current_response.clear();
+            self.current_reasoning.clear();
         }
     }
 
