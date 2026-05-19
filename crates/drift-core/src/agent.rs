@@ -216,24 +216,11 @@ impl Agent {
             // Build assistant message — provider-aware format.
             let is_openai = self.llm.provider_id() == "openai_compatible";
             if is_openai {
-                let tc_infos: Vec<drift_llm::ToolCallInfo> = completed_tool_calls
-                    .iter()
-                    .map(|tc| drift_llm::ToolCallInfo {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.args_string(),
-                    })
-                    .collect();
-                self.messages
-                    .push(LlmMessage::assistant_with_tools(
-                        full_response,
-                        if full_reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(full_reasoning)
-                        },
-                        tc_infos,
-                    ));
+                // Plain text: don't include tool_calls in history for max model compatibility.
+                // The tool results are injected as a plain user message below.
+                if !full_response.is_empty() {
+                    self.messages.push(LlmMessage::assistant(full_response));
+                }
             } else {
                 let mut assistant_content = Vec::new();
                 if !full_response.is_empty() {
@@ -314,13 +301,25 @@ impl Agent {
             }
 
             // Add tool results — provider-aware format.
+            // OpenAI-compatible: plain text user message (more broadly compatible than role:"tool")
             if is_openai {
+                let mut result_text = String::from("Tool results:\n\n");
                 for r in &tool_results_content {
-                    let id = r["tool_use_id"].as_str().unwrap_or("").to_string();
+                    let tool_name = completed_tool_calls
+                        .iter()
+                        .find(|tc| tc.id == r["tool_use_id"].as_str().unwrap_or(""))
+                        .map(|tc| tc.name.as_str())
+                        .unwrap_or("unknown");
                     let content = r["content"].as_str().unwrap_or("");
-                    self.messages
-                        .push(LlmMessage::tool_result(id, content));
+                    let is_error = r["is_error"].as_bool().unwrap_or(false);
+                    result_text.push_str(&format!(
+                        "--- {} ({}) ---\n{}\n\n",
+                        tool_name,
+                        if is_error { "FAILED" } else { "OK" },
+                        content,
+                    ));
                 }
+                self.messages.push(LlmMessage::user(result_text));
             } else {
                 self.messages.push(LlmMessage {
                     role: "user".to_string(),
