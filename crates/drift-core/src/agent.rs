@@ -414,16 +414,13 @@ impl Agent {
 
     // Builds the system prompt for every conversation turn.
     fn get_system_prompt(&self) -> Option<String> {
-        let tool_count = self.tool_registry.builtin_count();
-        Some(format!(
-            "You are DriftCLI, a helpful AI coding assistant running in the terminal.\n\
-             You are powered by {} (model: {}).\n\
-             You have access to {} tools that help you read files, edit code, run commands, and search.\n\
-             Only use tools when necessary to complete a task. For simple questions and greetings, respond directly without using tools.\n\
-             Answer concisely and help with software engineering tasks.",
-            self.llm.provider_id(),
-            self.llm.model_name(),
-            tool_count,
-        ))
+        Some(
+            "You are DriftCLI, a terminal-based AI coding agent with direct access to tools.\n\
+             You can read files, edit code, run shell commands, search code, fetch web pages, and manage tasks.\n\
+             IMPORTANT: When a user asks you to perform an action, you MUST use the appropriate tool to actually do it.\n\
+             Never say 'let me find' or 'let me read' — invoke the tool immediately.\n\
+             For simple greetings or questions that don't require file access, respond directly.\n\
+             Be concise and take action.".into(),
+        )
     }
 }
