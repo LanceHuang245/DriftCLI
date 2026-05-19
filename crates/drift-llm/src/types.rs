@@ -15,6 +15,7 @@ pub struct LlmMessage {
     pub content: serde_json::Value,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<ToolCallInfo>>,
+    pub reasoning_content: Option<String>,
 }
 
 impl LlmMessage {
@@ -24,6 +25,7 @@ impl LlmMessage {
             content: serde_json::Value::String(content.into()),
             tool_call_id: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -32,6 +34,7 @@ impl LlmMessage {
             content: serde_json::Value::String(content.into()),
             tool_call_id: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
     pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
@@ -40,9 +43,14 @@ impl LlmMessage {
             content: serde_json::Value::String(content.into()),
             tool_call_id: Some(tool_call_id),
             tool_calls: None,
+            reasoning_content: None,
         }
     }
-    pub fn assistant_with_tools(text: impl Into<String>, tool_calls: Vec<ToolCallInfo>) -> Self {
+    pub fn assistant_with_tools(
+        text: impl Into<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<ToolCallInfo>,
+    ) -> Self {
         let text = text.into();
         Self {
             role: "assistant".into(),
@@ -53,9 +61,11 @@ impl LlmMessage {
             },
             tool_call_id: None,
             tool_calls: Some(tool_calls),
+            reasoning_content: reasoning,
         }
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub enum LlmChunk {

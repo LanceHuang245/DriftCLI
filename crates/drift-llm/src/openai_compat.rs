@@ -82,6 +82,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     .collect();
                 msg["tool_calls"] = serde_json::json!(tc_json);
             }
+            if let Some(ref reasoning) = m.reasoning_content {
+                msg["reasoning_content"] = serde_json::json!(reasoning);
+            }
             api_messages.push(msg);
         }
 
@@ -172,6 +175,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             if let Some(content) = &delta.content {
                                 return Some(Ok(LlmChunk::TextDelta(content.clone())));
                             }
+                            if let Some(reasoning) = &delta.reasoning_content {
+                                if !reasoning.is_empty() {
+                                    return Some(Ok(LlmChunk::ReasoningDelta(reasoning.clone())));
+                                }
+                            }
                         }
                         if let Some(reason) = &choice.finish_reason {
                             if reason == "stop" {
@@ -211,6 +219,8 @@ struct OpenAiDelta {
     role: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCall>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

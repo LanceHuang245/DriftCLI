@@ -225,7 +225,15 @@ impl Agent {
                     })
                     .collect();
                 self.messages
-                    .push(LlmMessage::assistant_with_tools(full_response, tc_infos));
+                    .push(LlmMessage::assistant_with_tools(
+                        full_response,
+                        if full_reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(full_reasoning)
+                        },
+                        tc_infos,
+                    ));
             } else {
                 let mut assistant_content = Vec::new();
                 if !full_response.is_empty() {
@@ -247,6 +255,7 @@ impl Agent {
                     content: serde_json::Value::Array(assistant_content),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 });
             }
 
@@ -318,6 +327,7 @@ impl Agent {
                     content: serde_json::Value::Array(tool_results_content),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 });
             }
 
