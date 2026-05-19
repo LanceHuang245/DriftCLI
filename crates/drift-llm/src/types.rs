@@ -27,6 +27,9 @@ impl LlmMessage {
 pub enum LlmChunk {
     TextDelta(String),
     ReasoningDelta(String),
+    ToolCallStart { id: String, name: String },
+    ToolCallArgs { id: String, delta: String },
+    ToolCallEnd { id: String },
     Done,
 }
 

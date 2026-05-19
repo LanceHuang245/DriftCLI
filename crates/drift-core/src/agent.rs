@@ -1,23 +1,47 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::event::{AgentState, EventMsg};
 use drift_config::{AppConfig, LlmConfig};
-use drift_llm::{create_provider, fetch_anthropic_models, fetch_openai_compat_models, LlmError, LlmMessage, LlmProvider, ModelInfo};
+use drift_llm::{
+    create_provider, fetch_anthropic_models, fetch_openai_compat_models, LlmChunk, LlmError,
+    LlmMessage, LlmProvider, ModelInfo,
+};
+use drift_tools::{ToolContext, ToolRegistry};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
-// Agent: orchestrates a chat session — holds config, LLM provider, event bus, and message history.
+// Track state of a tool call being accumulated from streaming chunks.
+struct ActiveToolCall {
+    id: String,
+    name: String,
+    args: Vec<String>,
+}
+
+impl ActiveToolCall {
+    fn args_string(&self) -> String {
+        self.args.join("")
+    }
+}
+
+// Agent: orchestrates a chat session with tool calling — holds config, LLM provider,
+// tool registry, event bus, message history, and working directory.
 pub struct Agent {
     config: AppConfig,
     llm: Box<dyn LlmProvider>,
+    tool_registry: ToolRegistry,
     event_tx: broadcast::Sender<EventMsg>,
     messages: Vec<LlmMessage>,
     cwd: PathBuf,
 }
 
 impl Agent {
-    // Create a new agent: builds the LLM provider from the active config, opens a broadcast channel, and logs the connection.
-    pub fn new(config: AppConfig, cwd: PathBuf) -> Result<Self, LlmError> {
+    // Create a new agent: builds the LLM provider and tool registry, opens a broadcast channel.
+    pub fn new(
+        config: AppConfig,
+        cwd: PathBuf,
+        tool_registry: ToolRegistry,
+    ) -> Result<Self, LlmError> {
         let llm = create_provider(config.active_llm_config().unwrap())?;
         let (event_tx, _) = broadcast::channel(256);
 
@@ -30,6 +54,7 @@ impl Agent {
         Ok(Self {
             config,
             llm,
+            tool_registry,
             event_tx,
             messages: Vec::new(),
             cwd,
@@ -37,14 +62,12 @@ impl Agent {
     }
 
     // Subscribe returns a new broadcast receiver for consuming agent events in the TUI bridge.
-    /// Get a receiver for agent events (for the TUI to subscribe to).
     pub fn subscribe(&self) -> broadcast::Receiver<EventMsg> {
         self.event_tx.subscribe()
     }
 
-    // Submit: sends user input to the LLM, streams chunks as events, and appends the reply to history.
-    /// Submit user input and stream the response.
-    /// Returns immediately; events are sent via the broadcast channel.
+    // Submit: sends user input to the LLM, handles tool calls in a loop,
+    // streams chunks as events, and appends the reply to history.
     pub async fn submit(&mut self, user_input: String) {
         let _ = self
             .event_tx
@@ -53,99 +76,254 @@ impl Agent {
         // Add user message to history
         self.messages.push(LlmMessage::user(user_input));
 
-        // Get system prompt from config or use default
         let system_prompt = self.get_system_prompt();
+        let max_iterations = self.config.agent.max_iterations;
 
-        // Stream from LLM
-        match self
-            .llm
-            .stream_chat(
-                self.messages.clone(),
-                system_prompt,
-                self.config.agent.temperature,
-                Some(4096),
-            )
-            .await
-        {
-            Ok(mut stream) => {
-                let mut full_response = String::new();
-                let mut full_reasoning = String::new();
-                let mut streaming = false;
+        // Tool calling loop: iterate until LLM stops requesting tools or max reached
+        for iteration in 0..=max_iterations {
+            // Collect tool definitions for the LLM
+            let tool_defs = self.tool_registry.definitions().await;
+            let tools_json: Vec<serde_json::Value> = tool_defs
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "name": d.name,
+                        "description": d.description,
+                        "input_schema": d.input_schema,
+                    })
+                })
+                .collect();
+            let tools = if tools_json.is_empty() {
+                None
+            } else {
+                Some(tools_json)
+            };
 
-                loop {
-                    match stream.next().await {
-                        Some(Ok(drift_llm::LlmChunk::TextDelta(text))) => {
-                            if !streaming {
-                                if !full_reasoning.is_empty() {
-                                    let _ = self.event_tx.send(EventMsg::Reasoning(full_reasoning.clone()));
-                                }
-                                let _ = self.event_tx.send(EventMsg::AgentState(
-                                    AgentState::Generating(String::new()),
-                                ));
-                                streaming = true;
-                            }
-                            full_response.push_str(&text);
-                            let _ = self.event_tx.send(EventMsg::Token(text));
-                        }
-                        Some(Ok(drift_llm::LlmChunk::ReasoningDelta(text))) => {
-                            full_reasoning.push_str(&text);
-                            let _ = self.event_tx.send(EventMsg::Reasoning(text));
-                        }
-                        Some(Ok(drift_llm::LlmChunk::Done)) => break,
-                        Some(Err(e)) => {
-                            let _ = self.event_tx.send(EventMsg::Error {
-                                message: e.to_string(),
-                                recoverable: true,
-                            });
-                            return;
-                        }
-                        None => break,
-                    }
+            // Stream from LLM
+            let stream_result = self
+                .llm
+                .stream_chat(
+                    self.messages.clone(),
+                    system_prompt.clone(),
+                    self.config.agent.temperature,
+                    Some(4096),
+                    tools,
+                )
+                .await;
+
+            let mut stream = match stream_result {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = self.event_tx.send(EventMsg::Error {
+                        message: format!("LLM error: {}", e),
+                        recoverable: matches!(e, LlmError::Stream(_)),
+                    });
+                    break;
                 }
+            };
 
-                // Add assistant response to history
+            // Track accumulated state for this turn
+            let mut full_response = String::new();
+            let mut full_reasoning = String::new();
+            let mut streaming = false;
+            // Map call_id -> ActiveToolCall for correlating chunks
+            let mut active_tool_calls: HashMap<String, ActiveToolCall> = HashMap::new();
+            // Completed tool calls ready for execution (preserve order)
+            let mut completed_tool_calls: Vec<ActiveToolCall> = Vec::new();
+
+            // Process stream chunks
+            loop {
+                match stream.next().await {
+                    Some(Ok(LlmChunk::TextDelta(text))) => {
+                        if !streaming {
+                            if !full_reasoning.is_empty() {
+                                let _ = self
+                                    .event_tx
+                                    .send(EventMsg::Reasoning(full_reasoning.clone()));
+                            }
+                            let _ = self.event_tx.send(EventMsg::AgentState(
+                                AgentState::Generating(String::new()),
+                            ));
+                            streaming = true;
+                        }
+                        full_response.push_str(&text);
+                        let _ = self.event_tx.send(EventMsg::Token(text));
+                    }
+                    Some(Ok(LlmChunk::ReasoningDelta(text))) => {
+                        full_reasoning.push_str(&text);
+                        let _ = self.event_tx.send(EventMsg::Reasoning(text));
+                    }
+                    Some(Ok(LlmChunk::ToolCallStart { id, name })) => {
+                        let _ = self.event_tx.send(EventMsg::ToolCallStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                        });
+                        active_tool_calls.insert(
+                            id.clone(),
+                            ActiveToolCall {
+                                id,
+                                name,
+                                args: Vec::new(),
+                            },
+                        );
+                    }
+                    Some(Ok(LlmChunk::ToolCallArgs { id, delta })) => {
+                        let _ = self.event_tx.send(EventMsg::ToolCallArgs {
+                            id: id.clone(),
+                            delta: delta.clone(),
+                        });
+                        if let Some(tc) = active_tool_calls.get_mut(&id) {
+                            tc.args.push(delta);
+                        }
+                    }
+                    Some(Ok(LlmChunk::ToolCallEnd { id })) => {
+                        let _ = self
+                            .event_tx
+                            .send(EventMsg::ToolCallEnd { id: id.clone() });
+                        if let Some(tc) = active_tool_calls.remove(&id) {
+                            completed_tool_calls.push(tc);
+                        }
+                    }
+                    Some(Ok(LlmChunk::Done)) => break,
+                    Some(Err(e)) => {
+                        let _ = self.event_tx.send(EventMsg::Error {
+                            message: e.to_string(),
+                            recoverable: true,
+                        });
+                        break;
+                    }
+                    None => break,
+                }
+            }
+
+            // If no tool calls were completed, this is a text-only response — finalize
+            if completed_tool_calls.is_empty() {
                 if !full_response.is_empty() {
                     self.messages.push(LlmMessage::assistant(full_response));
                 }
+                break;
             }
-            Err(e) => {
-                let _ = self.event_tx.send(EventMsg::Error {
-                    message: format!("LLM error: {}", e),
-                    recoverable: matches!(e, LlmError::Stream(_)),
+
+            // Build the assistant message content (text + tool_use blocks)
+            let mut assistant_content = Vec::new();
+            if !full_response.is_empty() {
+                assistant_content.push(serde_json::json!({
+                    "type": "text",
+                    "text": full_response,
+                }));
+            }
+            for tc in &completed_tool_calls {
+                assistant_content.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": serde_json::from_str::<serde_json::Value>(&tc.args_string()).unwrap_or_default(),
+                }));
+            }
+
+            // Store assistant message with tool_use blocks
+            let assistant_json = serde_json::to_string(&assistant_content).unwrap_or_default();
+            self.messages.push(LlmMessage {
+                role: "assistant".to_string(),
+                content: assistant_json,
+            });
+
+            // Execute each tool call sequentially
+            let mut tool_results_content = Vec::new();
+            for tc in &completed_tool_calls {
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.args_string()).unwrap_or_default();
+
+                let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
                 });
+
+                let ctx = ToolContext {
+                    session_id: uuid::Uuid::new_v4(),
+                    working_dir: self.cwd.clone(),
+                    tool_call_id: tc.id.clone(),
+                };
+
+                let result = self
+                    .tool_registry
+                    .execute(&tc.name, args, &ctx)
+                    .await;
+
+                match result {
+                    Ok(r) => {
+                        let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            success: r.success,
+                            error: r.error.clone(),
+                        });
+                        tool_results_content.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "content": r.content,
+                            "is_error": !r.success,
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            success: false,
+                            error: Some(e.to_string()),
+                        });
+                        tool_results_content.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "content": format!("Error: {}", e),
+                            "is_error": true,
+                        }));
+                    }
+                }
+            }
+
+            // Add tool results as a user message
+            let results_json = serde_json::to_string(&tool_results_content).unwrap_or_default();
+            self.messages.push(LlmMessage {
+                role: "user".to_string(),
+                content: results_json,
+            });
+
+            // Warn if we're approaching the iteration limit
+            if iteration >= max_iterations.saturating_sub(2) {
+                warn!(
+                    "Tool calling loop iteration {}/{}",
+                    iteration, max_iterations
+                );
             }
         }
 
+        // Finalize
         let _ = self.event_tx.send(EventMsg::AgentState(AgentState::Idle));
         let _ = self.event_tx.send(EventMsg::Done);
     }
 
-    // Returns a human-readable summary of the current connection (provider, model, endpoint, key).
-    /// Get the connection summary (for /connect display)
+    // Returns a human-readable summary of the current connection.
     pub fn connection_summary(&self) -> String {
         self.config.connection_summary()
     }
 
-    // Returns a static identifier string for the current LLM provider (e.g. "Anthropic").
-    /// Provider ID
+    // Provider ID string.
     pub fn provider_id(&self) -> &str {
         self.llm.provider_id()
     }
 
-    // Returns the currently configured model name string.
-    /// Model name
+    // Currently configured model name string.
     pub fn model_name(&self) -> &str {
         self.llm.model_name()
     }
 
-    // Clones the broadcast sender so external consumers can emit events through the agent's channel.
-    /// Get the event sender for this agent
+    // Clones the broadcast sender for external consumers.
     pub fn event_sender(&self) -> broadcast::Sender<EventMsg> {
         self.event_tx.clone()
     }
 
-    // Reconfigure: swaps the LLM provider at runtime (e.g. from /connect) and persists the change to disk.
-    /// Reconfigure the LLM provider at runtime and persist to disk (backward compat — delegates to save_provider).
+    // Reconfigure: swaps the LLM provider at runtime and persists to disk.
     pub async fn reconfigure(&mut self, llm_config: LlmConfig) -> Result<(), LlmError> {
         let model = match &llm_config {
             LlmConfig::Anthropic { model, .. } => model.clone(),
@@ -156,8 +334,7 @@ impl Agent {
         self.save_provider(name, llm_config).await
     }
 
-    // Save a named provider config and activate it. Persists to disk.
-    /// Save a named provider config and activate it. Persists to disk.
+    // Save a named provider config and activate it.
     pub async fn save_provider(&mut self, name: String, config: LlmConfig) -> Result<(), LlmError> {
         self.config.save_provider(name.clone(), config);
         let llm_config = self.config
@@ -180,7 +357,6 @@ impl Agent {
     }
 
     // Switch to an existing named provider.
-    /// Switch to an existing named provider.
     pub async fn activate_provider(&mut self, name: &str) -> Result<(), LlmError> {
         self.config
             .activate_provider(name)
@@ -197,8 +373,7 @@ impl Agent {
         Ok(())
     }
 
-    // Remove a named provider. Auto-switches to first remaining.
-    /// Remove a named provider. Auto-switches to first remaining.
+    // Remove a named provider.
     pub async fn remove_provider(&mut self, name: &str) -> Result<(), LlmError> {
         self.config.remove_provider(name);
         if let Some(config) = self.config.active_llm_config() {
@@ -212,13 +387,11 @@ impl Agent {
     }
 
     // Returns all provider names.
-    /// Returns all provider names.
     pub fn list_providers(&self) -> Vec<String> {
         self.config.list_provider_names()
     }
 
-    // Static method: queries the provider's API for available model IDs without needing an Agent instance.
-    /// Fetch available models from the given provider params
+    // Static: queries the provider's API for available model IDs.
     pub async fn fetch_models(
         provider: &str,
         base_url: &str,
@@ -228,16 +401,19 @@ impl Agent {
             "Anthropic" => fetch_anthropic_models(api_key, base_url).await,
             "OpenAI Compatible" => {
                 let ids = fetch_openai_compat_models(api_key, base_url).await?;
-                Ok(ids.into_iter().map(|id| ModelInfo { id, effort_levels: vec![] }).collect())
+                Ok(ids
+                    .into_iter()
+                    .map(|id| ModelInfo {
+                        id,
+                        effort_levels: vec![],
+                    })
+                    .collect())
             }
-            _ => Err(LlmError::Config(format!(
-                "Unknown provider: {}",
-                provider
-            ))),
+            _ => Err(LlmError::Config(format!("Unknown provider: {}", provider))),
         }
     }
 
-    // Builds the system prompt injected at the start of every conversation turn.
+    // Builds the system prompt for every conversation turn.
     fn get_system_prompt(&self) -> Option<String> {
         Some(format!(
             "You are DriftCLI, a helpful AI coding assistant running in the terminal.\n\

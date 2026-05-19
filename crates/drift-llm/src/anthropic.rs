@@ -44,6 +44,7 @@ impl LlmProvider for AnthropicProvider {
         system_prompt: Option<String>,
         temperature: Option<f64>,
         max_output_tokens: Option<usize>,
+        tools: Option<Vec<serde_json::Value>>,
     ) -> Result<LlmResponseStream, LlmError> {
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
 
@@ -77,6 +78,9 @@ impl LlmProvider for AnthropicProvider {
         if let Some(ref effort) = self.reasoning_effort {
             body["reasoning_effort"] = serde_json::Value::String(effort.clone());
         }
+        if let Some(ref tool_list) = tools {
+            body["tools"] = serde_json::json!(tool_list);
+        }
 
         let response = self
             .client
@@ -109,29 +113,47 @@ impl LlmProvider for AnthropicProvider {
                 if data == "[DONE]" {
                     return Some(Ok(LlmChunk::Done));
                 }
-                match serde_json::from_str::<AnthropicStreamEvent>(data) {
-                    Ok(event) => match event.event_type.as_str() {
-                        "content_block_delta" => {
-                            if let Some(delta) = &event.delta {
-                                if let Some(thinking) = &delta.thinking {
-                                    Some(Ok(LlmChunk::ReasoningDelta(thinking.clone())))
-                                } else if let Some(text) = &delta.text {
-                                    Some(Ok(LlmChunk::TextDelta(text.clone())))
-                                } else {
-                                    None
+                if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
+                    match event.event_type.as_str() {
+                        "content_block_start" => {
+                            if let Some(ref block) = event.content_block {
+                                if block.block_type == "tool_use" {
+                                    let id = block.id.clone().unwrap_or_default();
+                                    let name = block.name.clone().unwrap_or_default();
+                                    return Some(Ok(LlmChunk::ToolCallStart { id, name }));
                                 }
-                            } else {
-                                None
                             }
                         }
-                        "message_stop" => Some(Ok(LlmChunk::Done)),
-                        _ => None,
-                    },
-                    Err(_) => None,
+                        "content_block_delta" => {
+                            if let Some(delta) = &event.delta {
+                                if delta.delta_type == "input_json_delta" {
+                                    if let Some(ref partial) = delta.partial_json {
+                                        let id = event.index.map(|i| i.to_string()).unwrap_or_default();
+                                        return Some(Ok(LlmChunk::ToolCallArgs {
+                                            id,
+                                            delta: partial.clone(),
+                                        }));
+                                    }
+                                } else if let Some(thinking) = &delta.thinking {
+                                    return Some(Ok(LlmChunk::ReasoningDelta(thinking.clone())));
+                                } else if let Some(text) = &delta.text {
+                                    return Some(Ok(LlmChunk::TextDelta(text.clone())));
+                                }
+                            }
+                        }
+                        "content_block_stop" => {
+                            if let Some(index) = event.index {
+                                return Some(Ok(LlmChunk::ToolCallEnd {
+                                    id: index.to_string(),
+                                }));
+                            }
+                        }
+                        "message_stop" => return Some(Ok(LlmChunk::Done)),
+                        _ => {}
+                    }
                 }
-            } else {
-                None
             }
+            None
         });
 
         Ok(LlmResponseStream::new(event_stream))
@@ -142,11 +164,30 @@ impl LlmProvider for AnthropicProvider {
 struct AnthropicStreamEvent {
     #[serde(rename = "type")]
     event_type: String,
+    #[serde(default)]
+    index: Option<usize>,
     delta: Option<AnthropicDelta>,
+    content_block: Option<AnthropicContentBlock>,
 }
 
 #[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct AnthropicDelta {
+    #[serde(rename = "type", default)]
+    delta_type: String,
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
     thinking: Option<String>,
+    #[serde(default)]
+    partial_json: Option<String>,
 }

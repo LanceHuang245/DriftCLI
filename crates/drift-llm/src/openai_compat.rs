@@ -40,6 +40,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         system_prompt: Option<String>,
         temperature: Option<f64>,
         max_output_tokens: Option<usize>,
+        tools: Option<Vec<serde_json::Value>>,
     ) -> Result<LlmResponseStream, LlmError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -74,6 +75,22 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
         if let Some(mt) = max_output_tokens {
             body["max_tokens"] = serde_json::json!(mt);
+        }
+        if let Some(ref tool_list) = tools {
+            let openai_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t["description"],
+                            "parameters": t["input_schema"],
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(openai_tools);
         }
 
         let response = self
@@ -111,12 +128,31 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 if let Ok(event) = serde_json::from_str::<OpenAiStreamEvent>(data) {
                     for choice in &event.choices {
                         if let Some(delta) = &choice.delta {
+                            if let Some(ref tool_calls) = delta.tool_calls {
+                                for tc in tool_calls {
+                                    if let Some(ref name) = tc.function.name {
+                                        return Some(Ok(LlmChunk::ToolCallStart {
+                                            id: tc.id.clone().unwrap_or_default(),
+                                            name: name.clone(),
+                                        }));
+                                    }
+                                    if let Some(ref args) = tc.function.arguments {
+                                        return Some(Ok(LlmChunk::ToolCallArgs {
+                                            id: tc.id.clone().unwrap_or_default(),
+                                            delta: args.clone(),
+                                        }));
+                                    }
+                                }
+                            }
                             if let Some(content) = &delta.content {
                                 return Some(Ok(LlmChunk::TextDelta(content.clone())));
                             }
                         }
                         if let Some(reason) = &choice.finish_reason {
                             if reason == "stop" {
+                                return Some(Ok(LlmChunk::Done));
+                            }
+                            if reason == "tool_calls" {
                                 return Some(Ok(LlmChunk::Done));
                             }
                         }
@@ -143,7 +179,27 @@ struct OpenAiStreamChoice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiDelta {
+    #[serde(default)]
     content: Option<String>,
     #[allow(dead_code)]
+    #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: OpenAiToolCallFunction,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }

@@ -26,6 +26,16 @@ pub enum EventMsg {
     ProviderList(Vec<String>),
     // Notification that the provider was switched, carrying the new provider name and model.
     ProviderSwitched { name: String, model: String },
+    // A tool call has been requested by the LLM — emitted with the call ID and tool name.
+    ToolCallStart { id: String, name: String },
+    // Streaming argument JSON fragment for a tool call in progress.
+    ToolCallArgs { id: String, delta: String },
+    // A tool call has been fully received — arguments are complete.
+    ToolCallEnd { id: String },
+    // Tool execution has begun — the tool name and args summary.
+    ToolExecStart { id: String, name: String },
+    // Tool execution has produced a result — content, success flag, and error if any.
+    ToolExecEnd { id: String, name: String, success: bool, error: Option<String> },
 }
 
 // AgentState: lifecycle states the agent transitions through during a processing turn.

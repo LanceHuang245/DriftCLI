@@ -330,6 +330,7 @@ dependencies = [
  "clap",
  "drift-config",
  "drift-core",
+ "drift-tools",
  "drift-tui",
  "tokio",
 ]
@@ -353,7 +354,9 @@ dependencies = [
  "async-trait",
  "drift-config",
  "drift-llm",
+ "drift-tools",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

@@ -12,6 +12,7 @@ path = "src/main.rs"
 clap.workspace = true
 drift-config = { path = "../drift-config" }
 drift-core = { path = "../drift-core" }
+drift-tools = { path = "../drift-tools" }
 drift-tui = { path = "../drift-tui" }
 anyhow.workspace = true
 tokio.workspace = true

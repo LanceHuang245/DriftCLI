@@ -28,10 +28,18 @@ pub enum AppEvent {
     Error(String),
     Done,
     ModelList(Vec<ModelInfo>),
-    // Response with provider name list for the picker.
     ProviderList(Vec<String>),
-    // Provider was switched (with name and model).
     ProviderSwitched { name: String, model: String },
+    // Tool call started with id and name
+    ToolCallStart { id: String, name: String },
+    // Tool call arguments streaming
+    ToolCallArgs { id: String, delta: String },
+    // Tool call completed
+    ToolCallEnd { id: String },
+    // Tool execution started
+    ToolExecStart { id: String, name: String },
+    // Tool execution finished with result summary
+    ToolExecEnd { id: String, name: String, success: bool },
 }
 
 // Commands sent from the TUI to the backend (chat, fetch models, reconfigure, provider management).
@@ -581,6 +589,23 @@ impl TuiApp {
                 self.provider_name = name.clone();
                 self.model_name = model;
                 self.status_text = format!("Switched to {}", name);
+            }
+            // Tool call requested by LLM — show in status bar.
+            AppEvent::ToolCallStart { name, .. } => {
+                self.status_text = format!("Calling tool: {}", name);
+            }
+            // Tool call args streaming — not surfaced to TUI yet.
+            AppEvent::ToolCallArgs { .. } => {}
+            // Tool call complete — no UI action needed.
+            AppEvent::ToolCallEnd { .. } => {}
+            // Tool execution started.
+            AppEvent::ToolExecStart { name, .. } => {
+                self.status_text = format!("Running: {}", name);
+            }
+            // Tool execution finished — update status with result.
+            AppEvent::ToolExecEnd { name, success, .. } => {
+                let status = if success { "Idle" } else { &format!("Tool {} failed", name) };
+                self.status_text = status.to_string();
             }
         }
     }

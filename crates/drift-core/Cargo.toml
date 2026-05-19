@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 drift-config = { path = "../drift-config" }
 drift-llm = { path = "../drift-llm" }
+drift-tools = { path = "../drift-tools" }
 tokio = { workspace = true, features = ["sync", "macros"] }
 serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

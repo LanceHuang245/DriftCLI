@@ -85,6 +85,7 @@ pub trait LlmProvider: Send + Sync {
         system_prompt: Option<String>,
         temperature: Option<f64>,
         max_output_tokens: Option<usize>,
+        tools: Option<Vec<serde_json::Value>>,
     ) -> Result<LlmResponseStream, LlmError>;
 
     async fn chat(
@@ -93,13 +94,16 @@ pub trait LlmProvider: Send + Sync {
         system_prompt: Option<String>,
     ) -> Result<String, LlmError> {
         let mut stream = self
-            .stream_chat(messages, system_prompt, None, None)
+            .stream_chat(messages, system_prompt, None, None, None)
             .await?;
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(LlmChunk::TextDelta(t)) => text.push_str(&t),
                 Ok(LlmChunk::ReasoningDelta(_)) => {}
+                Ok(LlmChunk::ToolCallStart { .. }) => {}
+                Ok(LlmChunk::ToolCallArgs { .. }) => {}
+                Ok(LlmChunk::ToolCallEnd { .. }) => {}
                 Ok(LlmChunk::Done) => break,
                 Err(e) => return Err(e),
             }

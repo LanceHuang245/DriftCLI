@@ -1,8 +1,13 @@
 use clap::{Parser, Subcommand};
 use drift_config::AppConfig;
 use drift_core::{Agent, EventMsg};
+use drift_tools::{
+    tools::{bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool, read::ReadTool, todowrite::TodoWriteTool, webfetch::WebFetchTool, websearch::WebSearchTool, write::WriteTool},
+    ToolRegistry,
+};
 use drift_tui::{AppEvent, TuiApp, TuiCommand};
 use std::env;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 // Cli: top-level argument struct parsed by clap — model, api_key, subcommands, and runtime options.
@@ -59,7 +64,19 @@ async fn main() -> anyhow::Result<()> {
 
             let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
 
-            let mut agent = Agent::new(config.clone(), cwd.clone())?;
+            // Build tool registry with all built-in tools
+            let mut tool_registry = ToolRegistry::new();
+            tool_registry.register_builtin(Arc::new(BashTool));
+            tool_registry.register_builtin(Arc::new(ReadTool));
+            tool_registry.register_builtin(Arc::new(WriteTool));
+            tool_registry.register_builtin(Arc::new(EditTool));
+            tool_registry.register_builtin(Arc::new(GrepTool));
+            tool_registry.register_builtin(Arc::new(GlobTool));
+            tool_registry.register_builtin(Arc::new(WebFetchTool));
+            tool_registry.register_builtin(Arc::new(WebSearchTool));
+            tool_registry.register_builtin(Arc::new(TodoWriteTool));
+
+            let mut agent = Agent::new(config.clone(), cwd.clone(), tool_registry)?;
             let event_tx = agent.event_sender();
             let llm_config = config.active_llm_config().cloned().unwrap();
 
@@ -101,6 +118,21 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Ok(EventMsg::ProviderSwitched { name, model }) => {
                             let _ = tui_tx.send(AppEvent::ProviderSwitched { name, model });
+                        }
+                        Ok(EventMsg::ToolCallStart { id, name }) => {
+                            let _ = tui_tx.send(AppEvent::ToolCallStart { id, name });
+                        }
+                        Ok(EventMsg::ToolCallArgs { id, delta }) => {
+                            let _ = tui_tx.send(AppEvent::ToolCallArgs { id, delta });
+                        }
+                        Ok(EventMsg::ToolCallEnd { id }) => {
+                            let _ = tui_tx.send(AppEvent::ToolCallEnd { id });
+                        }
+                        Ok(EventMsg::ToolExecStart { id, name }) => {
+                            let _ = tui_tx.send(AppEvent::ToolExecStart { id, name });
+                        }
+                        Ok(EventMsg::ToolExecEnd { id, name, success, .. }) => {
+                            let _ = tui_tx.send(AppEvent::ToolExecEnd { id, name, success });
                         }
                         _ => {}
                     }
