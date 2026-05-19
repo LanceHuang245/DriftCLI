@@ -131,16 +131,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             if let Some(ref tool_calls) = delta.tool_calls {
                                 for tc in tool_calls {
                                     if let Some(ref name) = tc.function.name {
-                                        return Some(Ok(LlmChunk::ToolCallStart {
-                                            id: tc.id.clone().unwrap_or_default(),
-                                            name: name.clone(),
-                                        }));
+                                        if !name.is_empty() {
+                                            return Some(Ok(LlmChunk::ToolCallStart {
+                                                id: tc.id.clone().unwrap_or_default(),
+                                                name: name.clone(),
+                                            }));
+                                        }
                                     }
                                     if let Some(ref args) = tc.function.arguments {
-                                        return Some(Ok(LlmChunk::ToolCallArgs {
-                                            id: tc.id.clone().unwrap_or_default(),
-                                            delta: args.clone(),
-                                        }));
+                                        if !args.is_empty() {
+                                            return Some(Ok(LlmChunk::ToolCallArgs {
+                                                id: tc.id.clone().unwrap_or_default(),
+                                                delta: args.clone(),
+                                            }));
+                                        }
                                     }
                                 }
                             }

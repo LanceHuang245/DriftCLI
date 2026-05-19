@@ -133,6 +133,17 @@ impl ToolRegistry {
         defs
     }
 
+    /// Synchronous version — uses blocking read for dynamic tools.
+    pub fn definitions_sync(&self) -> Vec<ToolDefinition> {
+        let mut defs: Vec<ToolDefinition> =
+            self.builtins.values().map(|t| t.definition()).collect();
+        let dynamic = self.dynamic.blocking_read();
+        for tool in dynamic.values() {
+            defs.push(tool.definition());
+        }
+        defs
+    }
+
     /// Execute a named tool with arguments and context.
     pub async fn execute(
         &self,
