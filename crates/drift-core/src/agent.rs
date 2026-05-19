@@ -216,9 +216,16 @@ impl Agent {
             // Build assistant message — provider-aware format.
             let is_openai = self.llm.provider_id() == "openai_compatible";
             if is_openai {
-                if !full_response.is_empty() {
-                    self.messages.push(LlmMessage::assistant(full_response));
-                }
+                let tc_infos: Vec<drift_llm::ToolCallInfo> = completed_tool_calls
+                    .iter()
+                    .map(|tc| drift_llm::ToolCallInfo {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.args_string(),
+                    })
+                    .collect();
+                self.messages
+                    .push(LlmMessage::assistant_with_tools(full_response, tc_infos));
             } else {
                 let mut assistant_content = Vec::new();
                 if !full_response.is_empty() {
@@ -239,6 +246,7 @@ impl Agent {
                     role: "assistant".to_string(),
                     content: serde_json::Value::Array(assistant_content),
                     tool_call_id: None,
+                    tool_calls: None,
                 });
             }
 
@@ -299,17 +307,17 @@ impl Agent {
             // Add tool results — provider-aware format.
             if is_openai {
                 for r in &tool_results_content {
-                    self.messages.push(LlmMessage {
-                        role: "tool".to_string(),
-                        content: r["content"].clone(),
-                        tool_call_id: Some(r["tool_use_id"].as_str().unwrap_or("").to_string()),
-                    });
+                    let id = r["tool_use_id"].as_str().unwrap_or("").to_string();
+                    let content = r["content"].as_str().unwrap_or("");
+                    self.messages
+                        .push(LlmMessage::tool_result(id, content));
                 }
             } else {
                 self.messages.push(LlmMessage {
                     role: "user".to_string(),
                     content: serde_json::Value::Array(tool_results_content),
                     tool_call_id: None,
+                    tool_calls: None,
                 });
             }
 

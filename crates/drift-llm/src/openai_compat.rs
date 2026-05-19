@@ -66,6 +66,22 @@ impl LlmProvider for OpenAiCompatibleProvider {
             if let Some(ref tci) = m.tool_call_id {
                 msg["tool_call_id"] = serde_json::json!(tci);
             }
+            if let Some(ref tool_calls) = m.tool_calls {
+                let tc_json: Vec<serde_json::Value> = tool_calls
+                    .iter()
+                    .map(|tc| {
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }
+                        })
+                    })
+                    .collect();
+                msg["tool_calls"] = serde_json::json!(tc_json);
+            }
             api_messages.push(msg);
         }
 

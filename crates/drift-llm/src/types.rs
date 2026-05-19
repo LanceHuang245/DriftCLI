@@ -2,11 +2,19 @@ use pin_project_lite::pin_project;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallInfo {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmMessage {
     pub role: String,
     pub content: serde_json::Value,
     pub tool_call_id: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallInfo>>,
 }
 
 impl LlmMessage {
@@ -15,6 +23,7 @@ impl LlmMessage {
             role: "user".into(),
             content: serde_json::Value::String(content.into()),
             tool_call_id: None,
+            tool_calls: None,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -22,6 +31,7 @@ impl LlmMessage {
             role: "assistant".into(),
             content: serde_json::Value::String(content.into()),
             tool_call_id: None,
+            tool_calls: None,
         }
     }
     pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
@@ -29,6 +39,20 @@ impl LlmMessage {
             role: "tool".into(),
             content: serde_json::Value::String(content.into()),
             tool_call_id: Some(tool_call_id),
+            tool_calls: None,
+        }
+    }
+    pub fn assistant_with_tools(text: impl Into<String>, tool_calls: Vec<ToolCallInfo>) -> Self {
+        let text = text.into();
+        Self {
+            role: "assistant".into(),
+            content: if text.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(text)
+            },
+            tool_call_id: None,
+            tool_calls: Some(tool_calls),
         }
     }
 }
