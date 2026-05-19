@@ -102,6 +102,7 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub reasoning: Option<String>,
+    pub thinking: bool,
 }
 
 impl TuiApp {
@@ -226,6 +227,7 @@ impl TuiApp {
                                                             role: "user".into(),
                                                             content: text.clone(),
                                                             reasoning: None,
+                                                            thinking: false,
                                                         });
                                                         self.current_response.clear();
                                                         self.current_reasoning.clear();
@@ -323,6 +325,7 @@ impl TuiApp {
                     role: "system".into(),
                     content: format!("Unknown command: {}. Try /connect, /provider, /clear, /quit", cmd),
                     reasoning: None,
+                    thinking: false,
                 });
             }
         }
@@ -516,6 +519,7 @@ impl TuiApp {
                         role: "assistant".into(),
                         content: text,
                         reasoning: None,
+                        thinking: false,
                     });
                 } else if let Some(last) = self.messages.last_mut() {
                     if last.role == "assistant" {
@@ -542,13 +546,14 @@ impl TuiApp {
                         role: "system".into(),
                         content: format!("Error: {}", msg),
                         reasoning: None,
+                        thinking: false,
                     });
                     self.status_text = "Error".into();
                 }
             }
             // Response streaming complete — finalize the message and reset.
             AppEvent::Done => {
-                self.commit_current_response();
+                self.commit_current_response(false);
                 self.status_text = "Idle".into();
             }
             // Received model list — populate the dropdown in connect mode.
@@ -579,7 +584,7 @@ impl TuiApp {
             }
             // Tool call requested by LLM — commit in-progress text and prepare for tool execution.
             AppEvent::ToolCallStart { name, .. } => {
-                self.commit_current_response();
+                self.commit_current_response(true);
                 self.status_text = format!("Calling tool: {}", name);
             }
             // Tool call args streaming — not surfaced to TUI yet.
@@ -602,7 +607,7 @@ impl TuiApp {
     }
 
     // Save the current in-progress response as a complete message and clear for the next turn.
-    fn commit_current_response(&mut self) {
+    fn commit_current_response(&mut self, is_thinking: bool) {
         if !self.current_response.is_empty() || !self.current_reasoning.is_empty() {
             if let Some(last) = self.messages.last_mut() {
                 if last.role == "assistant" {
@@ -610,6 +615,7 @@ impl TuiApp {
                     if !self.current_reasoning.is_empty() {
                         last.reasoning = Some(self.current_reasoning.clone());
                     }
+                    last.thinking = is_thinking;
                 }
             }
             self.current_response.clear();
@@ -811,6 +817,7 @@ impl TuiApp {
         let style = match msg.role.as_str() {
             "user" => Style::default().fg(Color::White),
             "system" => Style::default().fg(Color::Yellow),
+            _ if msg.thinking => Style::default().fg(Color::DarkGray),
             _ => Style::default(),
         };
 

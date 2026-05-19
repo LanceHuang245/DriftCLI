@@ -47,17 +47,16 @@ impl ShellConfig {
 
 /// Check if a command exists in PATH by trying to spawn it.
 fn which_exists(cmd: &str) -> bool {
-    std::process::Command::new(cmd)
-        .arg(if cmd == "pwsh" || cmd == "powershell" {
-            "-Command"
-        } else {
-            "--version"
-        })
-        .arg("exit 0")
-        .stdout(Stdio::null())
+    let mut c = std::process::Command::new(cmd);
+    if cmd == "pwsh" || cmd == "powershell" {
+        c.arg("-NoProfile").arg("-Command").arg("exit 0");
+    } else {
+        c.arg("--version");
+    }
+    c.stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|mut c| c.wait().is_ok())
+        .map(|mut child| child.wait().is_ok())
         .unwrap_or(false)
 }
 
@@ -68,7 +67,11 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and capture output"
+        if cfg!(windows) {
+            "Execute a shell command via PowerShell and capture output. Available commands: ls/dir (list files), cat/type (read file), echo, mkdir, rm, cp/copy, mv/move. Use 'dir' not 'ls' for cmd compatibility; PowerShell supports both."
+        } else {
+            "Execute a shell command and capture output"
+        }
     }
 
     fn input_schema(&self) -> serde_json::Value {
