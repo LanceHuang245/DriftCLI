@@ -191,10 +191,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
                                             }
                                         }
                                         if let Some(ref args) = tc.function.arguments {
-                                            if !args.is_empty() {
+                                            let delta = normalize_args(args);
+                                            if !delta.is_empty() {
                                                 chunks.push(Ok(LlmChunk::ToolCallArgs {
                                                     id: tc.id.clone().unwrap_or_default(),
-                                                    delta: args.clone(),
+                                                    delta,
                                                 }));
                                             }
                                         }
@@ -267,5 +268,16 @@ struct OpenAiToolCallFunction {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    arguments: Option<String>,
+    arguments: Option<serde_json::Value>,
+}
+
+/// Normalize the arguments value to a plain JSON string.
+/// DeepSeek (and other providers) sometimes send `arguments` as a JSON
+/// object instead of the spec-mandated JSON-encoded string.
+fn normalize_args(args: &serde_json::Value) -> String {
+    match args {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
