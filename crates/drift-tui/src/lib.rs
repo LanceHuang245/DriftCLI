@@ -1,9 +1,10 @@
 mod connect;
 mod components;
 mod input;
+mod selection;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, EnableMouseCapture, DisableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
+use selection::SelectionState;
 use std::io::{self, stdout};
 use tokio::sync::mpsc;
 
@@ -89,6 +91,9 @@ pub struct TuiApp {
     should_quit: bool,
     history: Vec<String>,
     history_index: Option<usize>,
+    chat_scroll_offset: usize,
+    selection: SelectionState,
+    chat_area: ratatui::layout::Rect,
 }
 
 // Which screen/overlay the TUI is currently displaying.
@@ -144,6 +149,9 @@ impl TuiApp {
             should_quit: false,
             history: Vec::new(),
             history_index: None,
+            chat_scroll_offset: 0,
+            selection: SelectionState::new(),
+            chat_area: ratatui::layout::Rect::new(0, 0, 80, 24),
         }
     }
 
@@ -151,14 +159,18 @@ impl TuiApp {
     pub fn run(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
         let result = self.main_loop(&mut terminal);
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
         result
     }
 
@@ -168,23 +180,36 @@ impl TuiApp {
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
         while !self.should_quit {
-            // Draw the current frame.
-            terminal.draw(|f| self.render(f))?;
+            // Draw the current frame. Also finalize any pending selection copy.
+            terminal.draw(|f| {
+                self.render(f);
+                self.selection.finalize_copy(f.buffer_mut());
+            })?;
+
+            // If the selection was finalized, copy the extracted text.
+            if let Some(text) = self.selection.take_copy_text() {
+                match Self::copy_to_clipboard(&text) {
+                    Ok(()) => {
+                        self.status_text = "Copied to clipboard".into();
+                    }
+                    Err(e) => {
+                        self.status_text = format!("Copy failed: {e}");
+                    }
+                }
+            }
 
             // Drain any pending async events from the backend.
             if let Ok(event) = self.event_rx.try_recv() {
                 self.handle_app_event(event);
             }
 
-            // Poll for keyboard input (non-blocking with 16 ms timeout).
+            // Poll for input events (non-blocking with 16 ms timeout).
             if event::poll(std::time::Duration::from_millis(16))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        // Dispatch key based on current TUI mode.
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         match self.mode {
                             TuiMode::Normal => {
                                 match key.code {
-                                    // Navigate up through input history.
                                     KeyCode::Up => {
                                         if self.history_index.is_none() && !self.input_buffer.is_empty() {
                                             self.history.push(self.input_buffer.clone());
@@ -197,7 +222,6 @@ impl TuiApp {
                                             self.cursor_position = self.input_buffer.len();
                                         }
                                     }
-                                    // Scroll down through input history.
                                     KeyCode::Down => {
                                         if let Some(idx) = self.history_index {
                                             let new_idx = idx + 1;
@@ -211,7 +235,13 @@ impl TuiApp {
                                             self.cursor_position = self.input_buffer.len();
                                         }
                                     }
-                                    // Reset history position and delegate to normal input processing.
+                                    // PgUp / PgDn scroll the chat area by half the viewport.
+                                    KeyCode::PageUp => {
+                                        self.chat_scroll_offset += 10;
+                                    }
+                                    KeyCode::PageDown => {
+                                        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
+                                    }
                                     _ => {
                                         self.history_index = None;
                                         let action = input::process_key(
@@ -221,13 +251,11 @@ impl TuiApp {
                                             &mut self.cursor_position,
                                         );
                                         match action {
-                                            // User submitted non-empty text — either a slash command or a chat message.
                                             input::InputAction::Submit(text) => {
                                                 if !text.trim().is_empty() {
                                                     if text.starts_with('/') {
                                                         self.handle_command(&text);
                                                     } else {
-                                                        // Store in history and send to backend as chat.
                                                         if self.history.last() != Some(&text) {
                                                             self.history.push(text.clone());
                                                         }
@@ -239,6 +267,8 @@ impl TuiApp {
                                                         });
                                                         self.current_response.clear();
                                                         self.current_reasoning.clear();
+                                                        self.chat_scroll_offset = 0;
+                                                        self.selection.clear();
                                                         self.status_text = "Waiting...".into();
                                                         let _ = self.cmd_tx.send(TuiCommand::Chat(text));
                                                     }
@@ -246,31 +276,81 @@ impl TuiApp {
                                                     self.cursor_position = 0;
                                                 }
                                             }
-                                            // Ctrl+D / Ctrl+C / Esc initiated quit.
                                             input::InputAction::Quit => self.should_quit = true,
                                             input::InputAction::ToggleConnectInfo => {}
                                         }
                                     }
                                 }
                             }
-                            // Delegate to the connection settings key handler.
-                            TuiMode::ConnectSettings => {
-                                self.handle_connect_key(key.code);
-                            }
-                            // Delegate to the variant picker key handler.
-                            TuiMode::VariantPicker => {
-                                self.handle_variant_key(key.code);
-                            }
-            // Delegate to the provider picker key handler.
-            TuiMode::ProviderPicker => {
-                self.handle_provider_key(key.code);
-            }
-            // Delegate to the provider action sub-menu key handler.
-            TuiMode::ProviderAction { .. } => {
-                self.handle_provider_action_key(key.code);
-            }
-        }
+                            TuiMode::ConnectSettings => { self.handle_connect_key(key.code); }
+                            TuiMode::VariantPicker => { self.handle_variant_key(key.code); }
+                            TuiMode::ProviderPicker => { self.handle_provider_key(key.code); }
+                            TuiMode::ProviderAction { .. } => { self.handle_provider_action_key(key.code); }
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                match self.mode {
+                                    TuiMode::Normal => { self.chat_scroll_offset += 3; }
+                                    TuiMode::ConnectSettings if self.connect_form.show_model_list => {
+                                        self.connect_form.model_list_index =
+                                            self.connect_form.model_list_index.saturating_sub(1);
+                                    }
+                                    TuiMode::VariantPicker => {
+                                        self.variant_selected = self.variant_selected.saturating_sub(1);
+                                    }
+                                    TuiMode::ProviderPicker => {
+                                        self.provider_selected = self.provider_selected.saturating_sub(1);
+                                    }
+                                    TuiMode::ProviderAction { .. } => {
+                                        self.provider_action_selected = self.provider_action_selected.saturating_sub(1);
+                                    }
+                                    _ => {}
+                                }
+                                // Scroll clears any active selection.
+                                self.selection.clear();
+                            }
+                            MouseEventKind::ScrollDown => {
+                                match self.mode {
+                                    TuiMode::Normal => {
+                                        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(3);
+                                    }
+                                    TuiMode::ConnectSettings if self.connect_form.show_model_list => {
+                                        if self.connect_form.model_list_index + 1 < self.connect_form.model_list.len() {
+                                            self.connect_form.model_list_index += 1;
+                                        }
+                                    }
+                                    TuiMode::VariantPicker => {
+                                        if self.variant_selected + 1 < self.variant_options.len() {
+                                            self.variant_selected += 1;
+                                        }
+                                    }
+                                    TuiMode::ProviderPicker => {
+                                        if self.provider_selected <= self.providers.len() {
+                                            self.provider_selected += 1;
+                                        }
+                                    }
+                                    TuiMode::ProviderAction { .. } => {
+                                        if self.provider_action_selected < 1 {
+                                            self.provider_action_selected += 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                self.selection.clear();
+                            }
+                            MouseEventKind::Down(_)
+                            | MouseEventKind::Drag(_)
+                            | MouseEventKind::Up(_) => {
+                                if self.mode == TuiMode::Normal {
+                                    self.selection.handle_mouse_event(&mouse, self.chat_area);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -563,6 +643,7 @@ impl TuiApp {
                 let was_empty = self.current_response.is_empty();
                 self.current_response.push_str(&text);
                 if was_empty {
+                    self.chat_scroll_offset = 0;
                     self.messages.push(ChatMessage {
                         role: "assistant".into(),
                         content: text,
@@ -677,7 +758,7 @@ impl TuiApp {
     }
 
     // Render the full TUI frame: content area, input line, and status bar.
-    fn render(&self, f: &mut ratatui::Frame) {
+    fn render(&mut self, f: &mut ratatui::Frame) {
         let size = f.area();
 
         // Split the screen into three rows: content, input, status bar.
@@ -693,6 +774,7 @@ impl TuiApp {
         // Render the top content area depending on the current mode.
         match self.mode {
             TuiMode::Normal => {
+                self.chat_area = chunks[0];
                 self.render_chat_area(chunks[0], f);
             }
             TuiMode::ConnectSettings => {
@@ -785,118 +867,81 @@ impl TuiApp {
         f.render_widget(status, chunks[2]);
     }
 
-    // Render the scrollable chat message area with only visible messages.
-    fn render_chat_area(&self, area: ratatui::layout::Rect, f: &mut ratatui::Frame) {
-        if self.messages.is_empty() {
-            return;
-        }
-
-        // Calculate height of each message in lines.
-        let mut heights: Vec<usize> = Vec::new();
-        for msg in &self.messages {
-            let content_lines = msg.content.lines().count().max(1);
-            let reasoning_lines = msg.reasoning.as_ref().map(|r| r.lines().count()).unwrap_or(0);
-            let frame_padding = if msg.role == "user" { 2 } else { 0 };
-            heights.push(content_lines + reasoning_lines + frame_padding);
-        }
-
-        // Determine which messages fit in the available vertical space (scrolled to bottom).
-        let available = area.height as usize;
-        let mut total = 0usize;
-        let mut start_idx = heights.len();
-        for i in (0..heights.len()).rev() {
-            if total + heights[i] > available {
-                if total == 0 {
-                    // Even a single message exceeds the viewport — render it anyway (clipped).
-                    start_idx = i;
-                }
-                break;
+    // Copy text to the system clipboard. Tries arboard first, falls back to OSC 52.
+    fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => {
+                clipboard.set_text(text)?;
             }
-            total += heights[i];
-            start_idx = i;
-        }
-        if start_idx >= self.messages.len() {
-            return;
-        }
-
-        // Cap the first visible message's height to the available area, so
-        // ratatui layout doesn't truncate the entire chat when one message is too tall.
-        let visible_heights: Vec<usize> = heights[start_idx..]
-            .iter()
-            .enumerate()
-            .map(|(i, &h)| if i == 0 && h > available { available } else { h })
-            .collect();
-        if visible_heights.is_empty() {
-            return;
-        }
-
-        let constraints: Vec<Constraint> = visible_heights
-            .iter()
-            .map(|&h| Constraint::Length(h as u16))
-            .collect();
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
-
-        for (j, msg_index) in (start_idx..self.messages.len()).enumerate() {
-            if j >= chunks.len() {
-                break;
-            }
-            let msg = &self.messages[msg_index];
-            let rect = chunks[j];
-
-            let paragraph = self.render_message(msg);
-
-            // When the first visible message overflows the viewport, scroll to its
-            // bottom so the user sees the latest lines (streaming‑friendly).
-            if j == 0 && heights[msg_index] > available {
-                let scroll = (heights[msg_index] - available) as u16;
-                f.render_widget(paragraph.scroll((scroll, 0)), rect);
-            } else {
-                f.render_widget(paragraph, rect);
+            Err(_) => {
+                // Fallback: OSC 52 terminal clipboard (works over SSH).
+                use std::io::Write;
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+                let osc52 = format!("\x1b]52;c;{}\x1b\\", b64);
+                let mut stdout = stdout();
+                stdout.write_all(osc52.as_bytes())?;
+                stdout.flush()?;
             }
         }
+        Ok(())
     }
 
-    // Render a single chat message with optional reasoning and role-based styling.
-    fn render_message(&self, msg: &ChatMessage) -> Paragraph<'_> {
+    // Render the scrollable chat message area with scroll offset and selection highlighting.
+    fn render_chat_area(&mut self, area: ratatui::layout::Rect, f: &mut ratatui::Frame) {
+        // Build flat lines for all messages with role-based styling.
         let mut lines: Vec<Line> = Vec::new();
 
-        // Display reasoning text in dark gray above the message content.
-        if let Some(reasoning) = &msg.reasoning {
-            for line in reasoning.lines() {
-                lines.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )));
+        for msg in &self.messages {
+            let text_style = match msg.role.as_str() {
+                "system" => Style::default().fg(Color::Yellow),
+                _ if msg.thinking => Style::default().fg(Color::DarkGray),
+                _ => Style::default(),
+            };
+
+            if let Some(reasoning) = &msg.reasoning {
+                for line in reasoning.lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+
+            if msg.role == "user" {
+                let width = area.width.saturating_sub(2) as usize;
+                let top = format!("┌{}┐", "─".repeat(width));
+                let bottom = format!("└{}┘", "─".repeat(width));
+                lines.push(Line::from(Span::styled(top, Style::default().fg(Color::Cyan))));
+                for content_line in msg.content.lines() {
+                    let vis = unicode_width::UnicodeWidthStr::width(content_line);
+                    let inner = area.width.saturating_sub(4) as usize;
+                    let pad = inner.saturating_sub(vis);
+                    let padded = format!("│ {} {}│", content_line, " ".repeat(pad));
+                    lines.push(Line::from(Span::styled(padded, Style::default().fg(Color::Cyan))));
+                }
+                lines.push(Line::from(Span::styled(bottom, Style::default().fg(Color::Cyan))));
+            } else {
+                for line in msg.content.lines() {
+                    lines.push(Line::from(Span::styled(line.to_string(), text_style)));
+                }
             }
         }
 
-        for line in msg.content.lines() {
-            lines.push(Line::from(Span::raw(line.to_string())));
+        if lines.is_empty() {
+            return;
         }
 
-        // Style the block border and text color based on message role.
-        let block = match msg.role.as_str() {
-            "user" => Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-            "system" => Block::default()
-                .borders(Borders::NONE)
-                .style(Style::default().fg(Color::Yellow)),
-            _ => Block::default().borders(Borders::NONE),
-        };
+        // Render the paragraph with scrolling.
+        let total = lines.len();
+        let visible = area.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let top_offset = max_scroll.saturating_sub(self.chat_scroll_offset).min(max_scroll);
+        let paragraph = Paragraph::new(lines).scroll((top_offset as u16, 0));
+        f.render_widget(paragraph, area);
 
-        let style = match msg.role.as_str() {
-            "user" => Style::default().fg(Color::White),
-            "system" => Style::default().fg(Color::Yellow),
-            _ if msg.thinking => Style::default().fg(Color::DarkGray),
-            _ => Style::default(),
-        };
-
-        Paragraph::new(lines).block(block).style(style)
+        // Overlay the selection highlight on top of the rendered content.
+        self.selection.render(f.buffer_mut());
     }
 
     // Render the connection settings form with provider name, type, URL, key, model fields, and buttons.
