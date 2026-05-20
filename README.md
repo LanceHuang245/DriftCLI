@@ -29,7 +29,7 @@ DriftCLI is a terminal AI coding agent that reads, writes, edits, and searches y
 | **Language** | Rust | TypeScript | Rust | TypeScript |
 | **Startup** | < 5ms | ~200ms | < 5ms | ~200ms |
 | **Binary size** | ~5 MB | — | ~50 MB | ~15 MB |
-| **Runtime** | None (static) | Node.js | None (static) | Bun |
+| **Runtime** | None (static) | Bun | None (static) | Bun |
 | **BYOK** | Yes | Anthropic only | OpenAI only | Yes |
 | **MCP** | rmcp (native) | Partial | rmcp (native) | MCP SDK |
 | **Plugins** | WASM (wasmtime) | — | — | WASM |
