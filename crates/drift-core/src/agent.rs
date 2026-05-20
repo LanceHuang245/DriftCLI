@@ -240,8 +240,10 @@ impl Agent {
             // Execute each tool call sequentially
             let mut tool_result_parts: Vec<drift_llm::ContentPart> = Vec::new();
             for tc in &completed_tool_calls {
+                let args_raw = tc.args_string();
                 let args: serde_json::Value =
-                    serde_json::from_str(&tc.args_string()).unwrap_or_default();
+                    serde_json::from_str(&args_raw).unwrap_or_default();
+                warn!(tool = %tc.name, id = %tc.id, args = %args_raw, "executing tool");
 
                 let _ = self.event_tx.send(EventMsg::ToolExecStart {
                     id: tc.id.clone(),
@@ -261,6 +263,14 @@ impl Agent {
 
                 match result {
                     Ok(r) => {
+                        if !r.success {
+                            warn!(
+                                tool = %tc.name,
+                                error = ?r.error,
+                                content_len = r.content.len(),
+                                "tool returned failure"
+                            );
+                        }
                         let _ = self.event_tx.send(EventMsg::ToolExecEnd {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
