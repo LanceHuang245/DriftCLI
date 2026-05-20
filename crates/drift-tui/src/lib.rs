@@ -750,6 +750,10 @@ impl TuiApp {
         let mut start_idx = heights.len();
         for i in (0..heights.len()).rev() {
             if total + heights[i] > available {
+                if total == 0 {
+                    // Even a single message exceeds the viewport — render it anyway (clipped).
+                    start_idx = i;
+                }
                 break;
             }
             total += heights[i];
@@ -759,7 +763,13 @@ impl TuiApp {
             return;
         }
 
-        let visible_heights: Vec<usize> = heights[start_idx..].to_vec();
+        // Cap the first visible message's height to the available area, so
+        // ratatui layout doesn't truncate the entire chat when one message is too tall.
+        let visible_heights: Vec<usize> = heights[start_idx..]
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| if i == 0 && h > available { available } else { h })
+            .collect();
         if visible_heights.is_empty() {
             return;
         }
@@ -781,7 +791,16 @@ impl TuiApp {
             let msg = &self.messages[msg_index];
             let rect = chunks[j];
 
-            f.render_widget(self.render_message(msg), rect);
+            let paragraph = self.render_message(msg);
+
+            // When the first visible message overflows the viewport, scroll to its
+            // bottom so the user sees the latest lines (streaming‑friendly).
+            if j == 0 && heights[msg_index] > available {
+                let scroll = (heights[msg_index] - available) as u16;
+                f.render_widget(paragraph.scroll((scroll, 0)), rect);
+            } else {
+                f.render_widget(paragraph, rect);
+            }
         }
     }
 
