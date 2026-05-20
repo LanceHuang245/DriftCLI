@@ -9,7 +9,7 @@ use drift_llm::{
 };
 use drift_tools::{ToolContext, ToolRegistry};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // Track state of a tool call being accumulated from streaming chunks.
 struct ActiveToolCall {
