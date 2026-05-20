@@ -180,23 +180,8 @@ impl TuiApp {
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
         while !self.should_quit {
-            // Draw the current frame. Also finalize any pending selection copy.
-            terminal.draw(|f| {
-                self.render(f);
-                self.selection.finalize_copy(f.buffer_mut());
-            })?;
-
-            // If the selection was finalized, copy the extracted text.
-            if let Some(text) = self.selection.take_copy_text() {
-                match Self::copy_to_clipboard(&text) {
-                    Ok(()) => {
-                        self.status_text = "Copied to clipboard".into();
-                    }
-                    Err(e) => {
-                        self.status_text = format!("Copy failed: {e}");
-                    }
-                }
-            }
+            // Draw the current frame.
+            terminal.draw(|f| self.render(f))?;
 
             // Drain any pending async events from the backend.
             if let Ok(event) = self.event_rx.try_recv() {
@@ -865,26 +850,6 @@ impl TuiApp {
 
         ]));
         f.render_widget(status, chunks[2]);
-    }
-
-    // Copy text to the system clipboard. Tries arboard first, falls back to OSC 52.
-    fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                clipboard.set_text(text)?;
-            }
-            Err(_) => {
-                // Fallback: OSC 52 terminal clipboard (works over SSH).
-                use std::io::Write;
-                use base64::Engine as _;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(text);
-                let osc52 = format!("\x1b]52;c;{}\x1b\\", b64);
-                let mut stdout = stdout();
-                stdout.write_all(osc52.as_bytes())?;
-                stdout.flush()?;
-            }
-        }
-        Ok(())
     }
 
     // Render the scrollable chat message area with scroll offset and selection highlighting.

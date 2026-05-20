@@ -81,43 +81,23 @@ pub enum SelectionResult {
 }
 
 /// Manages the lifecycle of a mouse drag text selection.
-/// Uses raw buffer coordinates — no need to translate to content line indices.
+/// Uses raw buffer coordinates so selection highlight is independent of content scroll.
 ///
-/// Text extraction is deferred: on mouse-up the selection stays active for one
-/// more frame so the rendered buffer can be read. After extraction the selection
-/// is cleared.
+/// On mouse-up after a drag, the selection highlight persists until cleared
+/// by a new click, scroll, or message submit.
 #[derive(Debug, Default)]
 pub struct SelectionState {
     active: Option<ActiveSelection>,
-    /// True when the next render should extract text then clear.
-    deferred_copy: bool,
-    /// Extracted text waiting to be copied (set during render, consumed after draw).
-    pending_copy: Option<String>,
 }
 
 impl SelectionState {
     pub fn new() -> Self {
-        Self {
-            active: None,
-            deferred_copy: false,
-            pending_copy: None,
-        }
+        Self { active: None }
     }
 
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        self.active.is_some()
-    }
-
-    /// Clear selection without extracting text.
+    /// Clear the current selection highlight.
     pub fn clear(&mut self) {
         self.active = None;
-        self.deferred_copy = false;
-    }
-
-    /// Take the pending copied text, if any.
-    pub fn take_copy_text(&mut self) -> Option<String> {
-        self.pending_copy.take()
     }
 
     /// Handle a mouse event within the given area.
@@ -125,8 +105,6 @@ impl SelectionState {
     pub fn handle_mouse_event(&mut self, event: &MouseEvent, area: Rect) -> SelectionResult {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.pending_copy = None;
-                self.deferred_copy = false;
                 if let Some(point) = point_in_area(event, area) {
                     self.active = Some(ActiveSelection {
                         area,
@@ -153,13 +131,10 @@ impl SelectionState {
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(ref active) = self.active {
                     if !active.dragged {
-                        // Click without drag: just clear the selection.
+                        // Click without drag: clear any previous selection.
                         self.active = None;
-                        return SelectionResult::Redraw;
                     }
-                    // Defer copy: keep selection active for one more render,
-                    // then extract text from the rendered buffer.
-                    self.deferred_copy = true;
+                    // Drag completed: keep highlight visible.
                     SelectionResult::Redraw
                 } else {
                     SelectionResult::None
@@ -168,7 +143,6 @@ impl SelectionState {
             _ => {
                 // Scroll, right-click, or any other mouse event clears selection.
                 if self.active.take().is_some() {
-                    self.deferred_copy = false;
                     SelectionResult::Redraw
                 } else {
                     SelectionResult::None
@@ -197,45 +171,7 @@ impl SelectionState {
         }
     }
 
-    /// Call during render after drawing content and selection highlight.
-    /// If a deferred copy is pending, extracts text from the buffer and clears the selection.
-    pub fn finalize_copy(&mut self, buf: &Buffer) {
-        if !self.deferred_copy {
-            return;
-        }
-        self.deferred_copy = false;
-        let Some(active) = self.active.take() else {
-            return;
-        };
-        let range = active.range();
-        let area = active.area;
-        let start_y = range.start.row;
-        let end_y = range.end.row;
-        let mut lines: Vec<String> =
-            Vec::with_capacity((end_y.saturating_sub(start_y) + 1) as usize);
-        for y in start_y..=end_y {
-            let (start_col, end_col) = match range.columns_for_row(y, area) {
-                Some(v) => v,
-                None => continue,
-            };
-            let mut line = String::new();
-            for x in start_col..end_col.min(area.right()) {
-                if let Some(cell) = buf.cell((x, y)) {
-                    line.push_str(cell.symbol());
-                }
-            }
-            if end_col >= area.right() {
-                line = line.trim_end().to_string();
-            }
-            lines.push(line);
-        }
-        let text = lines.join("\n");
-        if !text.trim().is_empty() {
-            self.pending_copy = Some(text);
-        }
-    }
-
-    /// Extract selected text from a buffer (for unit testing or direct use).
+    /// Extract selected text from a buffer (for debugging or future use).
     #[allow(dead_code)]
     pub fn extract_text(range: &SelectionRange, area: Rect, buf: &Buffer) -> Option<String> {
         let start_y = range.start.row;
