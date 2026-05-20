@@ -6,6 +6,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub struct AnthropicProvider {
     api_key: String,
@@ -141,74 +142,85 @@ impl LlmProvider for AnthropicProvider {
 
         let line_stream = sse_text_stream(response);
 
-        let event_stream = line_stream.filter_map(|line| {
-            // Track which block indices correspond to tool_use blocks and map index → actual tool_use id.
-            let mut tool_block_indices: HashMap<usize, String> = HashMap::new();
-            async move {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    let data = data.trim();
-                    if data == "[DONE]" {
-                        return Some(Ok(LlmChunk::Done));
-                    }
-                    if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
-                        match event.event_type.as_str() {
-                            "content_block_start" => {
-                                if let Some(ref block) = event.content_block {
-                                    if block.block_type == "tool_use" {
-                                        let actual_id = block.id.clone().unwrap_or_default();
-                                        let name = block.name.clone().unwrap_or_default();
-                                        if actual_id.is_empty() || name.is_empty() {
-                                            return None;
-                                        }
-                                        if let Some(index) = event.index {
-                                            tool_block_indices.insert(index, actual_id.clone());
-                                        }
-                                        return Some(Ok(LlmChunk::ToolCallStart {
-                                            id: actual_id,
-                                            name,
-                                        }));
-                                    }
-                                }
-                            }
-                            "content_block_delta" => {
-                                if let Some(delta) = &event.delta {
-                                    if delta.delta_type == "input_json_delta" {
-                                        if let Some(ref partial) = delta.partial_json {
-                                            let id = event
-                                                .index
-                                                .and_then(|i| tool_block_indices.get(&i).cloned())
-                                                .unwrap_or_default();
-                                            return Some(Ok(LlmChunk::ToolCallArgs {
-                                                id,
-                                                delta: partial.clone(),
+        // Maps block index → actual tool_use id, shared across all events.
+        let tool_block_indices: Arc<Mutex<HashMap<usize, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let event_stream = line_stream.filter_map({
+            let indices = Arc::clone(&tool_block_indices);
+            move |line| {
+                let indices = Arc::clone(&indices);
+                async move {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        let data = data.trim();
+                        if data == "[DONE]" {
+                            return Some(Ok(LlmChunk::Done));
+                        }
+                        if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
+                            match event.event_type.as_str() {
+                                "content_block_start" => {
+                                    if let Some(ref block) = event.content_block {
+                                        if block.block_type == "tool_use" {
+                                            let actual_id = block.id.clone().unwrap_or_default();
+                                            let name = block.name.clone().unwrap_or_default();
+                                            if actual_id.is_empty() || name.is_empty() {
+                                                return None;
+                                            }
+                                            if let Some(index) = event.index {
+                                                indices
+                                                    .lock()
+                                                    .unwrap()
+                                                    .insert(index, actual_id.clone());
+                                            }
+                                            return Some(Ok(LlmChunk::ToolCallStart {
+                                                id: actual_id,
+                                                name,
                                             }));
                                         }
-                                    } else if let Some(thinking) = &delta.thinking {
-                                        return Some(Ok(LlmChunk::ReasoningDelta(
-                                            thinking.clone(),
-                                        )));
-                                    } else if let Some(text) = &delta.text {
-                                        return Some(Ok(LlmChunk::TextDelta(text.clone())));
                                     }
                                 }
-                            }
-                            "content_block_stop" => {
-                                if let Some(index) = event.index {
-                                    if let Some(actual_id) =
-                                        tool_block_indices.remove(&index)
-                                    {
-                                        return Some(Ok(LlmChunk::ToolCallEnd {
-                                            id: actual_id,
-                                        }));
+                                "content_block_delta" => {
+                                    if let Some(delta) = &event.delta {
+                                        if delta.delta_type == "input_json_delta" {
+                                            if let Some(ref partial) = delta.partial_json {
+                                                let id = event
+                                                    .index
+                                                    .and_then(|i| {
+                                                        indices.lock().unwrap().get(&i).cloned()
+                                                    })
+                                                    .unwrap_or_default();
+                                                return Some(Ok(LlmChunk::ToolCallArgs {
+                                                    id,
+                                                    delta: partial.clone(),
+                                                }));
+                                            }
+                                        } else if let Some(thinking) = &delta.thinking {
+                                            return Some(Ok(LlmChunk::ReasoningDelta(
+                                                thinking.clone(),
+                                            )));
+                                        } else if let Some(text) = &delta.text {
+                                            return Some(Ok(LlmChunk::TextDelta(text.clone())));
+                                        }
                                     }
                                 }
+                                "content_block_stop" => {
+                                    if let Some(index) = event.index {
+                                        if let Some(actual_id) =
+                                            indices.lock().unwrap().remove(&index)
+                                        {
+                                            return Some(Ok(LlmChunk::ToolCallEnd {
+                                                id: actual_id,
+                                            }));
+                                        }
+                                    }
+                                }
+                                "message_stop" => return Some(Ok(LlmChunk::Done)),
+                                _ => {}
                             }
-                            "message_stop" => return Some(Ok(LlmChunk::Done)),
-                            _ => {}
                         }
                     }
+                    None
                 }
-                None
             }
         });
 
