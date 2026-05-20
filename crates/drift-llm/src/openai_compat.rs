@@ -169,57 +169,62 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         let line_stream = crate::sse_text_stream(response);
 
-        let event_stream = line_stream.filter_map(|line| async move {
-            if let Some(data) = line.strip_prefix("data: ") {
-                let data = data.trim();
-                if data == "[DONE]" {
-                    return Some(Ok(LlmChunk::Done));
-                }
-                if let Ok(event) = serde_json::from_str::<OpenAiStreamEvent>(data) {
-                    for choice in &event.choices {
-                        if let Some(delta) = &choice.delta {
-                            if let Some(ref tool_calls) = delta.tool_calls {
-                                for tc in tool_calls {
-                                    if let Some(ref name) = tc.function.name {
-                                        if !name.is_empty() {
-                                            return Some(Ok(LlmChunk::ToolCallStart {
-                                                id: tc.id.clone().unwrap_or_default(),
-                                                name: name.clone(),
-                                            }));
+        let event_stream = line_stream
+            .filter_map(|line| async move {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        return Some(vec![Ok(LlmChunk::Done)]);
+                    }
+                    if let Ok(event) = serde_json::from_str::<OpenAiStreamEvent>(data) {
+                        let mut chunks: Vec<Result<LlmChunk, LlmError>> = Vec::new();
+                        for choice in &event.choices {
+                            if let Some(delta) = &choice.delta {
+                                if let Some(ref tool_calls) = delta.tool_calls {
+                                    for tc in tool_calls {
+                                        if let Some(ref name) = tc.function.name {
+                                            if !name.is_empty() {
+                                                chunks.push(Ok(LlmChunk::ToolCallStart {
+                                                    id: tc.id.clone().unwrap_or_default(),
+                                                    name: name.clone(),
+                                                }));
+                                            }
                                         }
-                                    }
-                                    if let Some(ref args) = tc.function.arguments {
-                                        if !args.is_empty() {
-                                            return Some(Ok(LlmChunk::ToolCallArgs {
-                                                id: tc.id.clone().unwrap_or_default(),
-                                                delta: args.clone(),
-                                            }));
+                                        if let Some(ref args) = tc.function.arguments {
+                                            if !args.is_empty() {
+                                                chunks.push(Ok(LlmChunk::ToolCallArgs {
+                                                    id: tc.id.clone().unwrap_or_default(),
+                                                    delta: args.clone(),
+                                                }));
+                                            }
                                         }
                                     }
                                 }
+                                if let Some(content) = &delta.content {
+                                    chunks.push(Ok(LlmChunk::TextDelta(content.clone())));
+                                }
+                                if let Some(reasoning) = &delta.reasoning_content {
+                                    if !reasoning.is_empty() {
+                                        chunks.push(Ok(LlmChunk::ReasoningDelta(
+                                            reasoning.clone(),
+                                        )));
+                                    }
+                                }
                             }
-                            if let Some(content) = &delta.content {
-                                return Some(Ok(LlmChunk::TextDelta(content.clone())));
-                            }
-                            if let Some(reasoning) = &delta.reasoning_content {
-                                if !reasoning.is_empty() {
-                                    return Some(Ok(LlmChunk::ReasoningDelta(reasoning.clone())));
+                            if let Some(reason) = &choice.finish_reason {
+                                if reason == "stop" || reason == "tool_calls" {
+                                    chunks.push(Ok(LlmChunk::Done));
                                 }
                             }
                         }
-                        if let Some(reason) = &choice.finish_reason {
-                            if reason == "stop" {
-                                return Some(Ok(LlmChunk::Done));
-                            }
-                            if reason == "tool_calls" {
-                                return Some(Ok(LlmChunk::Done));
-                            }
+                        if !chunks.is_empty() {
+                            return Some(chunks);
                         }
                     }
                 }
-            }
-            None
-        });
+                None
+            })
+            .flat_map(|chunks| futures::stream::iter(chunks));
 
         Ok(LlmResponseStream::new(event_stream))
     }

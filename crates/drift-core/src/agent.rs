@@ -267,9 +267,20 @@ impl Agent {
                             success: r.success,
                             error: r.error.clone(),
                         });
+                        let result_content = if r.success {
+                            r.content
+                        } else {
+                            match &r.error {
+                                Some(err) if !r.content.is_empty() => {
+                                    format!("{} — Error: {}", r.content, err)
+                                }
+                                Some(err) => format!("Error: {}", err),
+                                None => r.content,
+                            }
+                        };
                         tool_result_parts.push(drift_llm::ContentPart::ToolResult {
                             tool_use_id: tc.id.clone(),
-                            content: r.content,
+                            content: result_content,
                             is_error: !r.success,
                         });
                     }
