@@ -6,7 +6,7 @@
   <h1 align="center">DriftCLI</h1>
   <p align="center">
     基于 Rust 构建的高性能终端 AI 编程 Agent。<br/>
-    自带密钥，自选模型。
+    自带密钥，自选模型——无代理、无锁定。
   </p>
 </p>
 
