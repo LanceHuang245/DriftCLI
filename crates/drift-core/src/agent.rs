@@ -415,6 +415,11 @@ impl Agent {
         self.config.list_provider_names()
     }
 
+    // Returns the full config for a specific provider.
+    pub fn get_provider_config(&self, name: &str) -> Option<LlmConfig> {
+        self.config.get_provider_config(name).cloned()
+    }
+
     // Static: queries the provider's API for available model IDs.
     pub async fn fetch_models(
         provider: &str,

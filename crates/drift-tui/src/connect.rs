@@ -42,6 +42,24 @@ impl ConnectForm {
         Self::from_entry("default", config)
     }
 
+    // Create an empty ConnectForm with sensible defaults for adding a new provider.
+    pub fn new() -> Self {
+        Self {
+            provider_name: String::new(),
+            provider_type: ProviderType::OpenAiCompatible,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            reasoning_effort: None,
+            selected_field: 0,
+            show_model_list: false,
+            model_list: Vec::new(),
+            model_list_index: 0,
+            fetching_models: false,
+            status_message: String::new(),
+        }
+    }
+
     // Build a ConnectForm from an explicit provider name and LlmConfig.
     pub fn from_entry(name: &str, config: &LlmConfig) -> Self {
         match config {

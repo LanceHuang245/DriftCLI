@@ -130,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
                         Ok(EventMsg::ProviderSwitched { name, model }) => {
                             let _ = tui_tx.send(AppEvent::ProviderSwitched { name, model });
                         }
+                        Ok(EventMsg::ProviderConfig { name, config }) => {
+                            let _ = tui_tx.send(AppEvent::ProviderConfig { name, config });
+                        }
                         Ok(EventMsg::ToolCallStart { id, name }) => {
                             let _ = tui_tx.send(AppEvent::ToolCallStart { id, name });
                         }
@@ -227,6 +230,19 @@ async fn main() -> anyhow::Result<()> {
                                 Err(e) => {
                                     let _ = event_tx.send(EventMsg::Error {
                                         message: format!("Delete failed: {}", e),
+                                        recoverable: true,
+                                    });
+                                }
+                            }
+                        }
+                        TuiCommand::GetProviderConfig(name) => {
+                            match agent.get_provider_config(&name) {
+                                Some(config) => {
+                                    let _ = event_tx.send(EventMsg::ProviderConfig { name, config });
+                                }
+                                None => {
+                                    let _ = event_tx.send(EventMsg::Error {
+                                        message: format!("Provider '{}' not found", name),
                                         recoverable: true,
                                     });
                                 }

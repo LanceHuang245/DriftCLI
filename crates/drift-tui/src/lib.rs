@@ -30,6 +30,8 @@ pub enum AppEvent {
     ModelList(Vec<ModelInfo>),
     ProviderList(Vec<String>),
     ProviderSwitched { name: String, model: String },
+    // Full config for a specific provider loaded from the backend.
+    ProviderConfig { name: String, config: LlmConfig },
     // Tool call started with id and name
     ToolCallStart { id: String, name: String },
     // Tool call arguments streaming
@@ -60,6 +62,8 @@ pub enum TuiCommand {
     GetProviders,
     // Delete a named provider from the configuration.
     DeleteProvider(String),
+    // Get the full config for a named provider (used for "Modify" in the provider picker).
+    GetProviderConfig(String),
 }
 
 // Central application state for the DriftCLI TUI.
@@ -78,6 +82,7 @@ pub struct TuiApp {
     // Multi-provider support: configured providers, selection index, and active name.
     providers: Vec<String>,
     provider_selected: usize,
+    provider_action_selected: usize,
     provider_name: String,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     cmd_tx: mpsc::UnboundedSender<TuiCommand>,
@@ -94,6 +99,8 @@ pub enum TuiMode {
     VariantPicker,
     // Provider switcher overlay (list configured providers with delete option)
     ProviderPicker,
+    // Sub-menu after selecting a provider in the provider picker: Apply / Modify
+    ProviderAction { provider_name: String },
 }
 
 // A single chat message with optional reasoning/thinking content.
@@ -130,6 +137,7 @@ impl TuiApp {
             variant_selected: 0,
             providers: Vec::new(),
             provider_selected: 0,
+            provider_action_selected: 0,
             provider_name: "default".to_string(),
             event_rx,
             cmd_tx,
@@ -253,11 +261,15 @@ impl TuiApp {
                             TuiMode::VariantPicker => {
                                 self.handle_variant_key(key.code);
                             }
-                            // Delegate to the provider picker key handler.
-                            TuiMode::ProviderPicker => {
-                                self.handle_provider_key(key.code);
-                            }
-                        }
+            // Delegate to the provider picker key handler.
+            TuiMode::ProviderPicker => {
+                self.handle_provider_key(key.code);
+            }
+            // Delegate to the provider action sub-menu key handler.
+            TuiMode::ProviderAction { .. } => {
+                self.handle_provider_action_key(key.code);
+            }
+        }
                     }
                 }
             }
@@ -270,9 +282,10 @@ impl TuiApp {
         let cmd = cmd.trim();
         match cmd {
             // Enter connection settings form.
-            "/connect" => {
-                self.mode = TuiMode::ConnectSettings;
-            }
+"/connect" => {
+    self.connect_form = connect::ConnectForm::new();
+    self.mode = TuiMode::ConnectSettings;
+}
             // Open the variant / reasoning-effort picker for the current model.
             "/variant" => {
                 let model = &self.connect_form.model;
@@ -430,8 +443,10 @@ impl TuiApp {
             KeyCode::Enter => {
                 if self.provider_selected < self.providers.len() {
                     let name = self.providers[self.provider_selected].clone();
-                    let _ = self.cmd_tx.send(TuiCommand::SetActiveProvider(name));
-                    self.mode = TuiMode::Normal;
+                    self.provider_action_selected = 0;
+                    self.mode = TuiMode::ProviderAction {
+                        provider_name: name,
+                    };
                 } else {
                     // [+ New Provider]
                     self.mode = TuiMode::ConnectSettings;
@@ -443,6 +458,39 @@ impl TuiApp {
                     let _ = self.cmd_tx.send(TuiCommand::DeleteProvider(name));
                     // Re-request list
                     let _ = self.cmd_tx.send(TuiCommand::GetProviders);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Handle key presses in the provider action sub-menu (Apply / Modify).
+    fn handle_provider_action_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = TuiMode::ProviderPicker,
+            KeyCode::Up => {
+                self.provider_action_selected = self.provider_action_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if self.provider_action_selected < 1 {
+                    self.provider_action_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let TuiMode::ProviderAction { ref provider_name } = self.mode {
+                    match self.provider_action_selected {
+                        0 => {
+                            let _ = self.cmd_tx
+                                .send(TuiCommand::SetActiveProvider(provider_name.clone()));
+                            self.mode = TuiMode::Normal;
+                        }
+                        1 => {
+                            let _ = self.cmd_tx
+                                .send(TuiCommand::GetProviderConfig(provider_name.clone()));
+                            // Mode switches to ConnectSettings when ProviderConfig event arrives.
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -582,6 +630,11 @@ impl TuiApp {
                 self.model_name = model;
                 self.status_text = format!("Switched to {}", name);
             }
+            // Received full config for a specific provider (from "Modify" action).
+            AppEvent::ProviderConfig { name, config } => {
+                self.connect_form = connect::ConnectForm::from_entry(&name, &config);
+                self.mode = TuiMode::ConnectSettings;
+            }
             // Tool call requested by LLM — commit in-progress text and prepare for tool execution.
             AppEvent::ToolCallStart { name, .. } => {
                 self.commit_current_response(true);
@@ -650,6 +703,9 @@ impl TuiApp {
             }
             TuiMode::ProviderPicker => {
                 f.render_widget(self.render_provider_picker(), chunks[0]);
+            }
+            TuiMode::ProviderAction { .. } => {
+                f.render_widget(self.render_provider_action(), chunks[0]);
             }
         }
 
@@ -1080,13 +1136,50 @@ impl TuiApp {
 
         lines.push(Line::from(Span::raw("")));
         lines.push(Line::from(Span::styled(
-            "  Up/Down: choose  Enter: switch  d: delete  Esc: cancel",
+            "  Up/Down: choose  Enter: select  d: delete  Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" /provider — Switch Provider ")
+            .title(" /provider — Select Provider ")
+            .border_style(Style::default().fg(Color::Cyan));
+        Paragraph::new(lines).block(block)
+    }
+
+    // Render the provider action sub-menu (Apply / Modify) after selecting a provider.
+    fn render_provider_action(&self) -> Paragraph<'_> {
+        let name = match &self.mode {
+            TuiMode::ProviderAction { provider_name } => provider_name.clone(),
+            _ => return Paragraph::new(vec![]),
+        };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            format!("  Provider: {}", name),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        for (i, label) in ["  Apply  (switch to this provider)", "  Modify (edit provider config)"].iter().enumerate() {
+            let style = if i == self.provider_action_selected {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(*label, style)));
+        }
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Up/Down: choose  Enter: confirm  Esc: back",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" /provider — Action ")
             .border_style(Style::default().fg(Color::Cyan));
         Paragraph::new(lines).block(block)
     }

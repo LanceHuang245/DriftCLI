@@ -173,6 +173,11 @@ impl AppConfig {
         self.providers.keys().cloned().collect()
     }
 
+    // Returns the LlmConfig for a specific provider by name.
+    pub fn get_provider_config(&self, name: &str) -> Option<&LlmConfig> {
+        self.providers.get(name).map(|e| &e.config)
+    }
+
     // Adds or updates a named provider. Sets it as active if it's the only one or explicitly requested.
     pub fn save_provider(&mut self, name: String, config: LlmConfig) {
         let is_first = self.providers.is_empty();

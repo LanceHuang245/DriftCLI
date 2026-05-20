@@ -1,3 +1,4 @@
+use drift_config::LlmConfig;
 use drift_llm::ModelInfo;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,8 @@ pub enum EventMsg {
     ModelList(Vec<ModelInfo>),
     // List of configured provider names for the /provider picker.
     ProviderList(Vec<String>),
+    // Full configuration for a specific provider, by name.
+    ProviderConfig { name: String, config: LlmConfig },
     // Notification that the provider was switched, carrying the new provider name and model.
     ProviderSwitched { name: String, model: String },
     // A tool call has been requested by the LLM — emitted with the call ID and tool name.
