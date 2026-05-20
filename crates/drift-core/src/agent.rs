@@ -128,6 +128,7 @@ impl Agent {
             let mut full_response = String::new();
             let mut full_reasoning = String::new();
             let mut reasoning_start: Option<Instant> = None;
+            let mut reasoning_complete_emitted = false;
             let mut streaming = false;
             // Map call_id -> ActiveToolCall for correlating chunks
             let mut active_tool_calls: HashMap<String, ActiveToolCall> = HashMap::new();
@@ -139,12 +140,13 @@ impl Agent {
                 match stream.next().await {
                     Some(Ok(LlmChunk::TextDelta(text))) => {
                         if !streaming {
-                            if !full_reasoning.is_empty() {
+                            if !full_reasoning.is_empty() && !reasoning_complete_emitted {
                                 if let Some(start) = reasoning_start {
                                     let duration_ms = start.elapsed().as_millis() as u64;
                                     let _ = self
                                         .event_tx
                                         .send(EventMsg::ReasoningComplete { duration_ms });
+                                    reasoning_complete_emitted = true;
                                 }
                             }
                             let _ = self
@@ -215,6 +217,17 @@ impl Agent {
                         break;
                     }
                     None => break,
+                }
+            }
+
+            // Emit ReasoningComplete for tool-call iterations that had
+            // reasoning but no TextDelta (so the flag was never set).
+            if !full_reasoning.is_empty() && !reasoning_complete_emitted {
+                if let Some(start) = reasoning_start {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let _ = self
+                        .event_tx
+                        .send(EventMsg::ReasoningComplete { duration_ms });
                 }
             }
 

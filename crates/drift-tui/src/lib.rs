@@ -123,6 +123,7 @@ pub struct TuiApp {
     current_reasoning_duration: Option<u64>,
     reasoning_start_time: Option<Instant>,
     current_reasoning_collapsed: bool,
+    current_thinking_tools: Vec<String>,
     reasoning_header_positions: Vec<(ReasoningTarget, usize)>,
     total_chat_lines: usize,
     input_buffer: String,
@@ -170,6 +171,7 @@ pub struct ChatMessage {
     pub thinking: bool,
     pub reasoning_duration_ms: Option<u64>,
     pub reasoning_collapsed: bool,
+    pub thinking_tools: Vec<String>,
 }
 
 impl TuiApp {
@@ -190,6 +192,7 @@ impl TuiApp {
             current_reasoning_duration: None,
             reasoning_start_time: None,
             current_reasoning_collapsed: true,
+            current_thinking_tools: Vec::new(),
             reasoning_header_positions: Vec::new(),
             total_chat_lines: 0,
             input_buffer: String::new(),
@@ -360,9 +363,11 @@ impl TuiApp {
                                                                 thinking: false,
                                                                 reasoning_duration_ms: None,
                                                                 reasoning_collapsed: false,
+                                                                thinking_tools: Vec::new(),
                                                             });
                                                             self.current_response.clear();
                                                             self.current_reasoning.clear();
+                                                            self.current_thinking_tools.clear();
                                                             self.reasoning_start_time = None;
                                                             self.current_reasoning_collapsed = true;
                                                             self.chat_scroll_offset = 0;
@@ -551,6 +556,7 @@ impl TuiApp {
                     thinking: false,
                     reasoning_duration_ms: None,
                     reasoning_collapsed: false,
+                    thinking_tools: Vec::new(),
                 });
             }
         }
@@ -804,6 +810,7 @@ impl TuiApp {
                         thinking: false,
                         reasoning_duration_ms: None,
                         reasoning_collapsed: false,
+                        thinking_tools: Vec::new(),
                     });
                 } else if let Some(last) = self.messages.last_mut() {
                     if last.role == "assistant" {
@@ -814,14 +821,26 @@ impl TuiApp {
             }
             // Accumulate reasoning/thinking text (displayed as dim text in response).
             AppEvent::Reasoning(text) => {
-                if self.current_reasoning.is_empty() {
+                if self.reasoning_start_time.is_none() {
                     self.reasoning_start_time = Some(Instant::now());
                 }
                 self.current_reasoning.push_str(&text);
             }
-            // Reasoning/thinking phase completed — display elapsed time in status.
+            // Reasoning/thinking phase completed — accumulate elapsed time
+            // across multiple tool-call iterations so the total thinking
+            // time reflects all bursts within the same submit.
+            // Uses max(self timer, agent duration) to prevent the live
+            // timer from visually backtracking when the agent's measured
+            // duration arrives slightly behind the TUI's own elapsed.
             AppEvent::ReasoningComplete { duration_ms } => {
-                self.current_reasoning_duration = Some(duration_ms);
+                let prev = self.current_reasoning_duration.unwrap_or(0);
+                let burst = self
+                    .reasoning_start_time
+                    .take()
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or(duration_ms)
+                    .max(duration_ms);
+                self.current_reasoning_duration = Some(prev + burst);
             }
             // Update the status bar text directly.
             AppEvent::AgentStatus(status) => {
@@ -840,6 +859,7 @@ impl TuiApp {
                         thinking: false,
                         reasoning_duration_ms: None,
                         reasoning_collapsed: false,
+                        thinking_tools: Vec::new(),
                     });
                     self.status_text = "Error".into();
                 }
@@ -885,6 +905,8 @@ impl TuiApp {
             // Anthropic extended thinking) produce a single unified thinking block.
             AppEvent::ToolCallStart { name, .. } => {
                 self.status_text = format!("Calling tool: {}", name);
+                self.current_thinking_tools
+                    .push(format!("> Calling tool: {}", name));
             }
             // Tool call args streaming — not surfaced to TUI yet.
             AppEvent::ToolCallArgs { .. } => {}
@@ -893,6 +915,8 @@ impl TuiApp {
             // Tool execution started.
             AppEvent::ToolExecStart { name, .. } => {
                 self.status_text = format!("Running: {}", name);
+                self.current_thinking_tools
+                    .push(format!("> Running: {}", name));
             }
             // Tool execution finished — update status with result.
             AppEvent::ToolExecEnd { name, success, .. } => {
@@ -901,6 +925,11 @@ impl TuiApp {
                 } else {
                     format!("Tool {} failed", name)
                 };
+                self.current_thinking_tools.push(format!(
+                    "> Tool {} {}",
+                    name,
+                    if success { "completed" } else { "failed" }
+                ));
             }
         }
     }
@@ -914,14 +943,23 @@ impl TuiApp {
                     if !self.current_reasoning.is_empty() {
                         last.reasoning = Some(self.current_reasoning.clone());
                     }
-                    last.reasoning_duration_ms = self.current_reasoning_duration.take();
+                    last.reasoning_duration_ms = {
+                        let accumulated = self.current_reasoning_duration.take().unwrap_or(0);
+                        let remaining = self
+                            .reasoning_start_time
+                            .take()
+                            .map(|start| start.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
+                        Some(accumulated + remaining)
+                    };
                     last.reasoning_collapsed = self.current_reasoning_collapsed;
                     last.thinking = is_thinking;
+                    last.thinking_tools = std::mem::take(&mut self.current_thinking_tools);
                 }
             }
             self.current_response.clear();
             self.current_reasoning.clear();
-            self.reasoning_start_time = None;
+            self.current_thinking_tools.clear();
             self.current_reasoning_collapsed = true;
             self.current_reasoning_duration = None;
         }
@@ -1096,9 +1134,38 @@ impl TuiApp {
         false
     }
 
+    /// Push wrapped reasoning lines into the lines vector with indent and dim style.
+    fn push_wrapped_lines(lines: &mut Vec<Line<'static>>, text: &str, area_width: u16, indent: &str) {
+        let max_w = area_width.saturating_sub(indent.len() as u16) as usize;
+        for paragraph in text.split('\n') {
+            let mut current = String::new();
+            let mut current_width = 0usize;
+            for word in paragraph.split_inclusive(|c: char| c.is_whitespace()) {
+                let word_width = unicode_width::UnicodeWidthStr::width(word);
+                if current_width + word_width > max_w && current_width > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{}", indent, current.trim_end()),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    current.clear();
+                    current_width = 0;
+                }
+                current.push_str(word);
+                current_width += word_width;
+            }
+            if !current.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", indent, current.trim_end()),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
     /// Push the live streaming reasoning block into the lines vector.
     /// Used both for pure-thinking phase (no text yet) and interleaved
     /// thinking during generation for OpenAI Compatible models.
+    #[allow(clippy::too_many_arguments)]
     fn push_live_reasoning_block(
         header_positions: &mut Vec<(ReasoningTarget, usize)>,
         lines: &mut Vec<Line<'static>>,
@@ -1106,25 +1173,29 @@ impl TuiApp {
         current_reasoning_collapsed: bool,
         reasoning_start_time: Option<Instant>,
         current_reasoning_duration: Option<u64>,
+        area_width: u16,
+        thinking_tools: &[String],
     ) {
-        let live_duration = match current_reasoning_duration {
-            Some(ms) => {
-                if ms >= 1000 {
-                    format!(" for {:.1}s", ms as f64 / 1000.0)
+        let live_duration = match reasoning_start_time {
+            Some(start) => {
+                let current_ms = start.elapsed().as_millis() as u64;
+                let total = current_reasoning_duration.unwrap_or(0) + current_ms;
+                if total >= 1000 {
+                    format!(" for {:.1}s", total as f64 / 1000.0)
                 } else {
-                    format!(" for {}ms", ms)
+                    format!(" for {}ms", total)
                 }
             }
-            None => reasoning_start_time
-                .map(|start| {
-                    let ms = start.elapsed().as_millis() as u64;
+            None => match current_reasoning_duration {
+                Some(ms) if ms > 0 => {
                     if ms >= 1000 {
                         format!(" for {:.1}s", ms as f64 / 1000.0)
                     } else {
                         format!(" for {}ms", ms)
                     }
-                })
-                .unwrap_or_default(),
+                }
+                _ => String::new(),
+            },
         };
 
         let toggle = if current_reasoning_collapsed {
@@ -1134,6 +1205,8 @@ impl TuiApp {
         };
         let header = format!("{} Thinking{}", toggle, live_duration);
 
+        lines.push(Line::from(Span::raw("")));
+
         header_positions.push((ReasoningTarget::Live, lines.len()));
 
         lines.push(Line::from(Span::styled(
@@ -1142,13 +1215,16 @@ impl TuiApp {
         )));
 
         if !current_reasoning_collapsed {
-            for line in current_reasoning.lines() {
+            Self::push_wrapped_lines(lines, current_reasoning, area_width, "  ");
+            for tool_line in thinking_tools {
                 lines.push(Line::from(Span::styled(
-                    format!("  {}", line),
-                    Style::default().fg(Color::DarkGray),
+                    format!("  {}", tool_line),
+                    Style::default().fg(Color::Cyan),
                 )));
             }
         }
+
+        lines.push(Line::from(Span::raw("")));
     }
 
     // Render the scrollable chat message area with scroll offset and selection highlighting.
@@ -1186,6 +1262,8 @@ impl TuiApp {
                 };
                 let header = format!("{} Thinking{}", toggle, duration_str);
 
+                lines.push(Line::from(Span::raw("")));
+
                 // Record header position for mouse hit-testing
                 self.reasoning_header_positions
                     .push((ReasoningTarget::Message(msg_idx), lines.len()));
@@ -1196,13 +1274,16 @@ impl TuiApp {
                 )));
 
                 if !msg.reasoning_collapsed {
-                    for line in reasoning.lines() {
+                    Self::push_wrapped_lines(&mut lines, reasoning, area.width, "  ");
+                    for tool_line in &msg.thinking_tools {
                         lines.push(Line::from(Span::styled(
-                            format!("  {}", line),
-                            Style::default().fg(Color::DarkGray),
+                            format!("  {}", tool_line),
+                            Style::default().fg(Color::Cyan),
                         )));
                     }
                 }
+
+                lines.push(Line::from(Span::raw("")));
             }
 
             // If this is the last message being streamed and live reasoning exists,
@@ -1217,6 +1298,8 @@ impl TuiApp {
                     self.current_reasoning_collapsed,
                     self.reasoning_start_time,
                     self.current_reasoning_duration,
+                    area.width,
+                    &self.current_thinking_tools,
                 );
                 live_rendered = true;
             }
@@ -1260,6 +1343,8 @@ impl TuiApp {
                 self.current_reasoning_collapsed,
                 self.reasoning_start_time,
                 self.current_reasoning_duration,
+                area.width,
+                &self.current_thinking_tools,
             );
         }
 
