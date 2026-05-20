@@ -170,11 +170,18 @@ impl Agent {
                         );
                     }
                     Some(Ok(LlmChunk::ToolCallArgs { id, delta })) => {
+                        // Some providers (DeepSeek) omit the id in subsequent
+                        // tool-call deltas; fall back to the first active call.
+                        let effective_id = if id.is_empty() {
+                            active_tool_calls.keys().next().cloned().unwrap_or_default()
+                        } else {
+                            id
+                        };
                         let _ = self.event_tx.send(EventMsg::ToolCallArgs {
-                            id: id.clone(),
+                            id: effective_id.clone(),
                             delta: delta.clone(),
                         });
-                        if let Some(tc) = active_tool_calls.get_mut(&id) {
+                        if let Some(tc) = active_tool_calls.get_mut(&effective_id) {
                             tc.args.push(delta);
                         }
                     }
