@@ -42,7 +42,8 @@ impl Tool for GlobTool {
             .ok_or_else(|| ToolError::InvalidArgs("pattern is required".into()))?;
 
         // Resolve the search directory, ensuring it is within the working directory
-        let search_dir = resolve_subdir(&ctx.working_dir, args.get("path").and_then(|v| v.as_str()))?;
+        let search_dir =
+            resolve_subdir(&ctx.working_dir, args.get("path").and_then(|v| v.as_str()))?;
 
         // Build the full glob pattern: search_dir / pattern
         let full_pattern = format!("{}/{}", search_dir.display(), pattern);
@@ -94,7 +95,10 @@ impl Tool for GlobTool {
 
 /// Resolve a subdirectory relative to the base working directory.
 /// Canonicalizes and ensures the result stays within the base directory.
-fn resolve_subdir(base: &std::path::Path, subdir: Option<&str>) -> Result<std::path::PathBuf, ToolError> {
+fn resolve_subdir(
+    base: &std::path::Path,
+    subdir: Option<&str>,
+) -> Result<std::path::PathBuf, ToolError> {
     let target = match subdir {
         Some(sub) if !sub.is_empty() => base.join(sub),
         _ => base.to_path_buf(),

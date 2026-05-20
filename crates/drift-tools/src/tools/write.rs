@@ -23,7 +23,11 @@ impl Tool for WriteTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         // Extract required arguments
         let file_path_str = args["filePath"]
             .as_str()

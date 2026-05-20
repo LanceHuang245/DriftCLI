@@ -203,7 +203,9 @@ impl SelectionState {
 /// Clamp a mouse event to within the given area.
 fn clamp_to_area(event: &MouseEvent, area: Rect) -> SelectionPoint {
     SelectionPoint {
-        column: event.column.clamp(area.left(), area.right().saturating_sub(1)),
+        column: event
+            .column
+            .clamp(area.left(), area.right().saturating_sub(1)),
         row: event.row.clamp(area.top(), area.bottom().saturating_sub(1)),
     }
 }

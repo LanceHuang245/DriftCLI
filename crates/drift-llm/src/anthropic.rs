@@ -1,6 +1,6 @@
+use crate::LlmProvider;
 use crate::sse_text_stream;
 use crate::types::*;
-use crate::LlmProvider;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
@@ -17,7 +17,12 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, model: String, base_url: String, reasoning_effort: Option<String>) -> Self {
+    pub fn new(
+        api_key: String,
+        model: String,
+        base_url: String,
+        reasoning_effort: Option<String>,
+    ) -> Self {
         Self {
             api_key,
             model,
@@ -64,7 +69,11 @@ impl LlmProvider for AnthropicProvider {
                         ContentPart::Text(t) => {
                             Some(serde_json::json!({"type": "text", "text": t}))
                         }
-                        ContentPart::ToolCall { id, name, arguments } => {
+                        ContentPart::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
                             let input = serde_json::from_str::<serde_json::Value>(arguments)
                                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                             Some(serde_json::json!({
@@ -74,14 +83,16 @@ impl LlmProvider for AnthropicProvider {
                                 "input": input,
                             }))
                         }
-                        ContentPart::ToolResult { tool_use_id, content, is_error } => {
-                            Some(serde_json::json!({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": content,
-                                "is_error": is_error,
-                            }))
-                        }
+                        ContentPart::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => Some(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": content,
+                            "is_error": is_error,
+                        })),
                         ContentPart::Reasoning(r) => {
                             Some(serde_json::json!({"type": "thinking", "thinking": r}))
                         }
@@ -111,7 +122,10 @@ impl LlmProvider for AnthropicProvider {
             body["reasoning_effort"] = serde_json::Value::String(effort.clone());
         }
         if let Some(ref tool_list) = tools {
-            tracing::info!(count = tool_list.len(), "anthropic: adding tools to request");
+            tracing::info!(
+                count = tool_list.len(),
+                "anthropic: adding tools to request"
+            );
             body["tools"] = serde_json::json!(tool_list);
         } else {
             tracing::info!("anthropic: no tools in request");

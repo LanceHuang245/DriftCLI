@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::event::{AgentState, EventMsg};
 use drift_config::{AppConfig, LlmConfig};
 use drift_llm::{
-    create_provider, fetch_anthropic_models, fetch_openai_compat_models, LlmChunk, LlmError,
-    LlmMessage, LlmProvider, ModelInfo,
+    LlmChunk, LlmError, LlmMessage, LlmProvider, ModelInfo, create_provider,
+    fetch_anthropic_models, fetch_openai_compat_models,
 };
 use drift_tools::{ToolContext, ToolRegistry};
 use tokio::sync::broadcast;
@@ -126,6 +127,7 @@ impl Agent {
             // Track accumulated state for this turn
             let mut full_response = String::new();
             let mut full_reasoning = String::new();
+            let mut reasoning_start: Option<Instant> = None;
             let mut streaming = false;
             // Map call_id -> ActiveToolCall for correlating chunks
             let mut active_tool_calls: HashMap<String, ActiveToolCall> = HashMap::new();
@@ -138,13 +140,16 @@ impl Agent {
                     Some(Ok(LlmChunk::TextDelta(text))) => {
                         if !streaming {
                             if !full_reasoning.is_empty() {
-                                let _ = self
-                                    .event_tx
-                                    .send(EventMsg::Reasoning(full_reasoning.clone()));
+                                if let Some(start) = reasoning_start {
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    let _ = self
+                                        .event_tx
+                                        .send(EventMsg::ReasoningComplete { duration_ms });
+                                }
                             }
-                            let _ = self.event_tx.send(EventMsg::AgentState(
-                                AgentState::Generating(String::new()),
-                            ));
+                            let _ = self
+                                .event_tx
+                                .send(EventMsg::AgentState(AgentState::Generating(String::new())));
                             streaming = true;
                         }
                         full_response.push_str(&text);
@@ -152,6 +157,9 @@ impl Agent {
                     }
                     Some(Ok(LlmChunk::ReasoningDelta(text))) => {
                         full_reasoning.push_str(&text);
+                        if reasoning_start.is_none() {
+                            reasoning_start = Some(Instant::now());
+                        }
                         let _ = self.event_tx.send(EventMsg::Reasoning(text));
                     }
                     Some(Ok(LlmChunk::ToolCallStart { id, name })) => {
@@ -185,9 +193,7 @@ impl Agent {
                         }
                     }
                     Some(Ok(LlmChunk::ToolCallEnd { id })) => {
-                        let _ = self
-                            .event_tx
-                            .send(EventMsg::ToolCallEnd { id: id.clone() });
+                        let _ = self.event_tx.send(EventMsg::ToolCallEnd { id: id.clone() });
                         if let Some(tc) = active_tool_calls.remove(&id) {
                             completed_tool_calls.push(tc);
                         }
@@ -261,10 +267,7 @@ impl Agent {
                     tool_call_id: tc.id.clone(),
                 };
 
-                let result = self
-                    .tool_registry
-                    .execute(&tc.name, args, &ctx)
-                    .await;
+                let result = self.tool_registry.execute(&tc.name, args, &ctx).await;
 
                 match result {
                     Ok(r) => {
@@ -361,7 +364,8 @@ impl Agent {
     // Save a named provider config and activate it.
     pub async fn save_provider(&mut self, name: String, config: LlmConfig) -> Result<(), LlmError> {
         self.config.save_provider(name.clone(), config);
-        let llm_config = self.config
+        let llm_config = self
+            .config
             .active_llm_config()
             .ok_or(LlmError::Config("No provider config".into()))?;
         self.llm = create_provider(llm_config)?;
@@ -385,7 +389,8 @@ impl Agent {
         self.config
             .activate_provider(name)
             .map_err(|e| LlmError::Config(e.to_string()))?;
-        let llm_config = self.config
+        let llm_config = self
+            .config
             .active_llm_config()
             .ok_or(LlmError::Config("No config".into()))?;
         self.llm = create_provider(llm_config)?;

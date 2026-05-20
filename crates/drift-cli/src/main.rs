@@ -2,8 +2,12 @@ use clap::{Parser, Subcommand};
 use drift_config::AppConfig;
 use drift_core::{Agent, EventMsg};
 use drift_tools::{
-    tools::{bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool, read::ReadTool, todowrite::TodoWriteTool, webfetch::WebFetchTool, websearch::WebSearchTool, write::WriteTool},
     ToolRegistry,
+    tools::{
+        bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool, read::ReadTool,
+        todowrite::TodoWriteTool, webfetch::WebFetchTool, websearch::WebSearchTool,
+        write::WriteTool,
+    },
 };
 use drift_tui::{AppEvent, TuiApp, TuiCommand};
 use std::env;
@@ -12,7 +16,11 @@ use tokio::sync::mpsc;
 
 // Cli: top-level argument struct parsed by clap — model, api_key, subcommands, and runtime options.
 #[derive(Parser)]
-#[command(name = "drift", version, about = "High-performance terminal AI coding agent")]
+#[command(
+    name = "drift",
+    version,
+    about = "High-performance terminal AI coding agent"
+)]
 struct Cli {
     #[arg(long)]
     model: Option<String>,
@@ -103,6 +111,9 @@ async fn main() -> anyhow::Result<()> {
                         Ok(EventMsg::Reasoning(text)) => {
                             let _ = tui_tx.send(AppEvent::Reasoning(text));
                         }
+                        Ok(EventMsg::ReasoningComplete { duration_ms }) => {
+                            let _ = tui_tx.send(AppEvent::ReasoningComplete { duration_ms });
+                        }
                         Ok(EventMsg::AgentState(state)) => {
                             let status = match state {
                                 drift_core::AgentState::Idle => "Idle",
@@ -145,7 +156,9 @@ async fn main() -> anyhow::Result<()> {
                         Ok(EventMsg::ToolExecStart { id, name }) => {
                             let _ = tui_tx.send(AppEvent::ToolExecStart { id, name });
                         }
-                        Ok(EventMsg::ToolExecEnd { id, name, success, .. }) => {
+                        Ok(EventMsg::ToolExecEnd {
+                            id, name, success, ..
+                        }) => {
                             let _ = tui_tx.send(AppEvent::ToolExecEnd { id, name, success });
                         }
                         _ => {}
@@ -238,7 +251,8 @@ async fn main() -> anyhow::Result<()> {
                         TuiCommand::GetProviderConfig(name) => {
                             match agent.get_provider_config(&name) {
                                 Some(config) => {
-                                    let _ = event_tx.send(EventMsg::ProviderConfig { name, config });
+                                    let _ =
+                                        event_tx.send(EventMsg::ProviderConfig { name, config });
                                 }
                                 None => {
                                     let _ = event_tx.send(EventMsg::Error {

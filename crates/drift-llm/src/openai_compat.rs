@@ -1,5 +1,5 @@
-use crate::types::*;
 use crate::LlmProvider;
+use crate::types::*;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -57,7 +57,12 @@ impl LlmProvider for OpenAiCompatibleProvider {
             // Emit tool results as role:"tool" messages first (agent sends them
             // as role:"user" with ContentPart::ToolResult for Anthropic compat).
             for part in &m.content {
-                if let ContentPart::ToolResult { tool_use_id, content, .. } = part {
+                if let ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = part
+                {
                     api_messages.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -67,12 +72,19 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
 
             // Build a user/assistant message from non-tool-result parts.
-            let has_msg_parts = m.content.iter().any(|p| !matches!(p, ContentPart::ToolResult { .. }));
+            let has_msg_parts = m
+                .content
+                .iter()
+                .any(|p| !matches!(p, ContentPart::ToolResult { .. }));
             if !has_msg_parts {
                 continue;
             }
 
-            let role = if m.role.as_str() == "assistant" { "assistant" } else { "user" };
+            let role = if m.role.as_str() == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
             let text = extract_text(&m.content);
             let reasoning = extract_reasoning(&m.content);
             let tc_list: Vec<ContentPart> = m
@@ -93,7 +105,12 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 let tc_json: Vec<serde_json::Value> = tc_list
                     .iter()
                     .map(|tc| {
-                        if let ContentPart::ToolCall { id, name, arguments } = tc {
+                        if let ContentPart::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } = tc
+                        {
                             serde_json::json!({
                                 "id": id,
                                 "type": "function",
@@ -206,9 +223,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
                                 }
                                 if let Some(reasoning) = &delta.reasoning_content {
                                     if !reasoning.is_empty() {
-                                        chunks.push(Ok(LlmChunk::ReasoningDelta(
-                                            reasoning.clone(),
-                                        )));
+                                        chunks
+                                            .push(Ok(LlmChunk::ReasoningDelta(reasoning.clone())));
                                     }
                                 }
                             }

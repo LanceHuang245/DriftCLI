@@ -197,12 +197,7 @@ impl AppConfig {
     pub fn remove_provider(&mut self, name: &str) {
         self.providers.remove(name);
         if self.active_provider == name {
-            self.active_provider = self
-                .providers
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_default();
+            self.active_provider = self.providers.keys().next().cloned().unwrap_or_default();
         }
     }
 
@@ -261,8 +256,7 @@ impl AppConfig {
     pub fn apply_project_override(&mut self, cwd: &PathBuf) -> Result<(), ConfigError> {
         let project_path = Self::project_config_path(cwd);
         if project_path.exists() {
-            let partial: toml::Value =
-                toml::from_str(&std::fs::read_to_string(&project_path)?)?;
+            let partial: toml::Value = toml::from_str(&std::fs::read_to_string(&project_path)?)?;
             Self::merge_toml_value(self, &partial);
         }
         Ok(())
@@ -489,7 +483,7 @@ model = "claude-sonnet-4-5-20250101"
 api_key = ""
 base_url = "https://api.anthropic.com/v1"
 "###
-            .to_string()
+        .to_string()
     }
 
     // Builds a display string summarizing the active provider, model, endpoint, and masked API key.
@@ -502,7 +496,12 @@ base_url = "https://api.anthropic.com/v1"
                     model,
                     base_url,
                     ..
-                } => ("Anthropic", api_key.as_str(), model.as_str(), base_url.as_str()),
+                } => (
+                    "Anthropic",
+                    api_key.as_str(),
+                    model.as_str(),
+                    base_url.as_str(),
+                ),
                 LlmConfig::OpenAiCompatible {
                     api_key,
                     model,

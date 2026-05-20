@@ -198,6 +198,10 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...\n[truncated: output exceeded {} characters]", &s[..max_len], max_len)
+        format!(
+            "{}...\n[truncated: output exceeded {} characters]",
+            &s[..max_len],
+            max_len
+        )
     }
 }

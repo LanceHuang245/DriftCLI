@@ -219,8 +219,8 @@ pub async fn fetch_anthropic_models(
             Err(_) => continue,
         };
 
-        if let Ok(models) = parse_anthropic_list(&body_text)
-            .or_else(|_| parse_simple_list(&body_text))
+        if let Ok(models) =
+            parse_anthropic_list(&body_text).or_else(|_| parse_simple_list(&body_text))
         {
             if !models.is_empty() {
                 return Ok(models);
@@ -250,14 +250,25 @@ fn parse_anthropic_list(body: &str) -> Result<Vec<ModelInfo>, serde_json::Error>
                 .filter(|e| e.supported)
                 .map(|e| {
                     let mut levels = Vec::new();
-                    if e.low.supported { levels.push("low".into()); }
-                    if e.medium.supported { levels.push("medium".into()); }
-                    if e.high.supported { levels.push("high".into()); }
-                    if e.max.supported { levels.push("max".into()); }
+                    if e.low.supported {
+                        levels.push("low".into());
+                    }
+                    if e.medium.supported {
+                        levels.push("medium".into());
+                    }
+                    if e.high.supported {
+                        levels.push("high".into());
+                    }
+                    if e.max.supported {
+                        levels.push("max".into());
+                    }
                     levels
                 })
                 .unwrap_or_default();
-            ModelInfo { id: m.id, effort_levels }
+            ModelInfo {
+                id: m.id,
+                effort_levels,
+            }
         })
         .collect())
 }
@@ -271,7 +282,10 @@ fn parse_simple_list(body: &str) -> Result<Vec<ModelInfo>, serde_json::Error> {
     Ok(resp
         .data
         .into_iter()
-        .map(|m| ModelInfo { id: m.id, effort_levels: vec![] })
+        .map(|m| ModelInfo {
+            id: m.id,
+            effort_levels: vec![],
+        })
         .collect())
 }
 

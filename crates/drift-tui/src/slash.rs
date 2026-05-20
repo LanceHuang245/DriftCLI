@@ -7,11 +7,26 @@ pub struct SlashCommand {
 
 /// All available slash commands in display order.
 pub const ALL_COMMANDS: &[SlashCommand] = &[
-    SlashCommand { name: "/connect",  description: "Configure connection settings (API key, model, etc.)" },
-    SlashCommand { name: "/provider", description: "Switch or manage configured AI providers" },
-    SlashCommand { name: "/variant",  description: "Change reasoning effort level for the current model" },
-    SlashCommand { name: "/clear",    description: "Clear all chat messages" },
-    SlashCommand { name: "/quit",     description: "Exit the application" },
+    SlashCommand {
+        name: "/connect",
+        description: "Configure connection settings (API key, model, etc.)",
+    },
+    SlashCommand {
+        name: "/provider",
+        description: "Switch or manage configured AI providers",
+    },
+    SlashCommand {
+        name: "/variant",
+        description: "Change reasoning effort level for the current model",
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "Clear all chat messages",
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "Exit the application",
+    },
 ];
 
 /// Filter commands by the given text (case-insensitive).

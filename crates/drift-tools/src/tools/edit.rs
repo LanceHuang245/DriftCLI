@@ -24,7 +24,11 @@ impl Tool for EditTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         // Extract required arguments
         let file_path_str = args["filePath"]
             .as_str()
@@ -59,10 +63,7 @@ impl Tool for EditTool {
             return Ok(ToolResult {
                 success: false,
                 content: String::new(),
-                error: Some(format!(
-                    "oldString not found in file: {}",
-                    file_path_str
-                )),
+                error: Some(format!("oldString not found in file: {}", file_path_str)),
             });
         }
         if count > 1 {

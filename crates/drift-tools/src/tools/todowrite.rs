@@ -68,20 +68,15 @@ impl Tool for TodoWriteTool {
         ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         // Parse the todos array from the JSON arguments
-        let todos: Vec<TodoItem> = serde_json::from_value(
-            args["todos"].clone(),
-        )
-        .map_err(|e| ToolError::InvalidArgs(format!("invalid todos array: {e}")))?;
+        let todos: Vec<TodoItem> = serde_json::from_value(args["todos"].clone())
+            .map_err(|e| ToolError::InvalidArgs(format!("invalid todos array: {e}")))?;
 
         // Validate: exactly one item may be in_progress, OR all items are completed/cancelled
-        let in_progress_count = todos
-            .iter()
-            .filter(|t| t.status == "in_progress")
-            .count();
+        let in_progress_count = todos.iter().filter(|t| t.status == "in_progress").count();
 
-        let all_terminal = todos.iter().all(|t| {
-            t.status == "completed" || t.status == "cancelled"
-        });
+        let all_terminal = todos
+            .iter()
+            .all(|t| t.status == "completed" || t.status == "cancelled");
 
         if !all_terminal && in_progress_count > 1 {
             return Err(ToolError::InvalidArgs(format!(
@@ -106,9 +101,9 @@ impl Tool for TodoWriteTool {
 
         // Store the todo list in the session-scoped map
         {
-            let mut store = TODO_STORE.lock().map_err(|e| {
-                ToolError::Other(format!("todo store lock poisoned: {e}"))
-            })?;
+            let mut store = TODO_STORE
+                .lock()
+                .map_err(|e| ToolError::Other(format!("todo store lock poisoned: {e}")))?;
             store.insert(ctx.session_id.to_string(), todos);
         }
 

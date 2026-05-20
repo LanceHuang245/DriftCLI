@@ -25,7 +25,11 @@ impl Tool for ReadTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         // Extract required filePath
         let file_path_str = args["filePath"]
             .as_str()
@@ -33,8 +37,7 @@ impl Tool for ReadTool {
 
         // Resolve path relative to working_dir, reject attempts to escape the working directory
         let resolved = ctx.working_dir.join(file_path_str);
-        let canonical = std::path::absolute(&ctx.working_dir)
-            .map_err(ToolError::Io)?;
+        let canonical = std::path::absolute(&ctx.working_dir).map_err(ToolError::Io)?;
         let file_canonical = std::path::absolute(&resolved)
             .map_err(|e| ToolError::InvalidArgs(format!("invalid file path: {e}")))?;
 

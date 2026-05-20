@@ -1,26 +1,30 @@
-mod connect;
 mod components;
+mod connect;
 mod input;
 mod selection;
 mod slash;
 
 use crossterm::{
-    event::{self, EnableMouseCapture, DisableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use drift_config::LlmConfig;
 use drift_llm::ModelInfo;
 use ratatui::{
+    Terminal,
     layout::{Constraint, Direction, Layout, Position},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
 };
 use selection::SelectionState;
 use slash::{SlashCommand, filter_commands};
 use std::io::{self, stdout};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 // Events sent from the backend to the TUI via async channel.
@@ -28,24 +32,48 @@ use tokio::sync::mpsc;
 pub enum AppEvent {
     Token(String),
     Reasoning(String),
+    ReasoningComplete {
+        duration_ms: u64,
+    },
     AgentStatus(String),
     Error(String),
     Done,
     ModelList(Vec<ModelInfo>),
     ProviderList(Vec<String>),
-    ProviderSwitched { name: String, model: String },
+    ProviderSwitched {
+        name: String,
+        model: String,
+    },
     // Full config for a specific provider loaded from the backend.
-    ProviderConfig { name: String, config: LlmConfig },
+    ProviderConfig {
+        name: String,
+        config: LlmConfig,
+    },
     // Tool call started with id and name
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
     // Tool call arguments streaming
-    ToolCallArgs { id: String, delta: String },
+    ToolCallArgs {
+        id: String,
+        delta: String,
+    },
     // Tool call completed
-    ToolCallEnd { id: String },
+    ToolCallEnd {
+        id: String,
+    },
     // Tool execution started
-    ToolExecStart { id: String, name: String },
+    ToolExecStart {
+        id: String,
+        name: String,
+    },
     // Tool execution finished with result summary
-    ToolExecEnd { id: String, name: String, success: bool },
+    ToolExecEnd {
+        id: String,
+        name: String,
+        success: bool,
+    },
 }
 
 // Commands sent from the TUI to the backend (chat, fetch models, reconfigure, provider management).
@@ -59,7 +87,10 @@ pub enum TuiCommand {
     },
     Reconfigure(LlmConfig),
     // Save or update a named provider configuration.
-    SaveProvider { name: String, config: LlmConfig },
+    SaveProvider {
+        name: String,
+        config: LlmConfig,
+    },
     // Switch to a different configured provider.
     SetActiveProvider(String),
     // Request the list of configured provider names.
@@ -75,11 +106,25 @@ struct SlashCompletionState {
     selected: usize,
 }
 
+/// Target of a reasoning header click — either a committed message or the live streaming block.
+#[derive(Debug, Clone, Copy)]
+enum ReasoningTarget {
+    /// A committed ChatMessage at the given index in self.messages.
+    Message(usize),
+    /// The live streaming reasoning block (self.current_reasoning).
+    Live,
+}
+
 // Central application state for the DriftCLI TUI.
 pub struct TuiApp {
     messages: Vec<ChatMessage>,
     current_response: String,
     current_reasoning: String,
+    current_reasoning_duration: Option<u64>,
+    reasoning_start_time: Option<Instant>,
+    current_reasoning_collapsed: bool,
+    reasoning_header_positions: Vec<(ReasoningTarget, usize)>,
+    total_chat_lines: usize,
     input_buffer: String,
     cursor_position: usize,
     status_text: String,
@@ -123,6 +168,8 @@ pub struct ChatMessage {
     pub content: String,
     pub reasoning: Option<String>,
     pub thinking: bool,
+    pub reasoning_duration_ms: Option<u64>,
+    pub reasoning_collapsed: bool,
 }
 
 impl TuiApp {
@@ -140,6 +187,11 @@ impl TuiApp {
             messages: Vec::new(),
             current_response: String::new(),
             current_reasoning: String::new(),
+            current_reasoning_duration: None,
+            reasoning_start_time: None,
+            current_reasoning_collapsed: true,
+            reasoning_header_positions: Vec::new(),
+            total_chat_lines: 0,
             input_buffer: String::new(),
             cursor_position: 0,
             status_text: "Idle".into(),
@@ -217,11 +269,12 @@ impl TuiApp {
                                                 popup_handled = true;
                                             }
                                             KeyCode::Down => {
-                                                state.selected = if state.selected + 1 >= state.filtered.len() {
-                                                    0
-                                                } else {
-                                                    state.selected + 1
-                                                };
+                                                state.selected =
+                                                    if state.selected + 1 >= state.filtered.len() {
+                                                        0
+                                                    } else {
+                                                        state.selected + 1
+                                                    };
                                                 popup_handled = true;
                                             }
                                             KeyCode::Tab => {
@@ -246,11 +299,15 @@ impl TuiApp {
                                 if !popup_handled {
                                     match key.code {
                                         KeyCode::Up => {
-                                            if self.history_index.is_none() && !self.input_buffer.is_empty() {
+                                            if self.history_index.is_none()
+                                                && !self.input_buffer.is_empty()
+                                            {
                                                 self.history.push(self.input_buffer.clone());
                                             }
                                             if !self.history.is_empty() {
-                                                let idx = self.history_index.map_or(self.history.len(), |i| i);
+                                                let idx = self
+                                                    .history_index
+                                                    .map_or(self.history.len(), |i| i);
                                                 let new_idx = idx.saturating_sub(1);
                                                 self.history_index = Some(new_idx);
                                                 self.input_buffer = self.history[new_idx].clone();
@@ -265,7 +322,8 @@ impl TuiApp {
                                                     self.input_buffer.clear();
                                                 } else {
                                                     self.history_index = Some(new_idx);
-                                                    self.input_buffer = self.history[new_idx].clone();
+                                                    self.input_buffer =
+                                                        self.history[new_idx].clone();
                                                 }
                                                 self.cursor_position = self.input_buffer.len();
                                             }
@@ -275,7 +333,8 @@ impl TuiApp {
                                             self.chat_scroll_offset += 10;
                                         }
                                         KeyCode::PageDown => {
-                                            self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
+                                            self.chat_scroll_offset =
+                                                self.chat_scroll_offset.saturating_sub(10);
                                         }
                                         _ => {
                                             self.history_index = None;
@@ -299,13 +358,19 @@ impl TuiApp {
                                                                 content: text.clone(),
                                                                 reasoning: None,
                                                                 thinking: false,
+                                                                reasoning_duration_ms: None,
+                                                                reasoning_collapsed: false,
                                                             });
                                                             self.current_response.clear();
                                                             self.current_reasoning.clear();
+                                                            self.reasoning_start_time = None;
+                                                            self.current_reasoning_collapsed = true;
                                                             self.chat_scroll_offset = 0;
                                                             self.selection.clear();
                                                             self.status_text = "Waiting...".into();
-                                                            let _ = self.cmd_tx.send(TuiCommand::Chat(text));
+                                                            let _ = self
+                                                                .cmd_tx
+                                                                .send(TuiCommand::Chat(text));
                                                         }
                                                         self.input_buffer.clear();
                                                         self.cursor_position = 0;
@@ -319,29 +384,44 @@ impl TuiApp {
                                 }
                                 self.update_slash_completion();
                             }
-                            TuiMode::ConnectSettings => { self.handle_connect_key(key.code); }
-                            TuiMode::VariantPicker => { self.handle_variant_key(key.code); }
-                            TuiMode::ProviderPicker => { self.handle_provider_key(key.code); }
-                            TuiMode::ProviderAction { .. } => { self.handle_provider_action_key(key.code); }
+                            TuiMode::ConnectSettings => {
+                                self.handle_connect_key(key.code);
+                            }
+                            TuiMode::VariantPicker => {
+                                self.handle_variant_key(key.code);
+                            }
+                            TuiMode::ProviderPicker => {
+                                self.handle_provider_key(key.code);
+                            }
+                            TuiMode::ProviderAction { .. } => {
+                                self.handle_provider_action_key(key.code);
+                            }
                         }
                     }
                     Event::Mouse(mouse) => {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
                                 match self.mode {
-                                    TuiMode::Normal => { self.chat_scroll_offset += 3; }
-                                    TuiMode::ConnectSettings if self.connect_form.show_model_list => {
+                                    TuiMode::Normal => {
+                                        self.chat_scroll_offset += 3;
+                                    }
+                                    TuiMode::ConnectSettings
+                                        if self.connect_form.show_model_list =>
+                                    {
                                         self.connect_form.model_list_index =
                                             self.connect_form.model_list_index.saturating_sub(1);
                                     }
                                     TuiMode::VariantPicker => {
-                                        self.variant_selected = self.variant_selected.saturating_sub(1);
+                                        self.variant_selected =
+                                            self.variant_selected.saturating_sub(1);
                                     }
                                     TuiMode::ProviderPicker => {
-                                        self.provider_selected = self.provider_selected.saturating_sub(1);
+                                        self.provider_selected =
+                                            self.provider_selected.saturating_sub(1);
                                     }
                                     TuiMode::ProviderAction { .. } => {
-                                        self.provider_action_selected = self.provider_action_selected.saturating_sub(1);
+                                        self.provider_action_selected =
+                                            self.provider_action_selected.saturating_sub(1);
                                     }
                                     _ => {}
                                 }
@@ -351,10 +431,15 @@ impl TuiApp {
                             MouseEventKind::ScrollDown => {
                                 match self.mode {
                                     TuiMode::Normal => {
-                                        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(3);
+                                        self.chat_scroll_offset =
+                                            self.chat_scroll_offset.saturating_sub(3);
                                     }
-                                    TuiMode::ConnectSettings if self.connect_form.show_model_list => {
-                                        if self.connect_form.model_list_index + 1 < self.connect_form.model_list.len() {
+                                    TuiMode::ConnectSettings
+                                        if self.connect_form.show_model_list =>
+                                    {
+                                        if self.connect_form.model_list_index + 1
+                                            < self.connect_form.model_list.len()
+                                        {
                                             self.connect_form.model_list_index += 1;
                                         }
                                     }
@@ -377,9 +462,14 @@ impl TuiApp {
                                 }
                                 self.selection.clear();
                             }
-                            MouseEventKind::Down(_)
-                            | MouseEventKind::Drag(_)
-                            | MouseEventKind::Up(_) => {
+                            MouseEventKind::Down(button) => {
+                                if self.mode == TuiMode::Normal && button == MouseButton::Left {
+                                    if !self.try_toggle_reasoning(&mouse) {
+                                        self.selection.handle_mouse_event(&mouse, self.chat_area);
+                                    }
+                                }
+                            }
+                            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
                                 if self.mode == TuiMode::Normal {
                                     self.selection.handle_mouse_event(&mouse, self.chat_area);
                                 }
@@ -399,10 +489,10 @@ impl TuiApp {
         let cmd = cmd.trim();
         match cmd {
             // Enter connection settings form.
-"/connect" => {
-    self.connect_form = connect::ConnectForm::new();
-    self.mode = TuiMode::ConnectSettings;
-}
+            "/connect" => {
+                self.connect_form = connect::ConnectForm::new();
+                self.mode = TuiMode::ConnectSettings;
+            }
             // Open the variant / reasoning-effort picker for the current model.
             "/variant" => {
                 let model = &self.connect_form.model;
@@ -453,9 +543,14 @@ impl TuiApp {
             _ => {
                 self.messages.push(ChatMessage {
                     role: "system".into(),
-                    content: format!("Unknown command: {}. Try /connect, /provider, /clear, /quit", cmd),
+                    content: format!(
+                        "Unknown command: {}. Try /connect, /provider, /clear, /quit",
+                        cmd
+                    ),
                     reasoning: None,
                     thinking: false,
+                    reasoning_duration_ms: None,
+                    reasoning_collapsed: false,
                 });
             }
         }
@@ -620,12 +715,14 @@ impl TuiApp {
                 if let TuiMode::ProviderAction { ref provider_name } = self.mode {
                     match self.provider_action_selected {
                         0 => {
-                            let _ = self.cmd_tx
+                            let _ = self
+                                .cmd_tx
                                 .send(TuiCommand::SetActiveProvider(provider_name.clone()));
                             self.mode = TuiMode::Normal;
                         }
                         1 => {
-                            let _ = self.cmd_tx
+                            let _ = self
+                                .cmd_tx
                                 .send(TuiCommand::GetProviderConfig(provider_name.clone()));
                             // Mode switches to ConnectSettings when ProviderConfig event arrives.
                         }
@@ -656,10 +753,7 @@ impl TuiApp {
             }
             // Enter confirms the selected effort level, sends reconfigure, and returns to normal mode.
             KeyCode::Enter => {
-                let level = self
-                    .variant_options
-                    .get(self.variant_selected)
-                    .cloned();
+                let level = self.variant_options.get(self.variant_selected).cloned();
                 let is_none = level.as_deref() == Some("(none)");
                 self.connect_form.reasoning_effort = if is_none { None } else { level.clone() };
                 let config = self.connect_form.to_llm_config();
@@ -689,8 +783,7 @@ impl TuiApp {
         let _ = self.cmd_tx.send(TuiCommand::SaveProvider { name, config });
         self.status_text = format!(
             "Connected: {} @ {}",
-            self.model_name,
-            self.connect_form.base_url
+            self.model_name, self.connect_form.base_url
         );
         self.mode = TuiMode::Normal;
     }
@@ -709,6 +802,8 @@ impl TuiApp {
                         content: text,
                         reasoning: None,
                         thinking: false,
+                        reasoning_duration_ms: None,
+                        reasoning_collapsed: false,
                     });
                 } else if let Some(last) = self.messages.last_mut() {
                     if last.role == "assistant" {
@@ -719,7 +814,14 @@ impl TuiApp {
             }
             // Accumulate reasoning/thinking text (displayed as dim text in response).
             AppEvent::Reasoning(text) => {
+                if self.current_reasoning.is_empty() {
+                    self.reasoning_start_time = Some(Instant::now());
+                }
                 self.current_reasoning.push_str(&text);
+            }
+            // Reasoning/thinking phase completed — display elapsed time in status.
+            AppEvent::ReasoningComplete { duration_ms } => {
+                self.current_reasoning_duration = Some(duration_ms);
             }
             // Update the status bar text directly.
             AppEvent::AgentStatus(status) => {
@@ -736,6 +838,8 @@ impl TuiApp {
                         content: format!("Error: {}", msg),
                         reasoning: None,
                         thinking: false,
+                        reasoning_duration_ms: None,
+                        reasoning_collapsed: false,
                     });
                     self.status_text = "Error".into();
                 }
@@ -776,9 +880,10 @@ impl TuiApp {
                 self.connect_form = connect::ConnectForm::from_entry(&name, &config);
                 self.mode = TuiMode::ConnectSettings;
             }
-            // Tool call requested by LLM — commit in-progress text and prepare for tool execution.
+            // Tool call requested by LLM — update status, but keep current_reasoning
+            // accumulating so that multiple tool-call iterations (OpenAI Compatible,
+            // Anthropic extended thinking) produce a single unified thinking block.
             AppEvent::ToolCallStart { name, .. } => {
-                self.commit_current_response(true);
                 self.status_text = format!("Calling tool: {}", name);
             }
             // Tool call args streaming — not surfaced to TUI yet.
@@ -809,11 +914,16 @@ impl TuiApp {
                     if !self.current_reasoning.is_empty() {
                         last.reasoning = Some(self.current_reasoning.clone());
                     }
+                    last.reasoning_duration_ms = self.current_reasoning_duration.take();
+                    last.reasoning_collapsed = self.current_reasoning_collapsed;
                     last.thinking = is_thinking;
                 }
             }
             self.current_response.clear();
             self.current_reasoning.clear();
+            self.reasoning_start_time = None;
+            self.current_reasoning_collapsed = true;
+            self.current_reasoning_duration = None;
         }
     }
 
@@ -904,8 +1014,7 @@ impl TuiApp {
         f.render_widget(input_widget, input_area);
 
         // Calculate cursor position accounting for unicode width and prompt prefix.
-        let before_cursor =
-            &self.input_buffer[..self.cursor_position.min(self.input_buffer.len())];
+        let before_cursor = &self.input_buffer[..self.cursor_position.min(self.input_buffer.len())];
         let prompt_width = 2;
         let visual_before = unicode_width::UnicodeWidthStr::width(before_cursor);
         let visual_total = prompt_width + visual_before;
@@ -948,17 +1057,110 @@ impl TuiApp {
                     .unwrap_or_default(),
                 Style::default().fg(Color::DarkGray),
             ),
-
         ]));
         f.render_widget(status, status_area);
     }
 
+    /// Check if a mouse click hits a reasoning header line and toggle it.
+    /// Returns true if a reasoning header was clicked (and handled).
+    fn try_toggle_reasoning(&mut self, mouse: &crossterm::event::MouseEvent) -> bool {
+        let mouse_row = mouse.row as usize;
+        let chat_top = self.chat_area.y as usize;
+        if mouse_row < chat_top {
+            return false;
+        }
+        let relative_row = mouse_row - chat_top;
+        let total = self.total_chat_lines;
+        let visible = self.chat_area.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let top_offset = max_scroll
+            .saturating_sub(self.chat_scroll_offset)
+            .min(max_scroll);
+        let clicked_line = relative_row + top_offset;
+
+        for (target, line_idx) in &self.reasoning_header_positions {
+            if *line_idx == clicked_line {
+                match target {
+                    ReasoningTarget::Message(msg_idx) => {
+                        if let Some(msg) = self.messages.get_mut(*msg_idx) {
+                            msg.reasoning_collapsed = !msg.reasoning_collapsed;
+                        }
+                    }
+                    ReasoningTarget::Live => {
+                        self.current_reasoning_collapsed = !self.current_reasoning_collapsed;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Push the live streaming reasoning block into the lines vector.
+    /// Used both for pure-thinking phase (no text yet) and interleaved
+    /// thinking during generation for OpenAI Compatible models.
+    fn push_live_reasoning_block(
+        header_positions: &mut Vec<(ReasoningTarget, usize)>,
+        lines: &mut Vec<Line<'static>>,
+        current_reasoning: &str,
+        current_reasoning_collapsed: bool,
+        reasoning_start_time: Option<Instant>,
+        current_reasoning_duration: Option<u64>,
+    ) {
+        let live_duration = match current_reasoning_duration {
+            Some(ms) => {
+                if ms >= 1000 {
+                    format!(" for {:.1}s", ms as f64 / 1000.0)
+                } else {
+                    format!(" for {}ms", ms)
+                }
+            }
+            None => reasoning_start_time
+                .map(|start| {
+                    let ms = start.elapsed().as_millis() as u64;
+                    if ms >= 1000 {
+                        format!(" for {:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!(" for {}ms", ms)
+                    }
+                })
+                .unwrap_or_default(),
+        };
+
+        let toggle = if current_reasoning_collapsed {
+            "▶"
+        } else {
+            "▼"
+        };
+        let header = format!("{} Thinking{}", toggle, live_duration);
+
+        header_positions.push((ReasoningTarget::Live, lines.len()));
+
+        lines.push(Line::from(Span::styled(
+            header,
+            Style::default().fg(Color::Gray),
+        )));
+
+        if !current_reasoning_collapsed {
+            for line in current_reasoning.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", line),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
     // Render the scrollable chat message area with scroll offset and selection highlighting.
     fn render_chat_area(&mut self, area: ratatui::layout::Rect, f: &mut ratatui::Frame) {
+        self.reasoning_header_positions.clear();
+        self.total_chat_lines = 0;
+
         // Build flat lines for all messages with role-based styling.
         let mut lines: Vec<Line> = Vec::new();
+        let mut live_rendered = false;
 
-        for msg in &self.messages {
+        for (msg_idx, msg) in self.messages.iter().enumerate() {
             let text_style = match msg.role.as_str() {
                 "system" => Style::default().fg(Color::Yellow),
                 _ if msg.thinking => Style::default().fg(Color::DarkGray),
@@ -966,32 +1168,99 @@ impl TuiApp {
             };
 
             if let Some(reasoning) = &msg.reasoning {
-                for line in reasoning.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                let duration_str = msg.reasoning_duration_ms.map_or_else(
+                    || String::new(),
+                    |ms| {
+                        if ms >= 1000 {
+                            format!(" for {:.1}s", ms as f64 / 1000.0)
+                        } else {
+                            format!(" for {}ms", ms)
+                        }
+                    },
+                );
+
+                let toggle = if msg.reasoning_collapsed {
+                    "▶"
+                } else {
+                    "▼"
+                };
+                let header = format!("{} Thinking{}", toggle, duration_str);
+
+                // Record header position for mouse hit-testing
+                self.reasoning_header_positions
+                    .push((ReasoningTarget::Message(msg_idx), lines.len()));
+
+                lines.push(Line::from(Span::styled(
+                    header,
+                    Style::default().fg(Color::Gray),
+                )));
+
+                if !msg.reasoning_collapsed {
+                    for line in reasoning.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
                 }
+            }
+
+            // If this is the last message being streamed and live reasoning exists,
+            // render the live block before the content (so interleaved thinking
+            // appears above the generating text for OpenAI Compatible models).
+            let is_last = msg_idx + 1 == self.messages.len();
+            if is_last && msg.role == "assistant" && !self.current_reasoning.is_empty() {
+                Self::push_live_reasoning_block(
+                    &mut self.reasoning_header_positions,
+                    &mut lines,
+                    &self.current_reasoning,
+                    self.current_reasoning_collapsed,
+                    self.reasoning_start_time,
+                    self.current_reasoning_duration,
+                );
+                live_rendered = true;
             }
 
             if msg.role == "user" {
                 let width = area.width.saturating_sub(2) as usize;
                 let top = format!("┌{}┐", "─".repeat(width));
                 let bottom = format!("└{}┘", "─".repeat(width));
-                lines.push(Line::from(Span::styled(top, Style::default().fg(Color::Cyan))));
+                lines.push(Line::from(Span::styled(
+                    top,
+                    Style::default().fg(Color::Cyan),
+                )));
                 for content_line in msg.content.lines() {
                     let vis = unicode_width::UnicodeWidthStr::width(content_line);
                     let inner = area.width.saturating_sub(4) as usize;
                     let pad = inner.saturating_sub(vis);
                     let padded = format!("│ {} {}│", content_line, " ".repeat(pad));
-                    lines.push(Line::from(Span::styled(padded, Style::default().fg(Color::Cyan))));
+                    lines.push(Line::from(Span::styled(
+                        padded,
+                        Style::default().fg(Color::Cyan),
+                    )));
                 }
-                lines.push(Line::from(Span::styled(bottom, Style::default().fg(Color::Cyan))));
+                lines.push(Line::from(Span::styled(
+                    bottom,
+                    Style::default().fg(Color::Cyan),
+                )));
             } else {
                 for line in msg.content.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
             }
+        }
+
+        // If the live block wasn't rendered inline (no assistant message yet),
+        // render it at the end for the pure thinking phase.
+        if !live_rendered && !self.current_reasoning.is_empty() {
+            Self::push_live_reasoning_block(
+                &mut self.reasoning_header_positions,
+                &mut lines,
+                &self.current_reasoning,
+                self.current_reasoning_collapsed,
+                self.reasoning_start_time,
+                self.current_reasoning_duration,
+            );
         }
 
         if lines.is_empty() {
@@ -1000,9 +1269,12 @@ impl TuiApp {
 
         // Render the paragraph with scrolling.
         let total = lines.len();
+        self.total_chat_lines = total;
         let visible = area.height as usize;
         let max_scroll = total.saturating_sub(visible);
-        let top_offset = max_scroll.saturating_sub(self.chat_scroll_offset).min(max_scroll);
+        let top_offset = max_scroll
+            .saturating_sub(self.chat_scroll_offset)
+            .min(max_scroll);
         let paragraph = Paragraph::new(lines).scroll((top_offset as u16, 0));
         f.render_widget(paragraph, area);
 
@@ -1031,11 +1303,7 @@ impl TuiApp {
             if len <= 8 {
                 "***".to_string()
             } else {
-                format!(
-                    "{}...{}",
-                    &form.api_key[..4],
-                    &form.api_key[len - 4..]
-                )
+                format!("{}...{}", &form.api_key[..4], &form.api_key[len - 4..])
             }
         };
 
@@ -1082,7 +1350,10 @@ impl TuiApp {
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             )
         } else {
-            Span::styled(format!("  {}", key_display), Style::default().fg(Color::White))
+            Span::styled(
+                format!("  {}", key_display),
+                Style::default().fg(Color::White),
+            )
         };
 
         let model_field = if model_highlight {
@@ -1091,21 +1362,19 @@ impl TuiApp {
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             )
         } else {
-            Span::styled(format!("  {}", form.model), Style::default().fg(Color::White))
+            Span::styled(
+                format!("  {}", form.model),
+                Style::default().fg(Color::White),
+            )
         };
 
         let save_btn = if save_highlight {
             Span::styled(
                 "[ Save & Apply ]",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green),
+                Style::default().fg(Color::Black).bg(Color::Green),
             )
         } else {
-            Span::styled(
-                "  Save & Apply  ",
-                Style::default().fg(Color::Green),
-            )
+            Span::styled("  Save & Apply  ", Style::default().fg(Color::Green))
         };
 
         let cancel_btn = if cancel_highlight {
@@ -1119,22 +1388,13 @@ impl TuiApp {
 
         let mut lines = Vec::new();
         lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(vec![
-            Span::raw("  Name:       "),
-            name_field,
-        ]));
+        lines.push(Line::from(vec![Span::raw("  Name:       "), name_field]));
         lines.push(Line::from(vec![
             Span::raw("  Provider:   "),
             provider_options,
         ]));
-        lines.push(Line::from(vec![
-            Span::raw("  Base URL:   "),
-            url_field,
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("  API Key:    "),
-            key_field,
-        ]));
+        lines.push(Line::from(vec![Span::raw("  Base URL:   "), url_field]));
+        lines.push(Line::from(vec![Span::raw("  API Key:    "), key_field]));
         lines.push(Line::from(vec![
             Span::raw("  Model:      "),
             model_field,
@@ -1152,9 +1412,7 @@ impl TuiApp {
 
         // Render the model list dropdown if visible.
         if form.show_model_list && !form.model_list.is_empty() {
-            let start = form
-                .model_list_index
-                .saturating_sub(4);
+            let start = form.model_list_index.saturating_sub(4);
             let end = (start + 9).min(form.model_list.len());
             for i in start..end {
                 let entry = &form.model_list[i];
@@ -1217,7 +1475,11 @@ impl TuiApp {
 
         for (i, name) in self.providers.iter().enumerate() {
             let active = name == &self.provider_name;
-            let arrow = if i == self.provider_selected { ">" } else { " " };
+            let arrow = if i == self.provider_selected {
+                ">"
+            } else {
+                " "
+            };
             let text = if active {
                 format!("  {} * {}", arrow, name)
             } else {
@@ -1235,7 +1497,11 @@ impl TuiApp {
 
         // [+ New Provider] option
         let new_idx = self.providers.len();
-        let arrow = if self.provider_selected == new_idx { ">" } else { " " };
+        let arrow = if self.provider_selected == new_idx {
+            ">"
+        } else {
+            " "
+        };
         lines.push(Line::from(Span::raw("")));
         let text = format!("    {} [+ New Provider]", arrow);
         let style = if self.provider_selected == new_idx {
@@ -1273,7 +1539,13 @@ impl TuiApp {
         )));
         lines.push(Line::from(Span::raw("")));
 
-        for (i, label) in ["  Apply  (switch to this provider)", "  Modify (edit provider config)"].iter().enumerate() {
+        for (i, label) in [
+            "  Apply  (switch to this provider)",
+            "  Modify (edit provider config)",
+        ]
+        .iter()
+        .enumerate()
+        {
             let style = if i == self.provider_action_selected {
                 Style::default().fg(Color::Black).bg(Color::Green)
             } else {
@@ -1358,7 +1630,11 @@ impl TuiApp {
         lines.push(Line::from(Span::raw("")));
 
         // Show the currently selected effort level.
-        let current = self.connect_form.reasoning_effort.as_deref().unwrap_or("none");
+        let current = self
+            .connect_form
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("none");
         lines.push(Line::from(Span::styled(
             format!("  Current: {}", current),
             Style::default().fg(Color::Yellow),

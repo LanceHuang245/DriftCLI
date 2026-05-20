@@ -103,7 +103,10 @@ impl ToolRegistry {
 
     /// Register a tool whose lifecycle can be managed at runtime.
     pub async fn register_dynamic(&self, tool: Arc<dyn Tool>) {
-        self.dynamic.write().await.insert(tool.name().to_string(), tool);
+        self.dynamic
+            .write()
+            .await
+            .insert(tool.name().to_string(), tool);
     }
 
     /// Remove a dynamically registered tool by name.

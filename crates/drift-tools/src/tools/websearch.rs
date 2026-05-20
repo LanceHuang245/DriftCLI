@@ -35,7 +35,10 @@ impl WebSearchTool {
             let href_pos = remaining[tag_start..].find("href=\"");
             let (mut url, title) = if let Some(pos) = href_pos {
                 let abs_href = tag_start + pos + 6; // skip 'href="'
-                let href_end = remaining[abs_href..].find('"').map(|e| abs_href + e).unwrap_or(abs_href + 200);
+                let href_end = remaining[abs_href..]
+                    .find('"')
+                    .map(|e| abs_href + e)
+                    .unwrap_or(abs_href + 200);
                 let url_str = &remaining[abs_href..href_end];
 
                 // Find the closing > of the <a> tag, then text until </a>
@@ -49,7 +52,10 @@ impl WebSearchTool {
                     .unwrap_or(tag_close + 200);
                 let title_str = &remaining[tag_close..title_end];
 
-                (url_str.trim().to_string(), html_entity_decode(title_str.trim()))
+                (
+                    url_str.trim().to_string(),
+                    html_entity_decode(title_str.trim()),
+                )
             } else {
                 // Advance to avoid infinite loop
                 remaining = &remaining[link_start + 16..];

@@ -64,11 +64,7 @@ impl SessionStore {
     }
 
     // Create a new session with metadata as the first JSONL line.
-    pub fn create(
-        &self,
-        working_dir: &str,
-        model: &str,
-    ) -> Result<(Uuid, PathBuf), StorageError> {
+    pub fn create(&self, working_dir: &str, model: &str) -> Result<(Uuid, PathBuf), StorageError> {
         let session_id = Uuid::new_v4();
         let filename = format!("{}.jsonl", session_id);
         let path = self.sessions_dir.join(&filename);
@@ -87,11 +83,7 @@ impl SessionStore {
     }
 
     // Append an event to the session's JSONL file.
-    pub fn append_event(
-        &self,
-        session_id: Uuid,
-        event: &SessionEvent,
-    ) -> Result<(), StorageError> {
+    pub fn append_event(&self, session_id: Uuid, event: &SessionEvent) -> Result<(), StorageError> {
         let filename = format!("{}.jsonl", session_id);
         let path = self.sessions_dir.join(&filename);
 
@@ -138,10 +130,7 @@ impl SessionStore {
     }
 
     // Read all events from a session JSONL file.
-    pub fn read_events(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<SessionEvent>, StorageError> {
+    pub fn read_events(&self, session_id: Uuid) -> Result<Vec<SessionEvent>, StorageError> {
         let filename = format!("{}.jsonl", session_id);
         let path = self.sessions_dir.join(&filename);
 

@@ -9,16 +9,29 @@ pub enum EventMsg {
     Token(String),
     // Reasoning/thinking text chunk (for extended-thinking models), streamed before the final answer.
     Reasoning(String),
+    // Signal that the reasoning/thinking phase has completed, carrying the elapsed wall-clock time (ms).
+    ReasoningComplete {
+        duration_ms: u64,
+    },
     // Token usage stats (input + output) reported after a turn completes.
-    TokenUsage { input: usize, output: usize },
+    TokenUsage {
+        input: usize,
+        output: usize,
+    },
     // Agent state transition notification (idle → thinking → generating → error).
     AgentState(AgentState),
     // Context compaction has started — TUI may display a "compacting" indicator.
     ContextCompacting,
     // Context compaction finished with a summary and the number of tokens saved.
-    ContextCompacted { summary: String, saved_tokens: usize },
+    ContextCompacted {
+        summary: String,
+        saved_tokens: usize,
+    },
     // A recoverable or non-recoverable error occurred during processing.
-    Error { message: String, recoverable: bool },
+    Error {
+        message: String,
+        recoverable: bool,
+    },
     // Agent finished processing for the current turn; TUI can accept new input.
     Done,
     // Retrieved list of available model IDs from the provider's API.
@@ -26,19 +39,41 @@ pub enum EventMsg {
     // List of configured provider names for the /provider picker.
     ProviderList(Vec<String>),
     // Full configuration for a specific provider, by name.
-    ProviderConfig { name: String, config: LlmConfig },
+    ProviderConfig {
+        name: String,
+        config: LlmConfig,
+    },
     // Notification that the provider was switched, carrying the new provider name and model.
-    ProviderSwitched { name: String, model: String },
+    ProviderSwitched {
+        name: String,
+        model: String,
+    },
     // A tool call has been requested by the LLM — emitted with the call ID and tool name.
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
     // Streaming argument JSON fragment for a tool call in progress.
-    ToolCallArgs { id: String, delta: String },
+    ToolCallArgs {
+        id: String,
+        delta: String,
+    },
     // A tool call has been fully received — arguments are complete.
-    ToolCallEnd { id: String },
+    ToolCallEnd {
+        id: String,
+    },
     // Tool execution has begun — the tool name and args summary.
-    ToolExecStart { id: String, name: String },
+    ToolExecStart {
+        id: String,
+        name: String,
+    },
     // Tool execution has produced a result — content, success flag, and error if any.
-    ToolExecEnd { id: String, name: String, success: bool, error: Option<String> },
+    ToolExecEnd {
+        id: String,
+        name: String,
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 // AgentState: lifecycle states the agent transitions through during a processing turn.

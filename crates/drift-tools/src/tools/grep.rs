@@ -51,7 +51,8 @@ impl Tool for GrepTool {
             .map_err(|e| ToolError::InvalidArgs(format!("invalid regex: {}", e)))?;
 
         // Resolve the search directory, ensuring it is within the working directory
-        let search_dir = resolve_subdir(&ctx.working_dir, args.get("path").and_then(|v| v.as_str()))?;
+        let search_dir =
+            resolve_subdir(&ctx.working_dir, args.get("path").and_then(|v| v.as_str()))?;
 
         // Optional glob filter for matching file paths relative to search_dir
         let include_filter = args
@@ -62,10 +63,7 @@ impl Tool for GrepTool {
         let mut results = Vec::new();
         const MAX_RESULTS: usize = 50;
 
-        for entry in WalkDir::new(&search_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(&search_dir).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -93,12 +91,7 @@ impl Tool for GrepTool {
 
             for (line_num, line) in content.lines().enumerate() {
                 if re.is_match(line) {
-                    results.push(format!(
-                        "{}:{}: {}",
-                        rel_path.display(),
-                        line_num + 1,
-                        line
-                    ));
+                    results.push(format!("{}:{}: {}", rel_path.display(), line_num + 1, line));
                     if results.len() >= MAX_RESULTS {
                         break;
                     }
@@ -126,14 +119,10 @@ fn resolve_subdir(base: &Path, subdir: Option<&str>) -> Result<std::path::PathBu
     };
 
     // Canonicalize to resolve any `..` components and get the real path
-    let canonical = target
-        .canonicalize()
-        .map_err(|e| ToolError::Io(e))?;
+    let canonical = target.canonicalize().map_err(|e| ToolError::Io(e))?;
 
     // Canonicalize the base for comparison
-    let canonical_base = base
-        .canonicalize()
-        .map_err(|e| ToolError::Io(e))?;
+    let canonical_base = base.canonicalize().map_err(|e| ToolError::Io(e))?;
 
     // Ensure the target is within the base directory
     if !canonical.starts_with(&canonical_base) {

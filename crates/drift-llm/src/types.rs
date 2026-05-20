@@ -68,11 +68,7 @@ pub fn extract_reasoning(parts: &[ContentPart]) -> Option<String> {
             }
         })
         .collect();
-    if r.is_empty() {
-        None
-    } else {
-        Some(r)
-    }
+    if r.is_empty() { None } else { Some(r) }
 }
 
 #[derive(Debug, Clone)]

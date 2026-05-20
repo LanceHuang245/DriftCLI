@@ -75,9 +75,7 @@ impl Tool for WebFetchTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("missing 'url' field".into()))?;
 
-        let max_length = args["maxLength"]
-            .as_u64()
-            .unwrap_or(5000) as usize;
+        let max_length = args["maxLength"].as_u64().unwrap_or(5000) as usize;
 
         // Build HTTP client with a 30-second timeout
         let client = reqwest::Client::builder()
