@@ -182,12 +182,6 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             if let Some(delta) = &choice.delta {
                                 if let Some(ref tool_calls) = delta.tool_calls {
                                     for tc in tool_calls {
-                                        tracing::debug!(
-                                            id = ?tc.id,
-                                            name = ?tc.function.name,
-                                            args = ?tc.function.arguments,
-                                            "openai: tool_call delta"
-                                        );
                                         if let Some(ref name) = tc.function.name {
                                             if !name.is_empty() {
                                                 chunks.push(Ok(LlmChunk::ToolCallStart {
