@@ -40,6 +40,17 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Set up tracing subscriber — writes to stderr (visible after TUI exit).
+    // Override with RUST_LOG env var (e.g. RUST_LOG=warn,drift_core=debug,drift_llm=debug).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+
     match &cli.command {
         // `drift init` — create a .drift/config.toml in the current directory.
         Some(Command::Init) => {

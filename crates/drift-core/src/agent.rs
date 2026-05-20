@@ -155,6 +155,7 @@ impl Agent {
                         let _ = self.event_tx.send(EventMsg::Reasoning(text));
                     }
                     Some(Ok(LlmChunk::ToolCallStart { id, name })) => {
+                        debug!(%id, %name, "agent: ToolCallStart");
                         let _ = self.event_tx.send(EventMsg::ToolCallStart {
                             id: id.clone(),
                             name: name.clone(),
