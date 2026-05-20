@@ -2,6 +2,7 @@ mod connect;
 mod components;
 mod input;
 mod selection;
+mod slash;
 
 use crossterm::{
     event::{self, EnableMouseCapture, DisableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
@@ -18,6 +19,7 @@ use ratatui::{
     Terminal,
 };
 use selection::SelectionState;
+use slash::{SlashCommand, filter_commands};
 use std::io::{self, stdout};
 use tokio::sync::mpsc;
 
@@ -68,6 +70,11 @@ pub enum TuiCommand {
     GetProviderConfig(String),
 }
 
+struct SlashCompletionState {
+    filtered: Vec<SlashCommand>,
+    selected: usize,
+}
+
 // Central application state for the DriftCLI TUI.
 pub struct TuiApp {
     messages: Vec<ChatMessage>,
@@ -93,6 +100,7 @@ pub struct TuiApp {
     history_index: Option<usize>,
     chat_scroll_offset: usize,
     selection: SelectionState,
+    slash_completion: Option<SlashCompletionState>,
     chat_area: ratatui::layout::Rect,
 }
 
@@ -151,6 +159,7 @@ impl TuiApp {
             history_index: None,
             chat_scroll_offset: 0,
             selection: SelectionState::new(),
+            slash_completion: None,
             chat_area: ratatui::layout::Rect::new(0, 0, 80, 24),
         }
     }
@@ -194,78 +203,121 @@ impl TuiApp {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         match self.mode {
                             TuiMode::Normal => {
-                                match key.code {
-                                    KeyCode::Up => {
-                                        if self.history_index.is_none() && !self.input_buffer.is_empty() {
-                                            self.history.push(self.input_buffer.clone());
-                                        }
-                                        if !self.history.is_empty() {
-                                            let idx = self.history_index.map_or(self.history.len(), |i| i);
-                                            let new_idx = idx.saturating_sub(1);
-                                            self.history_index = Some(new_idx);
-                                            self.input_buffer = self.history[new_idx].clone();
-                                            self.cursor_position = self.input_buffer.len();
-                                        }
-                                    }
-                                    KeyCode::Down => {
-                                        if let Some(idx) = self.history_index {
-                                            let new_idx = idx + 1;
-                                            if new_idx >= self.history.len() {
-                                                self.history_index = None;
-                                                self.input_buffer.clear();
-                                            } else {
-                                                self.history_index = Some(new_idx);
-                                                self.input_buffer = self.history[new_idx].clone();
+                                // Slash completion popup key intercept
+                                let mut popup_handled = false;
+                                if let Some(ref mut state) = self.slash_completion {
+                                    if !state.filtered.is_empty() {
+                                        match key.code {
+                                            KeyCode::Up => {
+                                                state.selected = if state.selected == 0 {
+                                                    state.filtered.len() - 1
+                                                } else {
+                                                    state.selected - 1
+                                                };
+                                                popup_handled = true;
                                             }
-                                            self.cursor_position = self.input_buffer.len();
-                                        }
-                                    }
-                                    // PgUp / PgDn scroll the chat area by half the viewport.
-                                    KeyCode::PageUp => {
-                                        self.chat_scroll_offset += 10;
-                                    }
-                                    KeyCode::PageDown => {
-                                        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
-                                    }
-                                    _ => {
-                                        self.history_index = None;
-                                        let action = input::process_key(
-                                            key.code,
-                                            key.modifiers,
-                                            &mut self.input_buffer,
-                                            &mut self.cursor_position,
-                                        );
-                                        match action {
-                                            input::InputAction::Submit(text) => {
-                                                if !text.trim().is_empty() {
-                                                    if text.starts_with('/') {
-                                                        self.handle_command(&text);
-                                                    } else {
-                                                        if self.history.last() != Some(&text) {
-                                                            self.history.push(text.clone());
-                                                        }
-                                                        self.messages.push(ChatMessage {
-                                                            role: "user".into(),
-                                                            content: text.clone(),
-                                                            reasoning: None,
-                                                            thinking: false,
-                                                        });
-                                                        self.current_response.clear();
-                                                        self.current_reasoning.clear();
-                                                        self.chat_scroll_offset = 0;
-                                                        self.selection.clear();
-                                                        self.status_text = "Waiting...".into();
-                                                        let _ = self.cmd_tx.send(TuiCommand::Chat(text));
-                                                    }
-                                                    self.input_buffer.clear();
-                                                    self.cursor_position = 0;
-                                                }
+                                            KeyCode::Down => {
+                                                state.selected = if state.selected + 1 >= state.filtered.len() {
+                                                    0
+                                                } else {
+                                                    state.selected + 1
+                                                };
+                                                popup_handled = true;
                                             }
-                                            input::InputAction::Quit => self.should_quit = true,
-                                            input::InputAction::ToggleConnectInfo => {}
+                                            KeyCode::Tab => {
+                                                let cmd = state.filtered[state.selected].name;
+                                                self.input_buffer = cmd.to_string();
+                                                self.cursor_position = cmd.len();
+                                                popup_handled = true;
+                                            }
+                                            KeyCode::Enter => {
+                                                let cmd = state.filtered[state.selected].name;
+                                                self.handle_command(cmd);
+                                                popup_handled = true;
+                                            }
+                                            KeyCode::Esc => {
+                                                self.slash_completion = None;
+                                                popup_handled = true;
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
+                                if !popup_handled {
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            if self.history_index.is_none() && !self.input_buffer.is_empty() {
+                                                self.history.push(self.input_buffer.clone());
+                                            }
+                                            if !self.history.is_empty() {
+                                                let idx = self.history_index.map_or(self.history.len(), |i| i);
+                                                let new_idx = idx.saturating_sub(1);
+                                                self.history_index = Some(new_idx);
+                                                self.input_buffer = self.history[new_idx].clone();
+                                                self.cursor_position = self.input_buffer.len();
+                                            }
+                                        }
+                                        KeyCode::Down => {
+                                            if let Some(idx) = self.history_index {
+                                                let new_idx = idx + 1;
+                                                if new_idx >= self.history.len() {
+                                                    self.history_index = None;
+                                                    self.input_buffer.clear();
+                                                } else {
+                                                    self.history_index = Some(new_idx);
+                                                    self.input_buffer = self.history[new_idx].clone();
+                                                }
+                                                self.cursor_position = self.input_buffer.len();
+                                            }
+                                        }
+                                        // PgUp / PgDn scroll the chat area by half the viewport.
+                                        KeyCode::PageUp => {
+                                            self.chat_scroll_offset += 10;
+                                        }
+                                        KeyCode::PageDown => {
+                                            self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
+                                        }
+                                        _ => {
+                                            self.history_index = None;
+                                            let action = input::process_key(
+                                                key.code,
+                                                key.modifiers,
+                                                &mut self.input_buffer,
+                                                &mut self.cursor_position,
+                                            );
+                                            match action {
+                                                input::InputAction::Submit(text) => {
+                                                    if !text.trim().is_empty() {
+                                                        if text.starts_with('/') {
+                                                            self.handle_command(&text);
+                                                        } else {
+                                                            if self.history.last() != Some(&text) {
+                                                                self.history.push(text.clone());
+                                                            }
+                                                            self.messages.push(ChatMessage {
+                                                                role: "user".into(),
+                                                                content: text.clone(),
+                                                                reasoning: None,
+                                                                thinking: false,
+                                                            });
+                                                            self.current_response.clear();
+                                                            self.current_reasoning.clear();
+                                                            self.chat_scroll_offset = 0;
+                                                            self.selection.clear();
+                                                            self.status_text = "Waiting...".into();
+                                                            let _ = self.cmd_tx.send(TuiCommand::Chat(text));
+                                                        }
+                                                        self.input_buffer.clear();
+                                                        self.cursor_position = 0;
+                                                    }
+                                                }
+                                                input::InputAction::Quit => self.should_quit = true,
+                                                input::InputAction::ToggleConnectInfo => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                self.update_slash_completion();
                             }
                             TuiMode::ConnectSettings => { self.handle_connect_key(key.code); }
                             TuiMode::VariantPicker => { self.handle_variant_key(key.code); }
@@ -409,6 +461,29 @@ impl TuiApp {
         }
         self.input_buffer.clear();
         self.cursor_position = 0;
+    }
+
+    // Update slash completion popup based on current input buffer.
+    fn update_slash_completion(&mut self) {
+        if self.input_buffer.starts_with('/') {
+            let filter = &self.input_buffer[1..];
+            let filtered = filter_commands(filter);
+            if filtered.is_empty() {
+                self.slash_completion = None;
+            } else if let Some(ref mut state) = self.slash_completion {
+                if state.selected >= filtered.len() {
+                    state.selected = filtered.len().saturating_sub(1);
+                }
+                state.filtered = filtered;
+            } else {
+                self.slash_completion = Some(SlashCompletionState {
+                    filtered,
+                    selected: 0,
+                });
+            }
+        } else {
+            self.slash_completion = None;
+        }
     }
 
     // Handle key presses while the connect settings form is active.
@@ -746,33 +821,59 @@ impl TuiApp {
     fn render(&mut self, f: &mut ratatui::Frame) {
         let size = f.area();
 
-        // Split the screen into three rows: content, input, status bar.
-        let chunks = Layout::default()
+        // Calculate popup height (max 8 items + 2 for borders)
+        let popup_height = self.slash_completion.as_ref().and_then(|s| {
+            if s.filtered.is_empty() {
+                None
+            } else {
+                Some((s.filtered.len().min(8) + 2) as u16)
+            }
+        });
+
+        // Split the screen: content, optional popup, input, status bar.
+        let mut constraints = vec![
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ];
+        if let Some(h) = popup_height {
+            constraints.insert(1, Constraint::Length(h));
+        }
+        let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(3),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(size);
+        let content_area = layout[0];
+        let (input_area, status_area, popup_area) = if popup_height.is_some() {
+            (layout[2], layout[3], Some(layout[1]))
+        } else {
+            (layout[1], layout[2], None)
+        };
 
         // Render the top content area depending on the current mode.
         match self.mode {
             TuiMode::Normal => {
-                self.chat_area = chunks[0];
-                self.render_chat_area(chunks[0], f);
+                self.chat_area = content_area;
+                self.render_chat_area(content_area, f);
             }
             TuiMode::ConnectSettings => {
-                f.render_widget(self.render_connect_settings(), chunks[0]);
+                f.render_widget(self.render_connect_settings(), content_area);
             }
             TuiMode::VariantPicker => {
-                f.render_widget(self.render_variant_picker(), chunks[0]);
+                f.render_widget(self.render_variant_picker(), content_area);
             }
             TuiMode::ProviderPicker => {
-                f.render_widget(self.render_provider_picker(), chunks[0]);
+                f.render_widget(self.render_provider_picker(), content_area);
             }
             TuiMode::ProviderAction { .. } => {
-                f.render_widget(self.render_provider_action(), chunks[0]);
+                f.render_widget(self.render_provider_action(), content_area);
+            }
+        }
+
+        // Render slash completion popup between content and input if active.
+        if let (Some(area), Some(state)) = (popup_area, &self.slash_completion) {
+            if !state.filtered.is_empty() {
+                f.render_widget(self.render_slash_popup(state), area);
             }
         }
 
@@ -800,7 +901,7 @@ impl TuiApp {
         // Render the input line widget with a top border.
         let input_line = Line::from(input_spans);
         let input_widget = Paragraph::new(input_line).block(Block::default().borders(Borders::TOP));
-        f.render_widget(input_widget, chunks[1]);
+        f.render_widget(input_widget, input_area);
 
         // Calculate cursor position accounting for unicode width and prompt prefix.
         let before_cursor =
@@ -808,10 +909,10 @@ impl TuiApp {
         let prompt_width = 2;
         let visual_before = unicode_width::UnicodeWidthStr::width(before_cursor);
         let visual_total = prompt_width + visual_before;
-        let inner_width = chunks[1].width as usize;
+        let inner_width = input_area.width as usize;
 
         let cursor_x = (visual_total % inner_width.max(1)) as u16;
-        let cursor_y = chunks[1].y + 1 + (visual_total / inner_width.max(1)) as u16;
+        let cursor_y = input_area.y + 1 + (visual_total / inner_width.max(1)) as u16;
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
         // Status bar: color-coded status, provider name, model name, and keyboard shortcuts.
@@ -849,7 +950,7 @@ impl TuiApp {
             ),
 
         ]));
-        f.render_widget(status, chunks[2]);
+        f.render_widget(status, status_area);
     }
 
     // Render the scrollable chat message area with scroll offset and selection highlighting.
@@ -1267,6 +1368,46 @@ impl TuiApp {
             .borders(Borders::ALL)
             .title(" /variant — Reasoning Effort ")
             .border_style(Style::default().fg(Color::Magenta));
+        Paragraph::new(lines).block(block)
+    }
+
+    // Render the slash command completion popup with bordered list.
+    fn render_slash_popup(&self, state: &SlashCompletionState) -> Paragraph<'_> {
+        let max_visible = 8usize;
+        let total = state.filtered.len();
+        let visible = total.min(max_visible);
+
+        // Scroll window to keep selected item visible
+        let start = if total <= max_visible {
+            0
+        } else {
+            state
+                .selected
+                .saturating_sub(max_visible / 2)
+                .min(total - max_visible)
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        for i in start..start + visible {
+            let cmd = &state.filtered[i];
+            let label = if i == state.selected {
+                Span::styled(
+                    format!("> {}  {}", cmd.name, cmd.description),
+                    Style::default().fg(Color::Black).bg(Color::White),
+                )
+            } else {
+                Span::styled(
+                    format!("  {}  {}", cmd.name, cmd.description),
+                    Style::default().fg(Color::White),
+                )
+            };
+            lines.push(Line::from(label));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Commands ")
+            .border_style(Style::default().fg(Color::Cyan));
         Paragraph::new(lines).block(block)
     }
 }
