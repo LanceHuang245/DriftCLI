@@ -1,6 +1,7 @@
 mod components;
 mod connect;
 mod input;
+mod markdown;
 mod selection;
 mod slash;
 
@@ -1326,6 +1327,11 @@ impl TuiApp {
                     bottom,
                     Style::default().fg(Color::Cyan),
                 )));
+            } else if msg.role == "assistant" && !msg.thinking {
+                let md_lines = markdown::render_markdown(&msg.content, area.width);
+                for line in md_lines {
+                    lines.push(line);
+                }
             } else {
                 for line in msg.content.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));

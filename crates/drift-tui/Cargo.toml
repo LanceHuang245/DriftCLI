@@ -12,3 +12,4 @@ crossterm = "0.28"
 tokio = { workspace = true, features = ["sync", "time"] }
 anyhow.workspace = true
 unicode-width = "0.2"
+pulldown-cmark = "0.12"
