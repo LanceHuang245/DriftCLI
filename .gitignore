@@ -1,11 +1,13 @@
-# Agent
+# Agents
 AGENTS.md
+CLAUDE.md
 .serena/
 .kilo/
+.omc/
 
 # Dev
 dev-docs/
-.drift
+.drift/
 
 # Rust
 target/
