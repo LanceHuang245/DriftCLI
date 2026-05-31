@@ -34,6 +34,8 @@ pub struct Agent {
     event_tx: broadcast::Sender<EventMsg>,
     messages: Vec<LlmMessage>,
     cwd: PathBuf,
+    session_id: uuid::Uuid,
+    session_store: std::sync::Arc<drift_storage::SessionStore>,
 }
 
 impl Agent {
@@ -42,6 +44,8 @@ impl Agent {
         config: AppConfig,
         cwd: PathBuf,
         tool_registry: ToolRegistry,
+        session_id: uuid::Uuid,
+        session_store: std::sync::Arc<drift_storage::SessionStore>,
     ) -> Result<Self, LlmError> {
         let llm = create_provider(config.active_llm_config().unwrap())?;
         let (event_tx, _) = broadcast::channel(256);
@@ -59,7 +63,97 @@ impl Agent {
             event_tx,
             messages: Vec::new(),
             cwd,
+            session_id,
+            session_store,
         })
+    }
+
+
+    // Set the full conversation history from a reconstructed LlmMessage list (used when resuming a session).
+    pub fn set_messages(&mut self, messages: Vec<LlmMessage>) {
+        self.messages = messages;
+    }
+
+    // Retrieve active session ID.
+    pub fn session_id(&self) -> uuid::Uuid {
+        self.session_id
+    }
+
+    // Reconstruct the core messages history list from a vector of storage events.
+    pub fn reconstruct_history(&mut self, events: &[drift_storage::SessionEvent]) {
+        let mut messages: Vec<LlmMessage> = Vec::new();
+
+        for event in events {
+            match event {
+                drift_storage::SessionEvent::Message { role, content, reasoning } => {
+                    let mut content_parts = Vec::new();
+                    if let Some(r) = reasoning {
+                        if !r.is_empty() {
+                            content_parts.push(drift_llm::ContentPart::Reasoning(r.clone()));
+                        }
+                    }
+                    if !content.is_empty() {
+                        content_parts.push(drift_llm::ContentPart::Text(content.clone()));
+                    }
+                    messages.push(LlmMessage {
+                        role: role.clone(),
+                        content: content_parts,
+                    });
+                }
+                drift_storage::SessionEvent::ToolCall { call_id, name, args } => {
+                    if let Some(last) = messages.last_mut() {
+                        if last.role == "assistant" {
+                            last.content.push(drift_llm::ContentPart::ToolCall {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                                arguments: args.to_string(),
+                            });
+                        }
+                    }
+                }
+                drift_storage::SessionEvent::ToolResult { call_id, name: _, success, content, error } => {
+                    let result_content = if *success {
+                        content.clone()
+                    } else {
+                        match error {
+                            Some(err) if !content.is_empty() => format!("{} — Error: {}", content, err),
+                            Some(err) => format!("Error: {}", err),
+                            None => content.clone(),
+                        }
+                    };
+
+                    // Check if the last message is already a tool-result user message
+                    let mut needs_new_user_msg = true;
+                    if let Some(last) = messages.last_mut() {
+                        if last.role == "user" {
+                            // Verify it only contains tool results so we can append to it
+                            let only_results = last.content.iter().all(|part| matches!(part, drift_llm::ContentPart::ToolResult { .. }));
+                            if only_results && !last.content.is_empty() {
+                                last.content.push(drift_llm::ContentPart::ToolResult {
+                                    tool_use_id: call_id.clone(),
+                                    content: result_content.clone(),
+                                    is_error: !success,
+                                });
+                                needs_new_user_msg = false;
+                            }
+                        }
+                    }
+
+                    if needs_new_user_msg {
+                        messages.push(LlmMessage {
+                            role: "user".into(),
+                            content: vec![drift_llm::ContentPart::ToolResult {
+                                tool_use_id: call_id.clone(),
+                                content: result_content,
+                                is_error: !success,
+                            }],
+                        });
+                    }
+                }
+            }
+        }
+
+        self.messages = messages;
     }
 
     // Subscribe returns a new broadcast receiver for consuming agent events in the TUI bridge.
@@ -75,7 +169,17 @@ impl Agent {
             .send(EventMsg::AgentState(AgentState::Thinking));
 
         // Add user message to history
-        self.messages.push(LlmMessage::user(user_input));
+        self.messages.push(LlmMessage::user(user_input.clone()));
+
+        // Write user message to SessionStore
+        let _ = self.session_store.append_event(
+            self.session_id,
+            &drift_storage::SessionEvent::Message {
+                role: "user".to_string(),
+                content: user_input,
+                reasoning: None,
+            },
+        );
 
         let system_prompt = self.get_system_prompt();
         let max_iterations = self.config.agent.max_iterations;
@@ -234,22 +338,37 @@ impl Agent {
             // If no tool calls were completed, this is a text-only response — finalize
             if completed_tool_calls.is_empty() {
                 if !full_response.is_empty() {
-                    self.messages.push(LlmMessage::assistant(full_response));
+                    self.messages.push(LlmMessage::assistant(full_response.clone()));
+                    // Write assistant message to SessionStore
+                    let reasoning_opt = if !full_reasoning.is_empty() {
+                        Some(full_reasoning)
+                    } else {
+                        None
+                    };
+                    let _ = self.session_store.append_event(
+                        self.session_id,
+                        &drift_storage::SessionEvent::Message {
+                            role: "assistant".to_string(),
+                            content: full_response,
+                            reasoning: reasoning_opt,
+                        },
+                    );
                 }
                 break;
             }
 
             // Build assistant message with unified ContentParts (provider-agnostic).
             let mut content_parts: Vec<drift_llm::ContentPart> = Vec::new();
+            let mut has_reasoning = false;
+            let mut has_text = false;
+            
             if !full_reasoning.is_empty() {
-                content_parts.push(drift_llm::ContentPart::Reasoning(std::mem::take(
-                    &mut full_reasoning,
-                )));
+                content_parts.push(drift_llm::ContentPart::Reasoning(full_reasoning.clone()));
+                has_reasoning = true;
             }
             if !full_response.is_empty() {
-                content_parts.push(drift_llm::ContentPart::Text(std::mem::take(
-                    &mut full_response,
-                )));
+                content_parts.push(drift_llm::ContentPart::Text(full_response.clone()));
+                has_text = true;
             }
             for tc in &completed_tool_calls {
                 content_parts.push(drift_llm::ContentPart::ToolCall {
@@ -263,6 +382,29 @@ impl Agent {
                 content: content_parts,
             });
 
+            // Write assistant message and tool calls to SessionStore
+            let _ = self.session_store.append_event(
+                self.session_id,
+                &drift_storage::SessionEvent::Message {
+                    role: "assistant".to_string(),
+                    content: if has_text { full_response } else { String::new() },
+                    reasoning: if has_reasoning { Some(full_reasoning) } else { None },
+                },
+            );
+
+            for tc in &completed_tool_calls {
+                let args_val: serde_json::Value =
+                    serde_json::from_str(&tc.args_string()).unwrap_or_default();
+                let _ = self.session_store.append_event(
+                    self.session_id,
+                    &drift_storage::SessionEvent::ToolCall {
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        args: args_val,
+                    },
+                );
+            }
+
             // Execute each tool call sequentially
             let mut tool_result_parts: Vec<drift_llm::ContentPart> = Vec::new();
             for tc in &completed_tool_calls {
@@ -275,7 +417,7 @@ impl Agent {
                 });
 
                 let ctx = ToolContext {
-                    session_id: uuid::Uuid::new_v4(),
+                    session_id: self.session_id,
                     working_dir: self.cwd.clone(),
                     tool_call_id: tc.id.clone(),
                 };
@@ -291,21 +433,33 @@ impl Agent {
                             error: r.error.clone(),
                         });
                         let result_content = if r.success {
-                            r.content
+                            r.content.clone()
                         } else {
                             match &r.error {
                                 Some(err) if !r.content.is_empty() => {
                                     format!("{} — Error: {}", r.content, err)
                                 }
                                 Some(err) => format!("Error: {}", err),
-                                None => r.content,
+                                None => r.content.clone(),
                             }
                         };
                         tool_result_parts.push(drift_llm::ContentPart::ToolResult {
                             tool_use_id: tc.id.clone(),
-                            content: result_content,
+                            content: result_content.clone(),
                             is_error: !r.success,
                         });
+
+                        // Write ToolResult to SessionStore
+                        let _ = self.session_store.append_event(
+                            self.session_id,
+                            &drift_storage::SessionEvent::ToolResult {
+                                call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                success: r.success,
+                                content: r.content,
+                                error: r.error,
+                            },
+                        );
                     }
                     Err(e) => {
                         let _ = self.event_tx.send(EventMsg::ToolExecEnd {
@@ -314,11 +468,24 @@ impl Agent {
                             success: false,
                             error: Some(e.to_string()),
                         });
+                        let err_str = e.to_string();
                         tool_result_parts.push(drift_llm::ContentPart::ToolResult {
                             tool_use_id: tc.id.clone(),
-                            content: format!("Error: {}", e),
+                            content: format!("Error: {}", err_str),
                             is_error: true,
                         });
+
+                        // Write ToolResult (Failure) to SessionStore
+                        let _ = self.session_store.append_event(
+                            self.session_id,
+                            &drift_storage::SessionEvent::ToolResult {
+                                call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                success: false,
+                                content: String::new(),
+                                error: Some(err_str),
+                            },
+                        );
                     }
                 }
             }

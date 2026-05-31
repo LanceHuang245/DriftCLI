@@ -9,6 +9,8 @@ name = "drift"
 path = "src/main.rs"
 
 [dependencies]
+drift-storage = { path = "../drift-storage" }
+uuid = { workspace = true, features = ["v4"] }
 clap.workspace = true
 drift-config = { path = "../drift-config" }
 drift-core = { path = "../drift-core" }

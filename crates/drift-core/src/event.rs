@@ -74,6 +74,13 @@ pub enum EventMsg {
         success: bool,
         error: Option<String>,
     },
+    // Sent to the TUI to broadcast all historical session metadata.
+    SessionList(Vec<drift_storage::SessionMeta>),
+    // Sent to the TUI when a specific session has been reconstructed.
+    SessionLoaded {
+        session_id: uuid::Uuid,
+        events: Vec<drift_storage::SessionEvent>,
+    },
 }
 
 // AgentState: lifecycle states the agent transitions through during a processing turn.

@@ -330,11 +330,13 @@ dependencies = [
  "clap",
  "drift-config",
  "drift-core",
+ "drift-storage",
  "drift-tools",
  "drift-tui",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -356,6 +358,7 @@ dependencies = [
  "async-trait",
  "drift-config",
  "drift-llm",
+ "drift-storage",
  "drift-tools",
  "serde",
  "serde_json",
@@ -436,10 +439,12 @@ dependencies = [
  "crossterm",
  "drift-config",
  "drift-llm",
+ "drift-storage",
  "pulldown-cmark",
  "ratatui",
  "tokio",
  "unicode-width 0.2.0",
+ "uuid",
 ]
 
 [[package]]

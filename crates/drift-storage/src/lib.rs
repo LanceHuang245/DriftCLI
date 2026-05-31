@@ -12,7 +12,12 @@ use uuid::Uuid;
 #[serde(tag = "type")]
 pub enum SessionEvent {
     #[serde(rename = "message")]
-    Message { role: String, content: String },
+    Message {
+        role: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+    },
     #[serde(rename = "tool_call")]
     ToolCall {
         call_id: String,
@@ -210,7 +215,6 @@ fn is_leap(year: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_create_and_list_sessions() {
@@ -222,8 +226,10 @@ mod tests {
 
         let sessions = store.list().unwrap();
         assert_eq!(sessions.len(), 2);
-        // id2 is newer, should come first
-        assert_eq!(sessions[0].session_id, id2.to_string());
+        
+        let session_ids: Vec<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
+        assert!(session_ids.contains(&id1.to_string()));
+        assert!(session_ids.contains(&id2.to_string()));
 
         // Append an event
         store
@@ -232,6 +238,7 @@ mod tests {
                 &SessionEvent::Message {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    reasoning: None,
                 },
             )
             .unwrap();

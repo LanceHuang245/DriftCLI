@@ -9,7 +9,7 @@ use drift_tools::{
         write::WriteTool,
     },
 };
-use drift_tui::{AppEvent, TuiApp, TuiCommand};
+use drift_tui::{AppEvent, TuiApp, TuiCommand, ChatMessage};
 use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -32,6 +32,8 @@ struct Cli {
     permission_mode: String,
     #[arg(long, default_value = "info")]
     log_level: String,
+    #[arg(long)]
+    session: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -41,6 +43,50 @@ struct Cli {
 enum Command {
     Init,
     Config,
+}
+
+// Helper function to translate persistent storage SessionEvents into TUI ChatMessages
+fn translate_events_to_chat_messages(events: &[drift_storage::SessionEvent]) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+
+    for event in events {
+        match event {
+            drift_storage::SessionEvent::Message { role, content, reasoning } => {
+                messages.push(ChatMessage {
+                    role: role.clone(),
+                    content: content.clone(),
+                    reasoning: reasoning.clone(),
+                    thinking: false,
+                    reasoning_duration_ms: None,
+                    reasoning_collapsed: true,
+                    thinking_tools: Vec::new(),
+                });
+            }
+            drift_storage::SessionEvent::ToolCall { call_id: _, name, args } => {
+                if let Some(last) = messages.last_mut() {
+                    if last.role == "assistant" {
+                        last.thinking_tools.push(format!("> Calling tool: {} with {}", name, args));
+                    }
+                }
+            }
+            drift_storage::SessionEvent::ToolResult { call_id: _, name, success, content: _, error } => {
+                if let Some(last) = messages.last_mut() {
+                    if last.role == "assistant" {
+                        last.thinking_tools.push(format!(
+                            "> Tool {} {}",
+                            name,
+                            if *success { "completed" } else { "failed" }
+                        ));
+                        if let Some(err) = error {
+                            last.thinking_tools.push(format!("  Error: {}", err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    messages
 }
 
 // Main entry point: parses CLI, loads config, and either runs a subcommand or boots the TUI with an event bridge.
@@ -95,7 +141,32 @@ async fn main() -> anyhow::Result<()> {
             tool_registry.register_builtin(Arc::new(WebSearchTool));
             tool_registry.register_builtin(Arc::new(TodoWriteTool));
 
-            let mut agent = Agent::new(config.clone(), cwd.clone(), tool_registry)?;
+            // Establish Persistence Paths & Handle Boot Bootstrapping
+            let drift_dir = AppConfig::global_config_dir().unwrap_or_else(|| std::path::PathBuf::from(".drift"));
+            let session_store = std::sync::Arc::new(drift_storage::SessionStore::new(drift_dir)?);
+
+            let (session_id, history_events) = if let Some(ref s_str) = cli.session {
+                if let Ok(parsed_id) = uuid::Uuid::parse_str(s_str) {
+                    if let Ok(events) = session_store.read_events(parsed_id) {
+                        (parsed_id, events)
+                    } else {
+                        let (new_id, _) = session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
+                        (new_id, Vec::new())
+                    }
+                } else {
+                    let (new_id, _) = session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
+                    (new_id, Vec::new())
+                }
+            } else {
+                let (new_id, _) = session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
+                (new_id, Vec::new())
+            };
+
+            let mut agent = Agent::new(config.clone(), cwd.clone(), tool_registry, session_id, session_store.clone())?;
+            if !history_events.is_empty() {
+                agent.reconstruct_history(&history_events);
+            }
+
             let event_tx = agent.event_sender();
             let llm_config = config.active_llm_config().cloned().unwrap();
 
@@ -160,6 +231,15 @@ async fn main() -> anyhow::Result<()> {
                             id, name, success, ..
                         }) => {
                             let _ = tui_tx.send(AppEvent::ToolExecEnd { id, name, success });
+                        }
+                        Ok(EventMsg::SessionList(meta_list)) => {
+                            let _ = tui_tx.send(AppEvent::SessionList(meta_list));
+                        }
+                        Ok(EventMsg::SessionLoaded { session_id, events }) => {
+                            let _ = tui_tx.send(AppEvent::SessionLoaded {
+                                session_id,
+                                messages: translate_events_to_chat_messages(&events),
+                            });
                         }
                         _ => {}
                     }
@@ -262,12 +342,32 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        TuiCommand::GetSessions => {
+                            if let Ok(meta_list) = session_store.list() {
+                                let _ = event_tx.send(EventMsg::SessionList(meta_list));
+                            }
+                        }
+                        TuiCommand::SwitchSession(target_id) => {
+                            if let Ok(events) = session_store.read_events(target_id) {
+                                agent.reconstruct_history(&events);
+                                let _ = event_tx.send(EventMsg::SessionLoaded { session_id: target_id, events });
+                            } else {
+                                let _ = event_tx.send(EventMsg::Error {
+                                    message: format!("Failed to read session {}", target_id),
+                                    recoverable: true,
+                                });
+                            }
+                        }
                     }
                 }
             });
 
             // Start the TUI app on the main thread — blocks until the user exits.
             let mut tui = TuiApp::new(&llm_config, tui_rx, cmd_tx);
+            if !history_events.is_empty() {
+                tui.set_messages(translate_events_to_chat_messages(&history_events));
+            }
+            tui.set_session_id(session_id);
             tui.run()?;
         }
     }

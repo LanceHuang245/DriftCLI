@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drift-storage = { path = "../drift-storage" }
 drift-config = { path = "../drift-config" }
 drift-llm = { path = "../drift-llm" }
 drift-tools = { path = "../drift-tools" }

@@ -20,6 +20,10 @@ pub const ALL_COMMANDS: &[SlashCommand] = &[
         description: "Change reasoning effort level for the current model",
     },
     SlashCommand {
+        name: "/sessions",
+        description: "Manage and switch between persistent historical chat sessions",
+    },
+    SlashCommand {
         name: "/clear",
         description: "Clear all chat messages",
     },

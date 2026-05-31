@@ -75,6 +75,13 @@ pub enum AppEvent {
         name: String,
         success: bool,
     },
+    // Carry session metadata arrays back to TUI for /sessions modal list
+    SessionList(Vec<drift_storage::SessionMeta>),
+    // Signal TUI that a specific session has been reconstructed from store
+    SessionLoaded {
+        session_id: uuid::Uuid,
+        messages: Vec<ChatMessage>,
+    },
 }
 
 // Commands sent from the TUI to the backend (chat, fetch models, reconfigure, provider management).
@@ -100,6 +107,10 @@ pub enum TuiCommand {
     DeleteProvider(String),
     // Get the full config for a named provider (used for "Modify" in the provider picker).
     GetProviderConfig(String),
+    // Get the full list of saved historical sessions.
+    GetSessions,
+    // Switch to a different historical session by UUID.
+    SwitchSession(uuid::Uuid),
 }
 
 struct SlashCompletionState {
@@ -140,6 +151,10 @@ pub struct TuiApp {
     provider_selected: usize,
     provider_action_selected: usize,
     provider_name: String,
+    // Active session metadata and switching list
+    session_id: uuid::Uuid,
+    session_list: Vec<drift_storage::SessionMeta>,
+    session_selected: usize,
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     cmd_tx: mpsc::UnboundedSender<TuiCommand>,
     should_quit: bool,
@@ -161,6 +176,8 @@ pub enum TuiMode {
     ProviderPicker,
     // Sub-menu after selecting a provider in the provider picker: Apply / Modify
     ProviderAction { provider_name: String },
+    // Session list and load picker overlay
+    SessionPicker,
 }
 
 // A single chat message with optional reasoning/thinking content.
@@ -208,6 +225,9 @@ impl TuiApp {
             provider_selected: 0,
             provider_action_selected: 0,
             provider_name: "default".to_string(),
+            session_id: uuid::Uuid::nil(),
+            session_list: Vec::new(),
+            session_selected: 0,
             event_rx,
             cmd_tx,
             should_quit: false,
@@ -402,6 +422,9 @@ impl TuiApp {
                             TuiMode::ProviderAction { .. } => {
                                 self.handle_provider_action_key(key.code);
                             }
+                            TuiMode::SessionPicker => {
+                                self.handle_session_picker_key(key.code);
+                            }
                         }
                     }
                     Event::Mouse(mouse) => {
@@ -428,6 +451,10 @@ impl TuiApp {
                                     TuiMode::ProviderAction { .. } => {
                                         self.provider_action_selected =
                                             self.provider_action_selected.saturating_sub(1);
+                                    }
+                                    TuiMode::SessionPicker => {
+                                        self.session_selected =
+                                            self.session_selected.saturating_sub(1);
                                     }
                                     _ => {}
                                 }
@@ -462,6 +489,11 @@ impl TuiApp {
                                     TuiMode::ProviderAction { .. } => {
                                         if self.provider_action_selected < 1 {
                                             self.provider_action_selected += 1;
+                                        }
+                                    }
+                                    TuiMode::SessionPicker => {
+                                        if !self.session_list.is_empty() && self.session_selected + 1 < self.session_list.len() {
+                                            self.session_selected += 1;
                                         }
                                     }
                                     _ => {}
@@ -536,6 +568,9 @@ impl TuiApp {
             "/provider" => {
                 let _ = self.cmd_tx.send(TuiCommand::GetProviders);
             }
+            "/sessions" | "/history" => {
+                let _ = self.cmd_tx.send(TuiCommand::GetSessions);
+            }
             // Quit the application.
             "/quit" | "/exit" => {
                 self.should_quit = true;
@@ -550,7 +585,7 @@ impl TuiApp {
                 self.messages.push(ChatMessage {
                     role: "system".into(),
                     content: format!(
-                        "Unknown command: {}. Try /connect, /provider, /clear, /quit",
+                        "Unknown command: {}. Try /connect, /provider, /sessions, /clear, /quit",
                         cmd
                     ),
                     reasoning: None,
@@ -734,6 +769,31 @@ impl TuiApp {
                             // Mode switches to ConnectSettings when ProviderConfig event arrives.
                         }
                         _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Handle key presses while the session picker is active.
+    fn handle_session_picker_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = TuiMode::Normal,
+            KeyCode::Up => {
+                self.session_selected = self.session_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if !self.session_list.is_empty() && self.session_selected + 1 < self.session_list.len() {
+                    self.session_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if !self.session_list.is_empty() && self.session_selected < self.session_list.len() {
+                    let s_meta = &self.session_list[self.session_selected];
+                    if let Ok(parsed_id) = uuid::Uuid::parse_str(&s_meta.session_id) {
+                        let _ = self.cmd_tx.send(TuiCommand::SwitchSession(parsed_id));
+                        self.status_text = "Loading session...".to_string();
                     }
                 }
             }
@@ -932,6 +992,24 @@ impl TuiApp {
                     if success { "completed" } else { "failed" }
                 ));
             }
+            AppEvent::SessionList(meta_list) => {
+                self.session_list = meta_list;
+                self.session_selected = self.session_list
+                    .iter()
+                    .position(|s| s.session_id == self.session_id.to_string())
+                    .unwrap_or(0);
+                self.mode = TuiMode::SessionPicker;
+            }
+            AppEvent::SessionLoaded { session_id, messages } => {
+                self.session_id = session_id;
+                self.messages = messages;
+                self.current_response.clear();
+                self.current_reasoning.clear();
+                self.current_thinking_tools.clear();
+                self.chat_scroll_offset = 0;
+                self.status_text = format!("Loaded session {}", &session_id.to_string()[..8]);
+                self.mode = TuiMode::Normal;
+            }
         }
     }
 
@@ -1017,6 +1095,9 @@ impl TuiApp {
             TuiMode::ProviderAction { .. } => {
                 f.render_widget(self.render_provider_action(), content_area);
             }
+            TuiMode::SessionPicker => {
+                f.render_widget(self.render_session_picker(), content_area);
+            }
         }
 
         // Render slash completion popup between content and input if active.
@@ -1095,6 +1176,15 @@ impl TuiApp {
                     .map(|e| format!(" [{}]", e))
                     .unwrap_or_default(),
                 Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(" | Session: "),
+            Span::styled(
+                if self.session_id.is_nil() {
+                    "(none)".to_string()
+                } else {
+                    self.session_id.to_string()[..8].to_string()
+                },
+                Style::default().fg(Color::Yellow),
             ),
         ]));
         f.render_widget(status, status_area);
@@ -1736,6 +1826,71 @@ impl TuiApp {
             .title(" /variant — Reasoning Effort ")
             .border_style(Style::default().fg(Color::Magenta));
         Paragraph::new(lines).block(block)
+    }
+
+    // Render the persistent session picker overlay list.
+    fn render_session_picker(&self) -> Paragraph<'_> {
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Saved Historical Sessions:",
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        if self.session_list.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No historical sessions found.",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            for (i, meta) in self.session_list.iter().enumerate() {
+                let is_active = meta.session_id == self.session_id.to_string();
+                let active_marker = if is_active { "*" } else { " " };
+                
+                let text = format!(
+                    "  {} [{}]  Created: {}  Dir: {}  Model: {}",
+                    active_marker,
+                    &meta.session_id[..8.min(meta.session_id.len())],
+                    meta.created_at,
+                    meta.working_dir,
+                    meta.model
+                );
+
+                let style = if i == self.session_selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else if is_active {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+        }
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "  Up/Down: choose  Enter: switch session  Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" /sessions — Saved Chat History ")
+            .border_style(Style::default().fg(Color::Yellow));
+        Paragraph::new(lines).block(block)
+    }
+
+    // Set full visual ChatMessage messages in TUI (used on loading a session)
+    pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = messages;
+    }
+
+    // Set the currently active session ID
+    pub fn set_session_id(&mut self, session_id: uuid::Uuid) {
+        self.session_id = session_id;
     }
 
     // Render the slash command completion popup with bordered list.
