@@ -311,11 +311,9 @@ impl Writer {
 
     fn rule(&mut self) {
         self.commit_line();
-        let count = (self.width as usize / 3).max(1);
-        let rule = "───".repeat(count);
-        let w = (self.width as usize).min(rule.len());
+        let rule = "─".repeat(self.width as usize);
         self.lines.push(Line::from(Span::styled(
-            rule[..w].to_string(),
+            rule,
             Style::default().fg(Color::DarkGray),
         )));
     }
