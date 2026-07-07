@@ -330,6 +330,7 @@ dependencies = [
  "clap",
  "drift-config",
  "drift-core",
+ "drift-security",
  "drift-storage",
  "drift-tools",
  "drift-tui",
@@ -344,6 +345,7 @@ name = "drift-config"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "drift-security",
  "serde",
  "serde_json",
  "thiserror",
@@ -358,6 +360,7 @@ dependencies = [
  "async-trait",
  "drift-config",
  "drift-llm",
+ "drift-security",
  "drift-storage",
  "drift-tools",
  "serde",
@@ -397,6 +400,14 @@ version = "0.1.0"
 [[package]]
 name = "drift-security"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "drift-storage"

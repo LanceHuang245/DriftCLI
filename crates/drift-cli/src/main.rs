@@ -9,6 +9,7 @@ use drift_tools::{
         write::WriteTool,
     },
 };
+use drift_security::types::PermissionResponse;
 use drift_tui::{AppEvent, TuiApp, TuiCommand, ChatMessage};
 use std::env;
 use std::sync::Arc;
@@ -28,6 +29,9 @@ struct Cli {
     api_key: Option<String>,
     #[arg(long)]
     config: Option<String>,
+    /// Security profile: "default", "auto", "readonly", "danger"
+    #[arg(long = "security-profile", short = 'P')]
+    security_profile: Option<String>,
     #[arg(long, default_value = "ask")]
     permission_mode: String,
     #[arg(long, default_value = "info")]
@@ -162,7 +166,22 @@ async fn main() -> anyhow::Result<()> {
                 (new_id, Vec::new())
             };
 
-            let mut agent = Agent::new(config.clone(), cwd.clone(), tool_registry, session_id, session_store.clone())?;
+            let security_cfg = config.security.clone();
+            // Use CLI flag profile if set; otherwise default
+            let profile_name = cli.security_profile.as_deref().unwrap_or(&security_cfg.default_profile);
+            let mut agent = Agent::new(
+                config.clone(),
+                cwd.clone(),
+                tool_registry,
+                session_id,
+                session_store.clone(),
+                &security_cfg,
+                profile_name,
+            )?;
+
+            // Set up permission response channel (TUI → Agent)
+            let (perm_tx, perm_rx) = mpsc::unbounded_channel();
+            agent.set_permission_channel(perm_rx);
             if !history_events.is_empty() {
                 agent.reconstruct_history(&history_events);
             }
@@ -240,6 +259,12 @@ async fn main() -> anyhow::Result<()> {
                                 session_id,
                                 messages: translate_events_to_chat_messages(&events),
                             });
+                        }
+                        Ok(EventMsg::PermissionRequest { request_id, tool_name, args_summary, reason, .. }) => {
+                            let _ = tui_tx.send(AppEvent::PermissionRequest { request_id, tool_name, args_summary, reason });
+                        }
+                        Ok(EventMsg::PermissionResolved { request_id, allowed }) => {
+                            let _ = tui_tx.send(AppEvent::PermissionResolved { request_id, allowed });
                         }
                         _ => {}
                     }
@@ -357,6 +382,18 @@ async fn main() -> anyhow::Result<()> {
                                     recoverable: true,
                                 });
                             }
+                        }
+                        TuiCommand::PermissionResponse { request_id, allowed, remember } => {
+                            // Map the TUI decision to a PermissionResponse variant.
+                            let resp = match (allowed, remember) {
+                                (true, false) => PermissionResponse::Allow,
+                                (true, true) => PermissionResponse::AllowAlways,
+                                (false, false) => PermissionResponse::Deny,
+                                (false, true) => PermissionResponse::DenyAlways,
+                            };
+                            let _ = perm_tx.send(resp);
+                            // Mark the request as resolved for TUI display.
+                            let _ = event_tx.send(EventMsg::PermissionResolved { request_id, allowed });
                         }
                     }
                 }

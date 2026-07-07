@@ -9,6 +9,7 @@ use drift_llm::{
     fetch_anthropic_models, fetch_openai_compat_models,
 };
 use drift_tools::{ToolContext, ToolRegistry};
+use drift_security::{PermissionEngine, PermissionDecision, SecurityConfig};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -31,6 +32,10 @@ pub struct Agent {
     config: AppConfig,
     llm: Box<dyn LlmProvider>,
     tool_registry: ToolRegistry,
+    /// Permission engine for tool call approval.
+    permission_engine: PermissionEngine,
+    /// Channel the bridge task writes user permission responses into.
+    permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>>,
     event_tx: broadcast::Sender<EventMsg>,
     messages: Vec<LlmMessage>,
     cwd: PathBuf,
@@ -39,20 +44,26 @@ pub struct Agent {
 }
 
 impl Agent {
-    // Create a new agent: builds the LLM provider and tool registry, opens a broadcast channel.
+    // Create a new agent: builds the LLM provider, tool registry, and permission engine.
     pub fn new(
         config: AppConfig,
         cwd: PathBuf,
         tool_registry: ToolRegistry,
         session_id: uuid::Uuid,
         session_store: std::sync::Arc<drift_storage::SessionStore>,
+        security_config: &SecurityConfig,
+        security_profile: &str,
     ) -> Result<Self, LlmError> {
         let llm = create_provider(config.active_llm_config().unwrap())?;
         let (event_tx, _) = broadcast::channel(256);
+        let permission_engine = PermissionEngine::new(security_config, security_profile);
 
         info!(
             provider = %llm.provider_id(),
             model = %llm.model_name(),
+            security_profile = permission_engine.profile_name(),
+            approval_policy = ?permission_engine.approval_policy(),
+            sandbox_mode = ?permission_engine.sandbox_mode(),
             "Agent created"
         );
 
@@ -65,9 +76,17 @@ impl Agent {
             cwd,
             session_id,
             session_store,
+            permission_engine,
+            permission_rx: None,
         })
     }
 
+
+
+    // Set up the channel through which the TUI bridge sends permission responses back to the agent loop.
+    pub fn set_permission_channel(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>) {
+        self.permission_rx = Some(rx);
+    }
 
     // Set the full conversation history from a reconstructed LlmMessage list (used when resuming a session).
     pub fn set_messages(&mut self, messages: Vec<LlmMessage>) {
@@ -422,7 +441,139 @@ impl Agent {
                     tool_call_id: tc.id.clone(),
                 };
 
-                let result = self.tool_registry.execute(&tc.name, args, &ctx).await;
+                // ── Permission check ──
+                let permission_decision = self.permission_engine.check_tool_permission(&tc.name, &args);
+                let result: Result<drift_tools::ToolResult, drift_tools::ToolError> = match permission_decision {
+                    PermissionDecision::Allowed { .. } => {
+                        // Proceed to execute
+                        self.tool_registry.execute(&tc.name, args, &ctx).await
+                    }
+                    PermissionDecision::Denied { reason } => {
+                        let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                        });
+                        let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            success: false,
+                            error: Some(reason.clone()),
+                        });
+                        Err(drift_tools::ToolError::PermissionDenied(reason))
+                    }
+                    PermissionDecision::AskUser { request } => {
+                        // Send permission request to TUI
+                        let _ = self.event_tx.send(EventMsg::PermissionRequest {
+                            request_id: request.request_id.clone(),
+                            tool_name: request.tool_name.clone(),
+                            args_summary: request.args_summary.clone(),
+                            reason: request.reason.clone(),
+                            risk_level: format!("{:?}", request.risk_level),
+                        });
+
+                        // Wait for user response
+                        let response = match &mut self.permission_rx {
+                            Some(rx) => {
+                                tokio::select! {
+                                    resp = rx.recv() => resp,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => None,
+                                }
+                            }
+                            None => {
+                                // No channel configured — deny by default
+                                tracing::warn!("Permission channel not set, denying tool call by default");
+                                None
+                            }
+                        };
+
+                        match response {
+                            Some(drift_security::PermissionResponse::Allow) => {
+                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                    request_id: request.request_id,
+                                    allowed: true,
+                                });
+                                self.tool_registry.execute(&tc.name, args, &ctx).await
+                            }
+                            Some(drift_security::PermissionResponse::AllowAlways) => {
+                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                    request_id: request.request_id,
+                                    allowed: true,
+                                });
+                                // Record session-persistent allow rule
+                                let pattern = drift_security::DoomLoopTracker::fingerprint(&tc.name, &args);
+                                self.permission_engine.add_session_rule(
+                                    &tc.name,
+                                    &pattern,
+                                    drift_security::types::PermissionAction::Allow,
+                                );
+                                self.tool_registry.execute(&tc.name, args, &ctx).await
+                            }
+                            Some(drift_security::PermissionResponse::Deny) => {
+                                let reason = "User denied permission".to_string();
+                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                    request_id: request.request_id,
+                                    allowed: false,
+                                });
+                                let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                });
+                                let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    success: false,
+                                    error: Some(reason.clone()),
+                                });
+                                Err(drift_tools::ToolError::PermissionDenied(reason))
+                            }
+                            Some(drift_security::PermissionResponse::DenyAlways) => {
+                                let reason = "User denied permission".to_string();
+                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                    request_id: request.request_id,
+                                    allowed: false,
+                                });
+                                // Record session-persistent deny rule
+                                let pattern = drift_security::DoomLoopTracker::fingerprint(&tc.name, &args);
+                                self.permission_engine.add_session_rule(
+                                    &tc.name,
+                                    &pattern,
+                                    drift_security::types::PermissionAction::Deny,
+                                );
+                                let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                });
+                                let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    success: false,
+                                    error: Some(reason.clone()),
+                                });
+                                Err(drift_tools::ToolError::PermissionDenied(reason))
+                            }
+                            None => {
+                                // Timeout or no response — deny
+                                let reason = "Permission request timed out".to_string();
+                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                    request_id: request.request_id,
+                                    allowed: false,
+                                });
+                                let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                });
+                                let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    success: false,
+                                    error: Some(reason.clone()),
+                                });
+                                Err(drift_tools::ToolError::PermissionDenied(reason))
+                            }
+                        }
+                    }
+                };
+
 
                 match result {
                     Ok(r) => {
@@ -456,7 +607,7 @@ impl Agent {
                                 call_id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 success: r.success,
-                                content: r.content,
+                                content: drift_security::SensitiveDataFilter::filter(&r.content),
                                 error: r.error,
                             },
                         );
@@ -482,8 +633,8 @@ impl Agent {
                                 call_id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 success: false,
-                                content: String::new(),
                                 error: Some(err_str),
+                                content: String::new(), // No content for permission-denied errors
                             },
                         );
                     }

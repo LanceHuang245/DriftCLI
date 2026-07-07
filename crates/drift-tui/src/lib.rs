@@ -82,6 +82,18 @@ pub enum AppEvent {
         session_id: uuid::Uuid,
         messages: Vec<ChatMessage>,
     },
+    // Permission system: agent asks for user approval before executing a tool.
+    PermissionRequest {
+        request_id: String,
+        tool_name: String,
+        args_summary: String,
+        reason: String,
+    },
+    // Permission was granted or denied.
+    PermissionResolved {
+        request_id: String,
+        allowed: bool,
+    },
 }
 
 // Commands sent from the TUI to the backend (chat, fetch models, reconfigure, provider management).
@@ -94,6 +106,13 @@ pub enum TuiCommand {
         api_key: String,
     },
     Reconfigure(LlmConfig),
+    // User response to a permission request.
+    PermissionResponse {
+        request_id: String,
+        allowed: bool,
+        /// Whether to persist this decision for the rest of the session.
+        remember: bool,
+    },
     // Save or update a named provider configuration.
     SaveProvider {
         name: String,
@@ -111,6 +130,17 @@ pub enum TuiCommand {
     GetSessions,
     // Switch to a different historical session by UUID.
     SwitchSession(uuid::Uuid),
+}
+
+
+/// Pending permission prompt — blocks normal input until the user responds.
+#[derive(Debug, Clone)]
+struct PermissionPromptState {
+    request_id: String,
+    tool_name: String,
+    args_summary: String,
+    reason: String,
+    risk_level: String,
 }
 
 struct SlashCompletionState {
@@ -164,6 +194,8 @@ pub struct TuiApp {
     selection: SelectionState,
     slash_completion: Option<SlashCompletionState>,
     chat_area: ratatui::layout::Rect,
+    /// Active permission prompt — when set, normal input is blocked until resolved.
+    permission_prompt: Option<PermissionPromptState>,
 }
 
 // Which screen/overlay the TUI is currently displaying.
@@ -237,6 +269,7 @@ impl TuiApp {
             selection: SelectionState::new(),
             slash_completion: None,
             chat_area: ratatui::layout::Rect::new(0, 0, 80, 24),
+            permission_prompt: None,
         }
     }
 
@@ -277,7 +310,31 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(16))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // ── Permission prompt interceptor ──
+                        // Permission prompt interceptor — only y/Y/n/N keys accepted
+                        if let Some(prompt) = self.permission_prompt.as_ref() {
+                            let request_id = prompt.request_id.clone();
+                            let (allowed, remember) = match key.code {
+                                KeyCode::Char('y') => (true, false),
+                                KeyCode::Char('Y') => (true, true),
+                                KeyCode::Char('n') => (false, false),
+                                KeyCode::Char('N') => (false, true),
+                                _ => {
+                                    continue; // Ignore other keys
+                                }
+                            };
+                            self.permission_prompt = None;
+                            let _ = self.cmd_tx.send(TuiCommand::PermissionResponse {
+                                request_id,
+                                allowed,
+                                remember,
+                            });
+                            continue;
+                        }
+                        // ── End permission interceptor ──
+
                         match self.mode {
+
                             TuiMode::Normal => {
                                 // Slash completion popup key intercept
                                 let mut popup_handled = false;
@@ -1010,9 +1067,37 @@ impl TuiApp {
                 self.status_text = format!("Loaded session {}", &session_id.to_string()[..8]);
                 self.mode = TuiMode::Normal;
             }
+            AppEvent::PermissionRequest { request_id, tool_name, args_summary, reason, .. } => {
+                // Set the interactive permission prompt — blocks normal input until resolved.
+                self.permission_prompt = Some(PermissionPromptState {
+                    request_id,
+                    tool_name,
+                    args_summary,
+                    reason,
+                    risk_level: "medium".into(),
+                });
+                // Also push a system message so it appears in the chat transcript.
+                let msg = format!(
+                    "⚠ Permission needed: `{}` with args `{}`\nReason: {}",
+                    self.permission_prompt.as_ref().unwrap().tool_name,
+                    self.permission_prompt.as_ref().unwrap().args_summary,
+                    self.permission_prompt.as_ref().unwrap().reason,
+                );
+                self.messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: msg,
+                    reasoning: None,
+                    thinking: false,
+                    reasoning_duration_ms: None,
+                    reasoning_collapsed: false,
+                    thinking_tools: Vec::new(),
+                });
+            }
+            AppEvent::PermissionResolved { .. } => {
+                // For now, resolved notifications are logged but not displayed distinctly
+            }
         }
     }
-
     // Save the current in-progress response as a complete message and clear for the next turn.
     fn commit_current_response(&mut self, is_thinking: bool) {
         if !self.current_response.is_empty() || !self.current_reasoning.is_empty() {
@@ -1130,8 +1215,14 @@ impl TuiApp {
 
         // Render the input line widget with a top border.
         let input_line = Line::from(input_spans);
-        let input_widget = Paragraph::new(input_line).block(Block::default().borders(Borders::TOP));
-        f.render_widget(input_widget, input_area);
+        // Permission dialog replaces the input line when a prompt is active.
+        if let Some(prompt) = &self.permission_prompt {
+            let dialog = self.render_permission_dialog(prompt);
+            f.render_widget(dialog, input_area);
+        } else {
+            let input_widget = Paragraph::new(input_line).block(Block::default().borders(Borders::TOP));
+            f.render_widget(input_widget, input_area);
+        }
 
         // Calculate cursor position accounting for unicode width and prompt prefix.
         let before_cursor = &self.input_buffer[..self.cursor_position.min(self.input_buffer.len())];
@@ -1930,6 +2021,43 @@ impl TuiApp {
             .borders(Borders::ALL)
             .title(" Commands ")
             .border_style(Style::default().fg(Color::Cyan));
+        Paragraph::new(lines).block(block)
+    }
+
+    // Render the permission prompt dialog in place of the input line.
+    fn render_permission_dialog(&self, prompt: &PermissionPromptState) -> Paragraph<'_> {
+        let risk_color = match prompt.risk_level.as_str() {
+            "Critical" => Color::Red,
+            "High" => Color::LightRed,
+            "Medium" => Color::Yellow,
+            _ => Color::White,
+        };
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  Permission Required — {}", prompt.tool_name),
+            Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", prompt.args_summary),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  Reason: {}", prompt.reason),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  Risk:   {}", prompt.risk_level),
+            Style::default().fg(risk_color),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  [y] Allow once    [Y] Always allow    [n] Deny once    [N] Always deny",
+            Style::default().fg(Color::Cyan),
+        )));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Permission ")
+            .border_style(Style::default().fg(Color::Yellow));
         Paragraph::new(lines).block(block)
     }
 }

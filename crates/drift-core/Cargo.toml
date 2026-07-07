@@ -9,6 +9,7 @@ drift-storage = { path = "../drift-storage" }
 drift-config = { path = "../drift-config" }
 drift-llm = { path = "../drift-llm" }
 drift-tools = { path = "../drift-tools" }
+drift-security = { path = "../drift-security" }
 tokio = { workspace = true, features = ["sync", "macros"] }
 serde.workspace = true
 serde_json.workspace = true

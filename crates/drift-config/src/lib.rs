@@ -13,6 +13,9 @@ pub struct ProviderEntry {
 }
 
 // AppConfig: top-level configuration combining agent behaviour, active provider, and a named provider map.
+// Re-export security config for convenience
+pub use drift_security::SecurityConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub agent: AgentConfig,
@@ -20,6 +23,9 @@ pub struct AppConfig {
     pub active_provider: String,
     #[serde(default)]
     pub providers: HashMap<String, ProviderEntry>,
+    /// Security / permission configuration
+    #[serde(default)]
+    pub security: SecurityConfig,
     // Legacy migration marker
     #[serde(skip)]
     #[allow(dead_code)]
@@ -236,6 +242,7 @@ impl AppConfig {
             },
             active_provider: default_name,
             providers,
+            security: SecurityConfig::default(),
             migrated: false,
         };
 
@@ -623,6 +630,7 @@ mod tests {
             },
             active_provider: "test".into(),
             providers,
+            security: SecurityConfig::default(),
             migrated: false,
         };
         let summary = config.connection_summary();

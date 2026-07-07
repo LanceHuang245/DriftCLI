@@ -11,3 +11,4 @@ toml.workspace = true
 directories.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+drift-security = { path = "../drift-security" }

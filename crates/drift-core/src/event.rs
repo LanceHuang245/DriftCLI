@@ -74,6 +74,20 @@ pub enum EventMsg {
         success: bool,
         error: Option<String>,
     },
+    // Permission request sent when the PermissionEngine decides to Ask the user.
+    // The TUI should display a dialog and send a PermissionResponse back via the mpsc channel.
+    PermissionRequest {
+        request_id: String,
+        tool_name: String,
+        args_summary: String,
+        reason: String,
+        risk_level: String,
+    },
+    // Permission granted/denied by the user (notified after the decision, for auditing).
+    PermissionResolved {
+        request_id: String,
+        allowed: bool,
+    },
     // Sent to the TUI to broadcast all historical session metadata.
     SessionList(Vec<drift_storage::SessionMeta>),
     // Sent to the TUI when a specific session has been reconstructed.
