@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------- Core Config ----------
 
@@ -30,6 +30,12 @@ pub struct AppConfig {
     #[serde(skip)]
     #[allow(dead_code)]
     migrated: bool,
+}
+
+// Wrapper used to serialize the security configuration under the [security] TOML table.
+#[derive(Serialize)]
+struct SecurityConfigWrapper<'a> {
+    security: &'a SecurityConfig,
 }
 
 // AgentConfig: tunable parameters for the agent's behaviour — model, iteration cap, temperature, thinking budget.
@@ -102,6 +108,12 @@ pub enum ConfigError {
     NoLlmProvider,
     #[error("API key not set for provider. Set api_key in config or DRIFT_API_KEY env var.")]
     MissingApiKey,
+    #[error("Invalid permission mode '{0}'. Expected ask, allow, or deny.")]
+    InvalidPermissionMode(String),
+    #[error("Security profile not found: {0}")]
+    UnknownSecurityProfile(String),
+    #[error("Failed to serialize config: {0}")]
+    Serialize(#[from] toml::ser::Error),
 }
 
 impl AppConfig {
@@ -109,6 +121,23 @@ impl AppConfig {
     /// Load config with merge: CLI args > env vars > .drift/config.toml > ~/.config/drift/config.toml > defaults
     pub fn load(cli_model: Option<&str>, cli_api_key: Option<&str>) -> Result<Self, ConfigError> {
         let mut config = Self::load_defaults_with_files()?;
+        config.apply_env_overrides();
+        config.apply_cli_overrides(cli_model, cli_api_key);
+        Ok(config)
+    }
+
+    // Load configuration with project and explicit-file layers before env and CLI overrides.
+    pub fn load_for_workspace(
+        cwd: &Path,
+        explicit_config: Option<&Path>,
+        cli_model: Option<&str>,
+        cli_api_key: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let mut config = Self::load_defaults_with_files()?;
+        config.apply_project_override(cwd)?;
+        if let Some(path) = explicit_config {
+            config = Self::merge_toml_file(config, path)?;
+        }
         config.apply_env_overrides();
         config.apply_cli_overrides(cli_model, cli_api_key);
         Ok(config)
@@ -129,7 +158,7 @@ impl AppConfig {
 
     // Creates the project-level .drift/ directory and writes a default config template.
     /// Init project-level config
-    pub fn init_project(cwd: &PathBuf) -> Result<PathBuf, ConfigError> {
+    pub fn init_project(cwd: &Path) -> Result<PathBuf, ConfigError> {
         let dir = cwd.join(".drift");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("config.toml");
@@ -155,7 +184,7 @@ impl AppConfig {
 
     // Returns the path to the project-level .drift/config.toml file.
     /// Project config file path
-    pub fn project_config_path(cwd: &PathBuf) -> PathBuf {
+    pub fn project_config_path(cwd: &Path) -> PathBuf {
         cwd.join(".drift").join("config.toml")
     }
 
@@ -216,6 +245,27 @@ impl AppConfig {
         Ok(())
     }
 
+    // Override the selected security profile's approval policy from the CLI.
+    pub fn apply_permission_mode(
+        &mut self,
+        profile_name: &str,
+        mode: &str,
+    ) -> Result<(), ConfigError> {
+        let policy = match mode.to_ascii_lowercase().as_str() {
+            "ask" => drift_security::ApprovalPolicy::OnRequest,
+            "allow" => drift_security::ApprovalPolicy::Never,
+            "deny" => drift_security::ApprovalPolicy::Deny,
+            _ => return Err(ConfigError::InvalidPermissionMode(mode.to_string())),
+        };
+        let profile = self
+            .security
+            .profiles
+            .get_mut(profile_name)
+            .ok_or_else(|| ConfigError::UnknownSecurityProfile(profile_name.to_string()))?;
+        profile.approval_policy = policy;
+        Ok(())
+    }
+
     // Builds a config starting from hardcoded defaults, then merges global config on top.
     fn load_defaults_with_files() -> Result<Self, ConfigError> {
         let mut providers = HashMap::new();
@@ -247,10 +297,10 @@ impl AppConfig {
         };
 
         // Layer 1: global config
-        if let Some(global_path) = Self::global_config_path() {
-            if global_path.exists() {
-                config = Self::merge_toml_file(config, &global_path)?;
-            }
+        if let Some(global_path) = Self::global_config_path()
+            && global_path.exists()
+        {
+            config = Self::merge_toml_file(config, &global_path)?;
         }
 
         // Layer 2: project config (overrides global)
@@ -260,24 +310,24 @@ impl AppConfig {
 
     // Merges a project-level .drift/config.toml on top of the currently loaded config.
     /// Apply project-level config override (call after determining workspace)
-    pub fn apply_project_override(&mut self, cwd: &PathBuf) -> Result<(), ConfigError> {
+    pub fn apply_project_override(&mut self, cwd: &Path) -> Result<(), ConfigError> {
         let project_path = Self::project_config_path(cwd);
         if project_path.exists() {
             let partial: toml::Value = toml::from_str(&std::fs::read_to_string(&project_path)?)?;
-            Self::merge_toml_value(self, &partial);
+            Self::merge_toml_value(self, &partial)?;
         }
         Ok(())
     }
 
     // Overrides API key and model from DRIFT_API_KEY / DRIFT_MODEL environment variables.
     fn apply_env_overrides(&mut self) {
-        if let Ok(key) = std::env::var("DRIFT_API_KEY") {
-            if let Some(config) = self.active_llm_config_mut() {
-                match config {
-                    LlmConfig::Anthropic { api_key, .. }
-                    | LlmConfig::OpenAiCompatible { api_key, .. } => {
-                        *api_key = key;
-                    }
+        if let Ok(key) = std::env::var("DRIFT_API_KEY")
+            && let Some(config) = self.active_llm_config_mut()
+        {
+            match config {
+                LlmConfig::Anthropic { api_key, .. }
+                | LlmConfig::OpenAiCompatible { api_key, .. } => {
+                    *api_key = key;
                 }
             }
         }
@@ -291,28 +341,28 @@ impl AppConfig {
         if let Some(m) = cli_model {
             self.agent.model = m.to_string();
         }
-        if let Some(k) = cli_api_key {
-            if let Some(config) = self.active_llm_config_mut() {
-                match config {
-                    LlmConfig::Anthropic { api_key, .. }
-                    | LlmConfig::OpenAiCompatible { api_key, .. } => {
-                        *api_key = k.to_string();
-                    }
+        if let Some(k) = cli_api_key
+            && let Some(config) = self.active_llm_config_mut()
+        {
+            match config {
+                LlmConfig::Anthropic { api_key, .. }
+                | LlmConfig::OpenAiCompatible { api_key, .. } => {
+                    *api_key = k.to_string();
                 }
             }
         }
     }
 
     // Reads a TOML file and merges its contents into a base config via merge_toml_value.
-    fn merge_toml_file(mut base: Self, path: &PathBuf) -> Result<Self, ConfigError> {
+    fn merge_toml_file(mut base: Self, path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let overlay: toml::Value = toml::from_str(&content)?;
-        Self::merge_toml_value(&mut base, &overlay);
+        Self::merge_toml_value(&mut base, &overlay)?;
         Ok(base)
     }
 
     // Merges a TOML value overlay into an AppConfig: selectively overwrites agent, providers, and active_provider fields.
-    fn merge_toml_value(config: &mut Self, overlay: &toml::Value) {
+    fn merge_toml_value(config: &mut Self, overlay: &toml::Value) -> Result<(), ConfigError> {
         // Merge [agent] section
         if let Some(agent) = overlay.get("agent") {
             if let Some(m) = agent.get("model").and_then(|v| v.as_str()) {
@@ -406,9 +456,10 @@ impl AppConfig {
         }
 
         // Backward compat: handle old [llm] format
-        if let Some(llm) = overlay.get("llm") {
-            if config.providers.is_empty() {
-                if let Some(provider) = llm.get("provider").and_then(|v| v.as_str()) {
+        if let Some(llm) = overlay.get("llm")
+            && config.providers.is_empty()
+            && let Some(provider) = llm.get("provider").and_then(|v| v.as_str())
+        {
                     let config_llm = match provider {
                         "anthropic" => Some(LlmConfig::Anthropic {
                             api_key: llm
@@ -469,14 +520,54 @@ impl AppConfig {
                             config.active_provider = name;
                         }
                     }
+        }
+
+        // Merge security settings, profiles, and network domain restrictions.
+        if let Some(security) = overlay.get("security").and_then(|v| v.as_table()) {
+            if let Some(default_profile) = security
+                .get("default_profile")
+                .and_then(|v| v.as_str())
+            {
+                config.security.default_profile = default_profile.to_string();
+            }
+            if let Some(enabled) = security.get("enabled").and_then(|v| v.as_bool()) {
+                config.security.enabled = enabled;
+            }
+            if let Some(allowed_domains) = security.get("allowed_domains").and_then(|v| v.as_array()) {
+                config.security.allowed_domains = allowed_domains
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+            if let Some(blocked_domains) = security.get("blocked_domains").and_then(|v| v.as_array()) {
+                config.security.blocked_domains = blocked_domains
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+            if let Some(profiles) = security.get("profiles").and_then(|v| v.as_table()) {
+                for (name, value) in profiles {
+                    let mut profile_value = value.clone();
+                    if let Some(table) = profile_value.as_table_mut() {
+                        table.insert("name".into(), toml::Value::String(name.clone()));
+                    }
+                    let profile: drift_security::SecurityProfile = profile_value.try_into()?;
+                    config.security.profiles.insert(name.clone(), profile);
                 }
             }
         }
+
+        Ok(())
     }
 
     // Returns a default TOML config template string used for initializing new config files.
     fn default_template() -> String {
-        r###"# DriftCLI Configuration
+        let security = toml::to_string(&SecurityConfigWrapper {
+            security: &SecurityConfig::default(),
+        })
+        .unwrap_or_default();
+        format!(
+            r###"# DriftCLI Configuration
 active_provider = "default"
 
 [agent]
@@ -489,8 +580,9 @@ provider = "anthropic"
 model = "claude-sonnet-4-5-20250101"
 api_key = ""
 base_url = "https://api.anthropic.com/v1"
-"###
-        .to_string()
+{}"###,
+            security
+        )
     }
 
     // Builds a display string summarizing the active provider, model, endpoint, and masked API key.
@@ -539,17 +631,17 @@ base_url = "https://api.anthropic.com/v1"
 
     // Serializes the current config and writes it to .drift/config.toml in the given project directory.
     /// Write the current config to the project .drift/config.toml
-    pub fn save_to_project(&self, cwd: &std::path::PathBuf) -> Result<(), ConfigError> {
+    pub fn save_to_project(&self, cwd: &Path) -> Result<(), ConfigError> {
         let dir = cwd.join(".drift");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("config.toml");
-        let toml_str = self.to_toml_string();
+        let toml_str = self.to_toml_string()?;
         std::fs::write(&path, toml_str)?;
         Ok(())
     }
 
     // Converts the current AppConfig into a human-readable TOML string with inline comments.
-    fn to_toml_string(&self) -> String {
+    fn to_toml_string(&self) -> Result<String, ConfigError> {
         let mut providers_str = String::new();
         for entry in self.providers.values() {
             let name = &entry.name;
@@ -586,10 +678,13 @@ base_url = "https://api.anthropic.com/v1"
                 name, inner
             ));
         }
-        format!(
+        let security = toml::to_string(&SecurityConfigWrapper {
+            security: &self.security,
+        })?;
+        Ok(format!(
             "# DriftCLI Configuration\n\nactive_provider = \"{}\"\n\n[agent]\nmodel = \"{}\"\nmax_iterations = {}\n\n{}",
             self.active_provider, self.agent.model, self.agent.max_iterations, providers_str,
-        )
+        ) + &security)
     }
 }
 
@@ -603,6 +698,7 @@ mod tests {
         assert!(tmpl.contains("[agent]"));
         assert!(tmpl.contains("[[providers]]"));
         assert!(tmpl.contains("active_provider"));
+        toml::from_str::<toml::Value>(&tmpl).expect("default template must be valid TOML");
     }
 
     #[test]
@@ -636,5 +732,60 @@ mod tests {
         let summary = config.connection_summary();
         assert!(summary.contains("Anthropic"));
         assert!(summary.contains("sk-a...1234"));
+    }
+
+    #[test]
+    fn test_security_config_merge_and_save() {
+        let mut config = AppConfig {
+            agent: AgentConfig {
+                model: default_model(),
+                max_iterations: 50,
+                temperature: None,
+                thinking_budget: None,
+                reasoning_effort: None,
+            },
+            active_provider: String::new(),
+            providers: HashMap::new(),
+            security: SecurityConfig::default(),
+            migrated: false,
+        };
+        let overlay: toml::Value = toml::from_str(
+            r#"
+[security]
+enabled = false
+default_profile = "audit"
+allowed_domains = ["example.com"]
+blocked_domains = ["blocked.example.com"]
+
+[security.profiles.audit]
+approval_policy = "deny"
+sandbox_mode = "read-only"
+"#,
+        )
+        .unwrap();
+
+        AppConfig::merge_toml_value(&mut config, &overlay).unwrap();
+        assert!(!config.security.enabled);
+        assert_eq!(config.security.default_profile, "audit");
+        assert_eq!(config.security.allowed_domains, vec!["example.com"]);
+        assert_eq!(config.security.blocked_domains, vec!["blocked.example.com"]);
+        assert_eq!(
+            config.security.profiles["audit"].approval_policy,
+            drift_security::ApprovalPolicy::Deny
+        );
+
+        config.apply_permission_mode("audit", "allow").unwrap();
+        assert_eq!(
+            config.security.profiles["audit"].approval_policy,
+            drift_security::ApprovalPolicy::Never
+        );
+
+        let serialized = config.to_toml_string().unwrap();
+        let value: toml::Value = toml::from_str(&serialized).unwrap();
+        assert_eq!(value["security"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            value["security"]["profiles"]["audit"]["approval_policy"].as_str(),
+            Some("never")
+        );
     }
 }
