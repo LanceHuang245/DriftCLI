@@ -12,6 +12,7 @@ use drift_tools::{
 use drift_security::types::PermissionResponse;
 use drift_tui::{AppEvent, TuiApp, TuiCommand, ChatMessage};
 use std::env;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -32,8 +33,8 @@ struct Cli {
     /// Security profile: "default", "auto", "readonly", "danger"
     #[arg(long = "security-profile", short = 'P')]
     security_profile: Option<String>,
-    #[arg(long, default_value = "ask")]
-    permission_mode: String,
+    #[arg(long, value_name = "MODE")]
+    permission_mode: Option<String>,
     #[arg(long, default_value = "info")]
     log_level: String,
     #[arg(long)]
@@ -120,16 +121,27 @@ async fn main() -> anyhow::Result<()> {
         }
         // `drift config` — load config and print the current connection summary.
         Some(Command::Config) => {
-            let config = AppConfig::load(cli.model.as_deref(), cli.api_key.as_deref())?;
+            let cwd = env::current_dir()?;
+            let explicit_config = cli.config.as_deref().map(Path::new);
+            let config = AppConfig::load_for_workspace(
+                &cwd,
+                explicit_config,
+                cli.model.as_deref(),
+                cli.api_key.as_deref(),
+            )?;
             println!("{}", config.connection_summary());
             return Ok(());
         }
         // Default: interactive mode — load config, start the agent, bridge events to the TUI, and run.
         None => {
-            let mut config = AppConfig::load(cli.model.as_deref(), cli.api_key.as_deref())?;
-
             let cwd = env::current_dir()?;
-            let _ = config.apply_project_override(&cwd);
+            let explicit_config = cli.config.as_deref().map(Path::new);
+            let mut config = AppConfig::load_for_workspace(
+                &cwd,
+                explicit_config,
+                cli.model.as_deref(),
+                cli.api_key.as_deref(),
+            )?;
 
             let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
 
@@ -166,9 +178,16 @@ async fn main() -> anyhow::Result<()> {
                 (new_id, Vec::new())
             };
 
-            let security_cfg = config.security.clone();
             // Use CLI flag profile if set; otherwise default
-            let profile_name = cli.security_profile.as_deref().unwrap_or(&security_cfg.default_profile);
+            let profile_name = cli
+                .security_profile
+                .as_deref()
+                .unwrap_or(&config.security.default_profile)
+                .to_string();
+            if let Some(mode) = cli.permission_mode.as_deref() {
+                config.apply_permission_mode(&profile_name, mode)?;
+            }
+            let security_cfg = config.security.clone();
             let mut agent = Agent::new(
                 config.clone(),
                 cwd.clone(),
@@ -176,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 session_id,
                 session_store.clone(),
                 &security_cfg,
-                profile_name,
+                &profile_name,
             )?;
 
             // Set up permission response channel (TUI → Agent)
@@ -191,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
 
             let (tui_tx, tui_rx) = mpsc::unbounded_channel();
             let mut core_rx = agent.subscribe();
+            let agent = Arc::new(tokio::sync::Mutex::new(agent));
             // Event bridge task: subscribes to core Agent events and forwards them to the TUI via an mpsc channel.
             tokio::spawn(async move {
                 loop {
@@ -221,6 +241,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Ok(EventMsg::Done) => {
                             let _ = tui_tx.send(AppEvent::Done);
+                        }
+                        Ok(EventMsg::Interrupted) => {
+                            let _ = tui_tx.send(AppEvent::Interrupted);
                         }
                         Ok(EventMsg::ModelList(models)) => {
                             let _ = tui_tx.send(AppEvent::ModelList(models));
@@ -273,10 +296,38 @@ async fn main() -> anyhow::Result<()> {
 
             // Command handling task: receives TUI commands (chat, fetch models, reconfigure, provider management) and dispatches to the agent.
             tokio::spawn(async move {
+                let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
+
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         TuiCommand::Chat(msg) => {
-                            agent.submit(msg).await;
+                            // A new input replaces an active turn, matching terminal Agent behavior.
+                            if let Some(handle) = active_task.take() {
+                                if handle.is_finished() {
+                                    let _ = handle.await;
+                                } else {
+                                    handle.abort();
+                                    let _ = handle.await;
+                                    let _ = event_tx.send(EventMsg::Interrupted);
+                                }
+                            }
+                            let agent = Arc::clone(&agent);
+                            active_task = Some(tokio::spawn(async move {
+                                let mut agent = agent.lock().await;
+                                agent.submit(msg).await;
+                            }));
+                        }
+                        TuiCommand::Interrupt => {
+                            // Aborting the submit task drops the active LLM/tool future immediately.
+                            if let Some(handle) = active_task.take() {
+                                if !handle.is_finished() {
+                                    handle.abort();
+                                    let _ = handle.await;
+                                    let _ = event_tx.send(EventMsg::Interrupted);
+                                } else {
+                                    let _ = handle.await;
+                                }
+                            }
                         }
                         TuiCommand::FetchModels {
                             provider,
@@ -293,20 +344,30 @@ async fn main() -> anyhow::Result<()> {
                                 });
                             }
                         },
-                        TuiCommand::Reconfigure(config) => match agent.reconfigure(config).await {
-                            Ok(()) => {
-                                let _ = event_tx
-                                    .send(EventMsg::AgentState(drift_core::AgentState::Idle));
+                        TuiCommand::Reconfigure(config) => {
+                            let result = {
+                                let mut agent = agent.lock().await;
+                                agent.reconfigure(config).await
+                            };
+                            match result {
+                                Ok(()) => {
+                                    let _ = event_tx
+                                        .send(EventMsg::AgentState(drift_core::AgentState::Idle));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(EventMsg::Error {
+                                        message: format!("Reconfiguration failed: {}", e),
+                                        recoverable: true,
+                                    });
+                                }
                             }
-                            Err(e) => {
-                                let _ = event_tx.send(EventMsg::Error {
-                                    message: format!("Reconfiguration failed: {}", e),
-                                    recoverable: true,
-                                });
-                            }
-                        },
+                        }
                         TuiCommand::SaveProvider { name, config } => {
-                            match agent.save_provider(name, config).await {
+                            let result = {
+                                let mut agent = agent.lock().await;
+                                agent.save_provider(name, config).await
+                            };
+                            match result {
                                 Ok(()) => {
                                     let _ = event_tx
                                         .send(EventMsg::AgentState(drift_core::AgentState::Idle));
@@ -320,7 +381,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         TuiCommand::SetActiveProvider(name) => {
-                            match agent.activate_provider(&name).await {
+                            let result = {
+                                let mut agent = agent.lock().await;
+                                agent.activate_provider(&name).await
+                            };
+                            match result {
                                 Ok(()) => {
                                     let _ = event_tx
                                         .send(EventMsg::AgentState(drift_core::AgentState::Idle));
@@ -334,13 +399,17 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         TuiCommand::GetProviders => {
-                            let names = agent.list_providers();
+                            let names = agent.lock().await.list_providers();
                             let _ = event_tx.send(EventMsg::ProviderList(names));
                         }
                         TuiCommand::DeleteProvider(name) => {
-                            match agent.remove_provider(&name).await {
+                            let result = {
+                                let mut agent = agent.lock().await;
+                                agent.remove_provider(&name).await
+                            };
+                            match result {
                                 Ok(()) => {
-                                    let names = agent.list_providers();
+                                    let names = agent.lock().await.list_providers();
                                     let _ = event_tx.send(EventMsg::ProviderList(names));
                                     let _ = event_tx
                                         .send(EventMsg::AgentState(drift_core::AgentState::Idle));
@@ -354,7 +423,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         TuiCommand::GetProviderConfig(name) => {
-                            match agent.get_provider_config(&name) {
+                            match agent.lock().await.get_provider_config(&name) {
                                 Some(config) => {
                                     let _ =
                                         event_tx.send(EventMsg::ProviderConfig { name, config });
@@ -374,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         TuiCommand::SwitchSession(target_id) => {
                             if let Ok(events) = session_store.read_events(target_id) {
-                                agent.reconstruct_history(&events);
+                                agent.lock().await.switch_session(target_id, &events);
                                 let _ = event_tx.send(EventMsg::SessionLoaded { session_id: target_id, events });
                             } else {
                                 let _ = event_tx.send(EventMsg::Error {
@@ -396,6 +465,11 @@ async fn main() -> anyhow::Result<()> {
                             let _ = event_tx.send(EventMsg::PermissionResolved { request_id, allowed });
                         }
                     }
+                }
+
+                if let Some(handle) = active_task {
+                    handle.abort();
+                    let _ = handle.await;
                 }
             });
 

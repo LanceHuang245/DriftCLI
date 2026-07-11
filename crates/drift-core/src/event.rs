@@ -34,6 +34,8 @@ pub enum EventMsg {
     },
     // Agent finished processing for the current turn; TUI can accept new input.
     Done,
+    // The current Agent turn was cancelled by the user.
+    Interrupted,
     // Retrieved list of available model IDs from the provider's API.
     ModelList(Vec<ModelInfo>),
     // List of configured provider names for the /provider picker.

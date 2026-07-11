@@ -116,16 +116,15 @@ impl SessionStore {
         for entry in std::fs::read_dir(&self.sessions_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "jsonl") {
+            if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
             // Read first line for metadata
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Some(line) = content.lines().next() {
-                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
-                        sessions.push(meta);
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Some(line) = content.lines().next()
+                && let Ok(meta) = serde_json::from_str::<SessionMeta>(line)
+            {
+                sessions.push(meta);
             }
         }
 

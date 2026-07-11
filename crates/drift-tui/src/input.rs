@@ -1,9 +1,10 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
-// Actions produced by input processing: submit text, quit the TUI, or toggle connect info overlay.
+// Actions produced by input processing: submit text, interrupt work, quit the TUI, or toggle connect info overlay.
 #[derive(Debug, Clone)]
 pub enum InputAction {
     Submit(String),
+    Interrupt,
     Quit,
     ToggleConnectInfo,
 }
@@ -86,7 +87,7 @@ pub fn process_key(
             *cursor = input_buffer.len();
             InputAction::Submit(String::new())
         }
-        // Ctrl+C sends an interrupt / quit signal.
+        // Ctrl+C is handled by the TUI loop so it can require a second press before quitting.
         KeyCode::Char(ch) if modifiers == KeyModifiers::CONTROL && ch == 'c' => InputAction::Quit,
         // Ctrl+D quits if the buffer is empty, otherwise deletes at cursor.
         KeyCode::Char(ch) if modifiers == KeyModifiers::CONTROL && ch == 'd' => {
@@ -105,8 +106,8 @@ pub fn process_key(
             *cursor += ch.len_utf8();
             InputAction::Submit(String::new())
         }
-        // Escape key quits the application.
-        KeyCode::Esc => InputAction::Quit,
+        // Escape interrupts the active Agent turn.
+        KeyCode::Esc => InputAction::Interrupt,
         // Ignore unrecognized keys.
         _ => InputAction::Submit(String::new()),
     }

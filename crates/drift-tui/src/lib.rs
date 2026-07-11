@@ -39,6 +39,7 @@ pub enum AppEvent {
     AgentStatus(String),
     Error(String),
     Done,
+    Interrupted,
     ModelList(Vec<ModelInfo>),
     ProviderList(Vec<String>),
     ProviderSwitched {
@@ -100,6 +101,7 @@ pub enum AppEvent {
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
     Chat(String),
+    Interrupt,
     FetchModels {
         provider: String,
         base_url: String,
@@ -196,6 +198,8 @@ pub struct TuiApp {
     chat_area: ratatui::layout::Rect,
     /// Active permission prompt — when set, normal input is blocked until resolved.
     permission_prompt: Option<PermissionPromptState>,
+    /// Whether Ctrl+C has been pressed once and is waiting for confirmation.
+    quit_confirmation_pending: bool,
 }
 
 // Which screen/overlay the TUI is currently displaying.
@@ -270,6 +274,7 @@ impl TuiApp {
             slash_completion: None,
             chat_area: ratatui::layout::Rect::new(0, 0, 80, 24),
             permission_prompt: None,
+            quit_confirmation_pending: false,
         }
     }
 
@@ -310,9 +315,30 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(16))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Require two consecutive Ctrl+C presses before quitting the TUI.
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            if self.quit_confirmation_pending {
+                                self.should_quit = true;
+                            } else {
+                                self.quit_confirmation_pending = true;
+                                self.status_text = "Press Ctrl+C again to exit".into();
+                            }
+                            continue;
+                        }
+                        self.quit_confirmation_pending = false;
                         // ── Permission prompt interceptor ──
                         // Permission prompt interceptor — only y/Y/n/N keys accepted
                         if let Some(prompt) = self.permission_prompt.as_ref() {
+                            if key.code == KeyCode::Esc {
+                                self.permission_prompt = None;
+                                let _ = self.cmd_tx.send(TuiCommand::Interrupt);
+                                self.status_text = "Interrupting...".into();
+                                continue;
+                            }
                             let request_id = prompt.request_id.clone();
                             let (allowed, remember) = match key.code {
                                 KeyCode::Char('y') => (true, false),
@@ -458,6 +484,9 @@ impl TuiApp {
                                                         self.input_buffer.clear();
                                                         self.cursor_position = 0;
                                                     }
+                                                }
+                                                input::InputAction::Interrupt => {
+                                                    let _ = self.cmd_tx.send(TuiCommand::Interrupt);
                                                 }
                                                 input::InputAction::Quit => self.should_quit = true,
                                                 input::InputAction::ToggleConnectInfo => {}
@@ -986,6 +1015,11 @@ impl TuiApp {
             AppEvent::Done => {
                 self.commit_current_response(false);
                 self.status_text = "Idle".into();
+            }
+            // Keep any partial response visible, but return the TUI to an idle state.
+            AppEvent::Interrupted => {
+                self.commit_current_response(true);
+                self.status_text = "Interrupted".into();
             }
             // Received model list — populate the dropdown in connect mode.
             AppEvent::ModelList(models) => {
