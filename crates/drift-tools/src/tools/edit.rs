@@ -1,4 +1,5 @@
 use crate::{Tool, ToolContext, ToolError, ToolResult};
+use std::path::Path;
 
 pub struct EditTool;
 
@@ -40,17 +41,12 @@ impl Tool for EditTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("newString must be a string".into()))?;
 
-        // Resolve path relative to working_dir and canonically verify no escape
-        let resolved = ctx.working_dir.join(file_path_str);
-        let canonical = std::path::absolute(&ctx.working_dir).map_err(ToolError::Io)?;
-        let file_canonical = std::path::absolute(&resolved)
-            .map_err(|e| ToolError::InvalidArgs(format!("invalid file path: {e}")))?;
-
-        if !file_canonical.starts_with(&canonical) {
-            return Err(ToolError::PermissionDenied(
-                "file path escapes the working directory".into(),
-            ));
-        }
+        // Resolve and validate the file through the shared workspace guard.
+        let requested = Path::new(file_path_str);
+        ctx.file_access
+            .check_write(requested)
+            .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+        let resolved = ctx.file_access.resolve(requested);
 
         // Read the original file content
         let content = std::fs::read_to_string(&resolved)
@@ -82,6 +78,9 @@ impl Tool for EditTool {
 
         // Write atomically: write to temp file then rename
         let tmp_path = resolved.with_extension("tmp");
+        ctx.file_access
+            .check_write(&tmp_path)
+            .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
         std::fs::write(&tmp_path, new_content).map_err(ToolError::Io)?;
         std::fs::rename(&tmp_path, &resolved).map_err(ToolError::Io)?;
 

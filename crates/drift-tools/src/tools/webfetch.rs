@@ -68,19 +68,30 @@ impl Tool for WebFetchTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         // Extract and validate the URL argument
         let url = args["url"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("missing 'url' field".into()))?;
+        ctx.network
+            .check_url(url)
+            .map_err(|error| ToolError::PermissionDenied(error.to_string()))?;
 
         let max_length = args["maxLength"].as_u64().unwrap_or(5000) as usize;
 
         // Build HTTP client with a 30-second timeout
+        let network = ctx.network.clone();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Mozilla/5.0 (compatible; DriftCLI/1.0)")
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if network.check_url(attempt.url().as_str()).is_ok() {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
             .build()
             .map_err(|e| ToolError::Other(format!("failed to build HTTP client: {e}")))?;
 

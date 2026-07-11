@@ -1,6 +1,7 @@
 //! BashTool — execute a shell command with timeout and capture output.
 
 use crate::{Tool, ToolContext, ToolError, ToolResult};
+use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -104,31 +105,22 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("command is required".into()))?;
 
-        // Resolve the working directory: use explicit workdir arg, else session working_dir
+        // Resolve the working directory through the shared workspace guard.
         let workdir = if let Some(wd) = args.get("workdir").and_then(|v| v.as_str()) {
             if wd.is_empty() {
                 ctx.working_dir.clone()
             } else {
-                let p = ctx.working_dir.join(wd);
-                p.canonicalize().map_err(|e| ToolError::Io(e))?
+                let requested = Path::new(wd);
+                ctx.file_access
+                    .check_read(requested)
+                    .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+                ctx.file_access.resolve(requested)
             }
         } else {
             ctx.working_dir.clone()
         };
 
-        // Canonicalize the working directory for path safety check
-        let canonical_base = ctx
-            .working_dir
-            .canonicalize()
-            .map_err(|e| ToolError::Io(e))?;
-
-        // Ensure resolved workdir is within the session working directory
-        let canonical_workdir = workdir.canonicalize().map_err(|e| ToolError::Io(e))?;
-        if !canonical_workdir.starts_with(&canonical_base) {
-            return Err(ToolError::PermissionDenied(
-                "workdir is outside the session working directory".into(),
-            ));
-        }
+        let canonical_workdir = workdir;
 
         // Parse timeout: default 120 seconds
         let timeout_ms = args
@@ -148,6 +140,7 @@ impl Tool for BashTool {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
+        cmd.kill_on_drop(true);
 
         // Run the command with a timeout
         let output = match timeout(timeout_duration, cmd.output()).await {

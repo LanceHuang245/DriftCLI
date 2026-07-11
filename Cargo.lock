@@ -406,6 +406,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -429,6 +430,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "drift-security",
  "glob",
  "regex",
  "reqwest",

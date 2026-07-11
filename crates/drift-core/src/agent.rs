@@ -41,6 +41,8 @@ pub struct Agent {
     cwd: PathBuf,
     session_id: uuid::Uuid,
     session_store: std::sync::Arc<drift_storage::SessionStore>,
+    file_access: std::sync::Arc<drift_security::FileAccessGuard>,
+    network: std::sync::Arc<drift_security::NetworkGuard>,
 }
 
 impl Agent {
@@ -57,6 +59,12 @@ impl Agent {
         let llm = create_provider(config.active_llm_config().unwrap())?;
         let (event_tx, _) = broadcast::channel(256);
         let permission_engine = PermissionEngine::new(security_config, security_profile);
+        let file_access = std::sync::Arc::new(
+            permission_engine
+                .file_access_guard(&cwd)
+                .map_err(|error| LlmError::Config(format!("file access guard: {:?}", error)))?,
+        );
+        let network = std::sync::Arc::new(permission_engine.network_guard());
 
         info!(
             provider = %llm.provider_id(),
@@ -76,6 +84,8 @@ impl Agent {
             cwd,
             session_id,
             session_store,
+            file_access,
+            network,
             permission_engine,
             permission_rx: None,
         })
@@ -96,6 +106,16 @@ impl Agent {
     // Retrieve active session ID.
     pub fn session_id(&self) -> uuid::Uuid {
         self.session_id
+    }
+
+    // Switch the active session and rebuild the LLM history from its transcript.
+    pub fn switch_session(
+        &mut self,
+        session_id: uuid::Uuid,
+        events: &[drift_storage::SessionEvent],
+    ) {
+        self.session_id = session_id;
+        self.reconstruct_history(events);
     }
 
     // Reconstruct the core messages history list from a vector of storage events.
@@ -125,7 +145,10 @@ impl Agent {
                             last.content.push(drift_llm::ContentPart::ToolCall {
                                 id: call_id.clone(),
                                 name: name.clone(),
-                                arguments: args.to_string(),
+                                arguments: match args {
+                                    serde_json::Value::String(raw) => raw.clone(),
+                                    value => value.to_string(),
+                                },
                             });
                         }
                     }
@@ -204,7 +227,7 @@ impl Agent {
         let max_iterations = self.config.agent.max_iterations;
 
         // Tool calling loop: iterate until LLM stops requesting tools or max reached
-        for iteration in 0..=max_iterations {
+        for iteration in 0..max_iterations {
             // Collect tool definitions for the LLM
             let tool_defs = self.tool_registry.definitions().await;
             let tools_json: Vec<serde_json::Value> = tool_defs
@@ -412,8 +435,11 @@ impl Agent {
             );
 
             for tc in &completed_tool_calls {
-                let args_val: serde_json::Value =
-                    serde_json::from_str(&tc.args_string()).unwrap_or_default();
+                let raw_args = tc.args_string();
+                let args_val = match serde_json::from_str::<serde_json::Value>(&raw_args) {
+                    Ok(value) => value,
+                    Err(_) => serde_json::Value::String(raw_args),
+                };
                 let _ = self.session_store.append_event(
                     self.session_id,
                     &drift_storage::SessionEvent::ToolCall {
@@ -427,18 +453,51 @@ impl Agent {
             // Execute each tool call sequentially
             let mut tool_result_parts: Vec<drift_llm::ContentPart> = Vec::new();
             for tc in &completed_tool_calls {
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.args_string()).unwrap_or_default();
-
                 let _ = self.event_tx.send(EventMsg::ToolExecStart {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                 });
 
+                let raw_args = tc.args_string();
+                let args = match serde_json::from_str::<serde_json::Value>(&raw_args) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        // Return malformed tool arguments to the LLM instead of executing with an empty object.
+                        let message = format!(
+                            "Invalid JSON arguments for tool '{}': {}",
+                            tc.name, error
+                        );
+                        let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            success: false,
+                            error: Some(message.clone()),
+                        });
+                        tool_result_parts.push(drift_llm::ContentPart::ToolResult {
+                            tool_use_id: tc.id.clone(),
+                            content: message.clone(),
+                            is_error: true,
+                        });
+                        let _ = self.session_store.append_event(
+                            self.session_id,
+                            &drift_storage::SessionEvent::ToolResult {
+                                call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                success: false,
+                                content: String::new(),
+                                error: Some(message),
+                            },
+                        );
+                        continue;
+                    }
+                };
+
                 let ctx = ToolContext {
                     session_id: self.session_id,
                     working_dir: self.cwd.clone(),
                     tool_call_id: tc.id.clone(),
+                    file_access: self.file_access.clone(),
+                    network: self.network.clone(),
                 };
 
                 // ── Permission check ──

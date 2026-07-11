@@ -41,9 +41,16 @@ impl Tool for GlobTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("pattern is required".into()))?;
 
-        // Resolve the search directory, ensuring it is within the working directory
-        let search_dir =
-            resolve_subdir(&ctx.working_dir, args.get("path").and_then(|v| v.as_str()))?;
+        // Resolve the search directory through the shared workspace guard.
+        let requested = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(std::path::Path::new)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        ctx.file_access
+            .check_read(requested)
+            .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+        let search_dir = ctx.file_access.resolve(requested);
 
         // Build the full glob pattern: search_dir / pattern
         let full_pattern = format!("{}/{}", search_dir.display(), pattern);
@@ -68,7 +75,7 @@ impl Tool for GlobTool {
         }
 
         // Sort by modification time, newest first
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         // Limit to max results
         entries.truncate(MAX_RESULTS);
@@ -91,27 +98,4 @@ impl Tool for GlobTool {
             error: None,
         })
     }
-}
-
-/// Resolve a subdirectory relative to the base working directory.
-/// Canonicalizes and ensures the result stays within the base directory.
-fn resolve_subdir(
-    base: &std::path::Path,
-    subdir: Option<&str>,
-) -> Result<std::path::PathBuf, ToolError> {
-    let target = match subdir {
-        Some(sub) if !sub.is_empty() => base.join(sub),
-        _ => base.to_path_buf(),
-    };
-
-    let canonical = target.canonicalize().map_err(|e| ToolError::Io(e))?;
-    let canonical_base = base.canonicalize().map_err(|e| ToolError::Io(e))?;
-
-    if !canonical.starts_with(&canonical_base) {
-        return Err(ToolError::PermissionDenied(
-            "path traversal outside working directory is not allowed".into(),
-        ));
-    }
-
-    Ok(canonical)
 }

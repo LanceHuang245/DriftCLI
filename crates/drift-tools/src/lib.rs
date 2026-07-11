@@ -24,6 +24,8 @@ pub struct ToolContext {
     pub session_id: Uuid,
     pub working_dir: PathBuf,
     pub tool_call_id: String,
+    pub file_access: Arc<drift_security::FileAccessGuard>,
+    pub network: Arc<drift_security::NetworkGuard>,
 }
 
 /// Result returned by a tool after execution.

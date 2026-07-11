@@ -30,23 +30,22 @@ impl PatternMatcher {
         let mut p_start = 0;
         while p_start < p_len && p_chars[p_start] == '*' {
             p_start += 1;
-            for j in 0..=i_len {
-                dp[j] = true;
+            for value in dp.iter_mut().take(i_len + 1) {
+                *value = true;
             }
         }
 
-        for p_idx in p_start..p_len {
-            let pc = p_chars[p_idx];
+        for pc in p_chars.iter().skip(p_start) {
             let mut next_dp = vec![false; i_len + 1];
 
-            if pc == '*' {
+            if *pc == '*' {
                 // '*' matches zero or more: propagate from left or above
                 for j in 0..=i_len {
                     next_dp[j] = dp[j] || (j > 0 && next_dp[j - 1]);
                 }
             } else {
                 for j in 1..=i_len {
-                    if (pc == '?' || pc == i_chars[j - 1]) && dp[j - 1] {
+                    if (*pc == '?' || *pc == i_chars[j - 1]) && dp[j - 1] {
                         next_dp[j] = true;
                     }
                 }

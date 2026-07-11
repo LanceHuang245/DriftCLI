@@ -1,5 +1,6 @@
 use crate::{Tool, ToolContext, ToolError, ToolResult};
 use std::io::Read;
+use std::path::Path;
 
 pub struct ReadTool;
 
@@ -35,18 +36,12 @@ impl Tool for ReadTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("filePath must be a string".into()))?;
 
-        // Resolve path relative to working_dir, reject attempts to escape the working directory
-        let resolved = ctx.working_dir.join(file_path_str);
-        let canonical = std::path::absolute(&ctx.working_dir).map_err(ToolError::Io)?;
-        let file_canonical = std::path::absolute(&resolved)
-            .map_err(|e| ToolError::InvalidArgs(format!("invalid file path: {e}")))?;
-
-        // Ensure the resolved file is within the working directory
-        if !file_canonical.starts_with(&canonical) {
-            return Err(ToolError::PermissionDenied(
-                "file path escapes the working directory".into(),
-            ));
-        }
+        // Resolve and validate the file through the shared workspace guard.
+        let requested = Path::new(file_path_str);
+        ctx.file_access
+            .check_read(requested)
+            .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+        let resolved = ctx.file_access.resolve(requested);
 
         // Check if the path exists and is a file
         if !resolved.exists() {

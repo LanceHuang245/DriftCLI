@@ -50,9 +50,16 @@ impl Tool for GrepTool {
         let re = Regex::new(pattern)
             .map_err(|e| ToolError::InvalidArgs(format!("invalid regex: {}", e)))?;
 
-        // Resolve the search directory, ensuring it is within the working directory
-        let search_dir =
-            resolve_subdir(&ctx.working_dir, args.get("path").and_then(|v| v.as_str()))?;
+        // Resolve the search directory through the shared workspace guard.
+        let requested = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new("."));
+        ctx.file_access
+            .check_read(requested)
+            .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+        let search_dir = ctx.file_access.resolve(requested);
 
         // Optional glob filter for matching file paths relative to search_dir
         let include_filter = args
@@ -69,12 +76,11 @@ impl Tool for GrepTool {
             }
 
             // Apply optional glob filter against the relative path
-            if let Some(ref filter) = include_filter {
-                if let Ok(rel) = entry.path().strip_prefix(&search_dir) {
-                    if !filter.matches(rel.to_string_lossy().as_ref()) {
-                        continue;
-                    }
-                }
+            if let Some(ref filter) = include_filter
+                && let Ok(rel) = entry.path().strip_prefix(&search_dir)
+                && !filter.matches(rel.to_string_lossy().as_ref())
+            {
+                continue;
             }
 
             // Read the file content, skipping binary or unreadable files
@@ -108,28 +114,4 @@ impl Tool for GrepTool {
             error: None,
         })
     }
-}
-
-/// Resolve a subdirectory relative to the base working directory.
-/// Canonicalizes and ensures the result stays within the base directory.
-fn resolve_subdir(base: &Path, subdir: Option<&str>) -> Result<std::path::PathBuf, ToolError> {
-    let target = match subdir {
-        Some(sub) if !sub.is_empty() => base.join(sub),
-        _ => base.to_path_buf(),
-    };
-
-    // Canonicalize to resolve any `..` components and get the real path
-    let canonical = target.canonicalize().map_err(|e| ToolError::Io(e))?;
-
-    // Canonicalize the base for comparison
-    let canonical_base = base.canonicalize().map_err(|e| ToolError::Io(e))?;
-
-    // Ensure the target is within the base directory
-    if !canonical.starts_with(&canonical_base) {
-        return Err(ToolError::PermissionDenied(
-            "path traversal outside working directory is not allowed".into(),
-        ));
-    }
-
-    Ok(canonical)
 }

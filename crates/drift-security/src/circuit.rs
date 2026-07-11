@@ -78,6 +78,7 @@ impl DoomLoopTracker {
             "read" | "Read" | "edit" | "Edit" | "write" | "Write" => {
                 args.get("path")
                     .or_else(|| args.get("file_path"))
+                    .or_else(|| args.get("filePath"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string()
@@ -95,12 +96,17 @@ impl DoomLoopTracker {
                     .unwrap_or("")
                     .to_string()
             }
-            "web_fetch" | "websearch" | "WebFetch" | "WebSearch" => {
+            "web_fetch" | "webfetch" | "WebFetch" => {
                 args.get("url")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string()
             }
+            "web_search" | "websearch" | "WebSearch" => args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             _ => {
                 // Use compact JSON as fingerprint
                 serde_json::to_string(args).unwrap_or_default()

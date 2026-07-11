@@ -18,6 +18,8 @@ pub enum ApprovalPolicy {
     OnRequest,
     /// No prompts at all. OS sandbox still enforces limits.
     Never,
+    /// Deny every non-safe tool without prompting.
+    Deny,
 }
 
 /// Sandbox axis: controls what the operating system physically permits.
@@ -226,10 +228,22 @@ pub struct SecurityConfig {
     /// Master switch: when `false`, all permission checks are skipped.
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Domains allowed by network-capable tools. `*` allows every domain.
+    #[serde(default = "default_allowed_domains")]
+    pub allowed_domains: Vec<String>,
+
+    /// Domains denied by network-capable tools. Deny rules take precedence.
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
 }
 
 fn default_profile_name() -> String {
     "default".into()
+}
+
+fn default_allowed_domains() -> Vec<String> {
+    vec!["*".into()]
 }
 
 impl Default for SecurityConfig {
@@ -266,7 +280,7 @@ impl Default for SecurityConfig {
 
         // "danger" profile: never ask + no sandbox. Critical commands still gate.
         profiles.insert("danger".into(), {
-            let p = SecurityProfile {
+            SecurityProfile {
                 name: "danger".into(),
                 approval_policy: ApprovalPolicy::Never,
                 sandbox_mode: SandboxMode::DangerFullAccess,
@@ -279,14 +293,15 @@ impl Default for SecurityConfig {
                 },
                 protected_paths: vec![],
                 safe_tools: default_safe_tools(),
-            };
-            p
+            }
         });
 
         Self {
             default_profile: "default".into(),
             profiles,
             enabled: true,
+            allowed_domains: default_allowed_domains(),
+            blocked_domains: Vec::new(),
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::circuit::DoomLoopTracker;
+use crate::network::NetworkGuard;
 use crate::pattern::PatternMatcher;
 use crate::types::*;
 use std::collections::HashMap;
@@ -28,6 +29,8 @@ pub struct PermissionEngine {
     /// Session-persistent rules added by AllowAlways/DenyAlways user decisions.
     /// Each entry: (tool_name, args_pattern, action). Checked before profile rules.
     session_rules: Vec<(String, String, PermissionAction)>,
+    /// Shared network policy used by network-capable tools.
+    network_guard: NetworkGuard,
 }
 
 impl PermissionEngine {
@@ -68,6 +71,10 @@ impl PermissionEngine {
             doom_loop,
             request_counter: 0,
             session_rules: Vec::new(),
+            network_guard: NetworkGuard::new(
+                &config.allowed_domains,
+                &config.blocked_domains,
+            ),
         }
     }
 
@@ -80,6 +87,7 @@ impl PermissionEngine {
             doom_loop,
             request_counter: 0,
             session_rules: Vec::new(),
+            network_guard: NetworkGuard::new(&["*".into()], &[]),
         }
     }
 
@@ -199,6 +207,9 @@ impl PermissionEngine {
                 // Untrusted: only safe tools auto-pass (already handled above)
                 self.make_ask(tool_name, args, "Untrusted mode requires confirmation")
             }
+            ApprovalPolicy::Deny => PermissionDecision::Denied {
+                reason: "Permission mode is set to 'deny'".into(),
+            },
         }
     }
 
@@ -232,7 +243,7 @@ impl PermissionEngine {
             "bash" | "Bash"
                 | "write" | "Write"
                 | "edit" | "Edit"
-                | "web_fetch" | "WebFetch"
+                | "web_fetch" | "webfetch" | "WebFetch"
                 | "web_search" | "websearch" | "WebSearch"
         )
     }
@@ -248,12 +259,17 @@ impl PermissionEngine {
             "read" | "Read" | "edit" | "Edit" | "write" | "Write" => args
                 .get("path")
                 .or_else(|| args.get("file_path"))
+                .or_else(|| args.get("filePath"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            "web_fetch" | "WebFetch" | "web_search" | "websearch" | "WebSearch" => args
+            "web_fetch" | "webfetch" | "WebFetch" => args
                 .get("url")
-                .or_else(|| args.get("query"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            "web_search" | "websearch" | "WebSearch" => args
+                .get("query")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -307,14 +323,14 @@ impl PermissionEngine {
                 let path = args
                     .get("path")
                     .or_else(|| args.get("file_path"))
+                    .or_else(|| args.get("filePath"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no path)");
                 path.to_string()
             }
-            "web_fetch" | "WebFetch" | "web_search" | "websearch" | "WebSearch" => {
+            "web_fetch" | "webfetch" | "WebFetch" => {
                 let url = args
                     .get("url")
-                    .or_else(|| args.get("query"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no url)");
                 if url.len() > 80 {
@@ -323,6 +339,11 @@ impl PermissionEngine {
                     url.to_string()
                 }
             }
+            "web_search" | "websearch" | "WebSearch" => args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no query)")
+                .to_string(),
             _ => {
                 let compact = serde_json::to_string(args).unwrap_or_default();
                 if compact.len() > 80 {
@@ -369,6 +390,7 @@ impl PermissionEngine {
                 let path = args
                     .get("path")
                     .or_else(|| args.get("file_path"))
+                    .or_else(|| args.get("filePath"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
@@ -382,7 +404,7 @@ impl PermissionEngine {
                     RiskLevel::Medium
                 }
             }
-            "web_fetch" | "WebFetch" => RiskLevel::Medium,
+            "web_fetch" | "webfetch" | "WebFetch" => RiskLevel::Medium,
             "web_search" | "websearch" | "WebSearch" => RiskLevel::Low,
             _ => RiskLevel::Low,
         }
@@ -403,13 +425,26 @@ impl PermissionEngine {
     /// `working_dir` should be the canonical working directory from the tool context.
     /// `write` indicates whether the operation is a write/edit (enforces protected paths).
     pub fn check_file_access(&self, working_dir: &std::path::Path, file_path: &std::path::Path, write: bool) -> Result<(), crate::guard::AccessDenied> {
-        let guard = crate::FileAccessGuard::new(working_dir, &self.profile.protected_paths)
-            .map_err(|e| crate::guard::AccessDenied::OutsideWorkspace(e.to_string()))?;
+        let guard = self.file_access_guard(working_dir)?;
         if write {
             guard.check_write(file_path)
         } else {
             guard.check_read(file_path)
         }
+    }
+
+    /// Build the file guard used by all filesystem-capable tools.
+    pub fn file_access_guard(
+        &self,
+        working_dir: &std::path::Path,
+    ) -> Result<crate::FileAccessGuard, crate::guard::AccessDenied> {
+        crate::FileAccessGuard::new(working_dir, &self.profile.protected_paths)
+            .map_err(|e| crate::guard::AccessDenied::OutsideWorkspace(e.to_string()))
+    }
+
+    /// Return the network guard configured for this security profile.
+    pub fn network_guard(&self) -> NetworkGuard {
+        self.network_guard.clone()
     }
 
 

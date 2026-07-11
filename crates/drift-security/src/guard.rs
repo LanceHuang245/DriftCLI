@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 /// Guards file access: ensures operations stay within the working directory
 /// and don't touch protected paths.
+#[derive(Debug)]
 pub struct FileAccessGuard {
     /// Absolute, canonical working directory.
     working_dir: PathBuf,
@@ -60,7 +61,8 @@ impl FileAccessGuard {
     }
 
     /// Resolve a path: if absolute, use as-is; if relative, join with working_dir.
-    fn resolve(&self, path: &Path) -> PathBuf {
+    /// Resolve a path before a tool performs its filesystem operation.
+    pub fn resolve(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             // Try to canonicalize; if it doesn't exist yet, normalize manually
             path.canonicalize().unwrap_or_else(|_| {
@@ -83,7 +85,7 @@ impl FileAccessGuard {
             })
         } else {
             let joined = self.working_dir.join(path);
-            joined.canonicalize().unwrap_or_else(|_| joined)
+            joined.canonicalize().unwrap_or(joined)
         }
     }
 
@@ -106,7 +108,9 @@ impl FileAccessGuard {
                 let part = part.trim_start_matches('/');
                 if i == 0 {
                     // First part must match from start
-                    if !Self::star_match(part, &remaining[..remaining.len().min(part.len() + 100)]).is_some() {
+                    if Self::star_match(part, &remaining[..remaining.len().min(part.len() + 100)])
+                        .is_none()
+                    {
                         return false;
                     }
                     if let Some(pos) = Self::star_match(part, remaining) {
@@ -140,15 +144,15 @@ impl FileAccessGuard {
         let mut dp = vec![false; sn + 1];
         dp[0] = true;
 
-        for pi in 0..pn {
+        for pc in p.iter().take(pn) {
             let mut next = vec![false; sn + 1];
-            if p[pi] == '*' {
+            if *pc == '*' {
                 for si in 0..=sn {
                     next[si] = dp[si] || (si > 0 && next[si - 1]);
                 }
             } else {
                 for si in 1..=sn {
-                    if (p[pi] == '?' || p[pi] == s[si - 1]) && dp[si - 1] {
+                    if (*pc == '?' || *pc == s[si - 1]) && dp[si - 1] {
                         next[si] = true;
                     }
                 }
@@ -163,7 +167,6 @@ impl FileAccessGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn test_within_workspace() {

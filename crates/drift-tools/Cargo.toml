@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drift-security = { path = "../drift-security" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

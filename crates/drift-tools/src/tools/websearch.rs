@@ -81,7 +81,7 @@ impl WebSearchTool {
                         .find("</a>")
                         .map(|i| snippet_tag_close + i)?;
                     Some(html_entity_decode(
-                        &after_link[snippet_tag_close..snippet_end].trim(),
+                        after_link[snippet_tag_close..snippet_end].trim(),
                     ))
                 })
                 .unwrap_or_default();
@@ -142,7 +142,7 @@ impl Tool for WebSearchTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let query = args["query"]
             .as_str()
@@ -158,8 +158,11 @@ impl Tool for WebSearchTool {
 
         let search_url = format!(
             "https://html.duckduckgo.com/html/?q={}",
-            urlencoding(&query)
+            urlencoding(query)
         );
+        ctx.network
+            .check_url(&search_url)
+            .map_err(|error| ToolError::PermissionDenied(error.to_string()))?;
 
         let response = client
             .get(&search_url)
