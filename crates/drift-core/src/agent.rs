@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::context::ContextManager;
 use crate::event::{AgentState, EventMsg};
 use drift_config::{AppConfig, LlmConfig};
 use drift_llm::{
@@ -37,7 +38,7 @@ pub struct Agent {
     /// Channel the bridge task writes user permission responses into.
     permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>>,
     event_tx: broadcast::Sender<EventMsg>,
-    messages: Vec<LlmMessage>,
+    context: ContextManager,
     cwd: PathBuf,
     session_id: uuid::Uuid,
     session_store: std::sync::Arc<drift_storage::SessionStore>,
@@ -65,6 +66,11 @@ impl Agent {
                 .map_err(|error| LlmError::Config(format!("file access guard: {:?}", error)))?,
         );
         let network = std::sync::Arc::new(permission_engine.network_guard());
+        let context = ContextManager::new(
+            llm.context_window(),
+            config.agent.compaction_threshold,
+            config.agent.compaction_target,
+        );
 
         info!(
             provider = %llm.provider_id(),
@@ -80,7 +86,7 @@ impl Agent {
             llm,
             tool_registry,
             event_tx,
-            messages: Vec::new(),
+            context,
             cwd,
             session_id,
             session_store,
@@ -100,7 +106,7 @@ impl Agent {
 
     // Set the full conversation history from a reconstructed LlmMessage list (used when resuming a session).
     pub fn set_messages(&mut self, messages: Vec<LlmMessage>) {
-        self.messages = messages;
+        self.context.set_messages(messages);
     }
 
     // Retrieve active session ID.
@@ -195,7 +201,7 @@ impl Agent {
             }
         }
 
-        self.messages = messages;
+        self.context.set_messages(messages);
     }
 
     // Subscribe returns a new broadcast receiver for consuming agent events in the TUI bridge.
@@ -211,7 +217,7 @@ impl Agent {
             .send(EventMsg::AgentState(AgentState::Thinking));
 
         // Add user message to history
-        self.messages.push(LlmMessage::user(user_input.clone()));
+        self.context.push_message(LlmMessage::user(user_input.clone()));
 
         // Write user message to SessionStore
         let _ = self.session_store.append_event(
@@ -223,39 +229,39 @@ impl Agent {
             },
         );
 
-        let system_prompt = self.get_system_prompt();
         let max_iterations = self.config.agent.max_iterations;
 
         // Tool calling loop: iterate until LLM stops requesting tools or max reached
         for iteration in 0..max_iterations {
             // Collect tool definitions for the LLM
             let tool_defs = self.tool_registry.definitions().await;
-            let tools_json: Vec<serde_json::Value> = tool_defs
-                .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "name": d.name,
-                        "description": d.description,
-                        "input_schema": d.input_schema,
-                    })
-                })
-                .collect();
-            let tools = if tools_json.is_empty() {
-                None
-            } else {
-                tracing::info!(tool_count = tools_json.len(), "sending tools to LLM");
-                Some(tools_json)
-            };
+            let should_compact = self.config.agent.auto_compaction
+                && self.context.needs_compaction(&tool_defs);
+            if should_compact {
+                let _ = self.event_tx.send(EventMsg::ContextCompacting);
+            }
+            let built_context = self
+                .context
+                .build_context(&tool_defs, self.config.agent.auto_compaction);
+            if built_context.compacted {
+                let _ = self.event_tx.send(EventMsg::ContextCompacted {
+                    summary: "Local context compaction completed".into(),
+                    saved_tokens: built_context.saved_tokens,
+                });
+            }
+            if !tool_defs.is_empty() {
+                tracing::info!(tool_count = tool_defs.len(), "sending tools to LLM");
+            }
 
             // Stream from LLM
             let stream_result = self
                 .llm
                 .stream_chat(
-                    self.messages.clone(),
-                    system_prompt.clone(),
+                    built_context.messages,
+                    built_context.system_prompt,
                     self.config.agent.temperature,
                     Some(4096),
-                    tools,
+                    built_context.tools,
                 )
                 .await;
 
@@ -380,7 +386,8 @@ impl Agent {
             // If no tool calls were completed, this is a text-only response — finalize
             if completed_tool_calls.is_empty() {
                 if !full_response.is_empty() {
-                    self.messages.push(LlmMessage::assistant(full_response.clone()));
+                    self.context
+                        .push_message(LlmMessage::assistant(full_response.clone()));
                     // Write assistant message to SessionStore
                     let reasoning_opt = if !full_reasoning.is_empty() {
                         Some(full_reasoning)
@@ -419,7 +426,7 @@ impl Agent {
                     arguments: tc.args_string(),
                 });
             }
-            self.messages.push(LlmMessage {
+            self.context.push_message(LlmMessage {
                 role: "assistant".into(),
                 content: content_parts,
             });
@@ -701,7 +708,7 @@ impl Agent {
             }
 
             // Add tool results as a user message (provider-agnostic).
-            self.messages.push(LlmMessage {
+            self.context.push_message(LlmMessage {
                 role: "user".into(),
                 content: tool_result_parts,
             });
@@ -759,6 +766,7 @@ impl Agent {
             .active_llm_config()
             .ok_or(LlmError::Config("No provider config".into()))?;
         self.llm = create_provider(llm_config)?;
+        self.context.set_context_window(self.llm.context_window());
         self.config
             .save_to_project(&self.cwd)
             .map_err(|e| LlmError::Config(e.to_string()))?;
@@ -784,6 +792,7 @@ impl Agent {
             .active_llm_config()
             .ok_or(LlmError::Config("No config".into()))?;
         self.llm = create_provider(llm_config)?;
+        self.context.set_context_window(self.llm.context_window());
         let _ = self.event_tx.send(EventMsg::ProviderSwitched {
             name: name.to_string(),
             model: self.llm.model_name().to_string(),
@@ -837,20 +846,4 @@ impl Agent {
         }
     }
 
-    // Builds the system prompt for every conversation turn.
-    fn get_system_prompt(&self) -> Option<String> {
-        Some(
-            "You are DriftCLI, a terminal-based AI coding agent with direct access to tools.\n\
-             You can read files, edit code, run shell commands, search code, fetch web pages, and manage tasks.\n\
-             \n\
-             CRITICAL RULES:\n\
-             1. When the user asks you to do something, CALL THE TOOL immediately. Do NOT narrate your plan.\n\
-             2. Do NOT say things like \"Let me check\", \"I'll try\", \"I need to\" — just invoke the tool.\n\
-             3. Your first response to any file/action request should be a tool call, NOT a text description.\n\
-             4. Only output text AFTER you have tool results to summarize.\n\
-             5. For simple greetings or questions requiring no file access, respond directly.\n\
-             \n\
-             Be concise. Act, don't talk.".into(),
-        )
-    }
 }

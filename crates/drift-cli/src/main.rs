@@ -257,6 +257,17 @@ async fn main() -> anyhow::Result<()> {
                         Ok(EventMsg::ProviderConfig { name, config }) => {
                             let _ = tui_tx.send(AppEvent::ProviderConfig { name, config });
                         }
+                        Ok(EventMsg::ContextCompacting) => {
+                            let _ = tui_tx.send(AppEvent::AgentStatus(
+                                "Compacting context...".to_string(),
+                            ));
+                        }
+                        Ok(EventMsg::ContextCompacted { saved_tokens, .. }) => {
+                            let _ = tui_tx.send(AppEvent::AgentStatus(format!(
+                                "Context compacted (-{} tokens)",
+                                saved_tokens
+                            )));
+                        }
                         Ok(EventMsg::ToolCallStart { id, name }) => {
                             let _ = tui_tx.send(AppEvent::ToolCallStart { id, name });
                         }

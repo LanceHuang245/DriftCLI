@@ -51,6 +51,12 @@ pub struct AgentConfig {
     pub thinking_budget: Option<usize>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default = "default_auto_compaction")]
+    pub auto_compaction: bool,
+    #[serde(default = "default_compaction_threshold")]
+    pub compaction_threshold: f64,
+    #[serde(default = "default_compaction_target")]
+    pub compaction_target: f64,
 }
 
 // LlmConfig: tagged enum selecting the active LLM provider — one variant per backend family.
@@ -85,6 +91,18 @@ fn default_model() -> String {
 }
 fn default_max_iterations() -> usize {
     50
+}
+
+fn default_auto_compaction() -> bool {
+    true
+}
+
+fn default_compaction_threshold() -> f64 {
+    0.75
+}
+
+fn default_compaction_target() -> f64 {
+    0.4
 }
 fn default_anthropic_base_url() -> String {
     "https://api.anthropic.com/v1".into()
@@ -289,6 +307,9 @@ impl AppConfig {
                 temperature: None,
                 thinking_budget: None,
                 reasoning_effort: None,
+                auto_compaction: default_auto_compaction(),
+                compaction_threshold: default_compaction_threshold(),
+                compaction_target: default_compaction_target(),
             },
             active_provider: default_name,
             providers,
@@ -379,6 +400,15 @@ impl AppConfig {
             }
             if let Some(e) = agent.get("reasoning_effort").and_then(|v| v.as_str()) {
                 config.agent.reasoning_effort = Some(e.to_string());
+            }
+            if let Some(enabled) = agent.get("auto_compaction").and_then(|v| v.as_bool()) {
+                config.agent.auto_compaction = enabled;
+            }
+            if let Some(threshold) = agent.get("compaction_threshold").and_then(|v| v.as_float()) {
+                config.agent.compaction_threshold = threshold;
+            }
+            if let Some(target) = agent.get("compaction_target").and_then(|v| v.as_float()) {
+                config.agent.compaction_target = target;
             }
         }
 
@@ -573,6 +603,9 @@ active_provider = "default"
 [agent]
 model = "claude-sonnet-4-5-20250101"
 max_iterations = 50
+auto_compaction = true
+compaction_threshold = 0.75
+compaction_target = 0.4
 
 [[providers]]
 name = "default"
@@ -682,8 +715,14 @@ base_url = "https://api.anthropic.com/v1"
             security: &self.security,
         })?;
         Ok(format!(
-            "# DriftCLI Configuration\n\nactive_provider = \"{}\"\n\n[agent]\nmodel = \"{}\"\nmax_iterations = {}\n\n{}",
-            self.active_provider, self.agent.model, self.agent.max_iterations, providers_str,
+            "# DriftCLI Configuration\n\nactive_provider = \"{}\"\n\n[agent]\nmodel = \"{}\"\nmax_iterations = {}\nauto_compaction = {}\ncompaction_threshold = {}\ncompaction_target = {}\n\n{}",
+            self.active_provider,
+            self.agent.model,
+            self.agent.max_iterations,
+            self.agent.auto_compaction,
+            self.agent.compaction_threshold,
+            self.agent.compaction_target,
+            providers_str,
         ) + &security)
     }
 }
@@ -698,7 +737,25 @@ mod tests {
         assert!(tmpl.contains("[agent]"));
         assert!(tmpl.contains("[[providers]]"));
         assert!(tmpl.contains("active_provider"));
+        assert!(tmpl.contains("auto_compaction = true"));
+        assert!(tmpl.contains("compaction_threshold = 0.75"));
+        assert!(tmpl.contains("compaction_target = 0.4"));
         toml::from_str::<toml::Value>(&tmpl).expect("default template must be valid TOML");
+    }
+
+    #[test]
+    fn test_compaction_config_merge() {
+        let mut config = AppConfig::load_defaults_with_files().unwrap();
+        let overlay: toml::Value = toml::from_str(
+            "[agent]\nauto_compaction = false\ncompaction_threshold = 0.8\ncompaction_target = 0.3\n",
+        )
+        .unwrap();
+
+        AppConfig::merge_toml_value(&mut config, &overlay).unwrap();
+
+        assert!(!config.agent.auto_compaction);
+        assert_eq!(config.agent.compaction_threshold, 0.8);
+        assert_eq!(config.agent.compaction_target, 0.3);
     }
 
     #[test]
@@ -723,6 +780,9 @@ mod tests {
                 temperature: None,
                 thinking_budget: None,
                 reasoning_effort: None,
+                auto_compaction: true,
+                compaction_threshold: 0.75,
+                compaction_target: 0.4,
             },
             active_provider: "test".into(),
             providers,
@@ -743,6 +803,9 @@ mod tests {
                 temperature: None,
                 thinking_budget: None,
                 reasoning_effort: None,
+                auto_compaction: true,
+                compaction_threshold: 0.75,
+                compaction_target: 0.4,
             },
             active_provider: String::new(),
             providers: HashMap::new(),
