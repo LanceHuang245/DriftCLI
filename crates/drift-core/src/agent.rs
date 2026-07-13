@@ -6,11 +6,11 @@ use crate::context::ContextManager;
 use crate::event::{AgentState, EventMsg};
 use drift_config::{AppConfig, LlmConfig};
 use drift_llm::{
-    LlmChunk, LlmError, LlmMessage, LlmProvider, ModelInfo, create_provider,
+    ContentPart, LlmChunk, LlmError, LlmMessage, LlmProvider, ModelInfo, create_provider,
     fetch_anthropic_models, fetch_openai_compat_models,
 };
+use drift_security::{PermissionDecision, PermissionEngine, SecurityConfig};
 use drift_tools::{ToolContext, ToolRegistry};
-use drift_security::{PermissionEngine, PermissionDecision, SecurityConfig};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -19,6 +19,191 @@ struct ActiveToolCall {
     id: String,
     name: String,
     args: Vec<String>,
+}
+
+/// Convert provider messages into storage DTOs without adding drift-llm to storage.
+fn to_persisted_messages(messages: &[LlmMessage]) -> Vec<drift_storage::PersistedMessage> {
+    messages
+        .iter()
+        .map(|message| drift_storage::PersistedMessage {
+            role: message.role.clone(),
+            content: message
+                .content
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text(text) => {
+                        drift_storage::PersistedContentPart::Text(text.clone())
+                    }
+                    ContentPart::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => drift_storage::PersistedContentPart::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                    ContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => drift_storage::PersistedContentPart::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                    },
+                    ContentPart::Reasoning(text) => {
+                        drift_storage::PersistedContentPart::Reasoning(text.clone())
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Restore provider messages from the dependency-free storage representation.
+fn from_persisted_messages(messages: &[drift_storage::PersistedMessage]) -> Vec<LlmMessage> {
+    messages
+        .iter()
+        .map(|message| LlmMessage {
+            role: message.role.clone(),
+            content: message
+                .content
+                .iter()
+                .map(|part| match part {
+                    drift_storage::PersistedContentPart::Text(text) => {
+                        ContentPart::Text(text.clone())
+                    }
+                    drift_storage::PersistedContentPart::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => ContentPart::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                    drift_storage::PersistedContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => ContentPart::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                    },
+                    drift_storage::PersistedContentPart::Reasoning(text) => {
+                        ContentPart::Reasoning(text.clone())
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Rebuild messages while treating the newest compaction snapshot as a replay boundary.
+fn replay_history(events: &[drift_storage::SessionEvent]) -> (Vec<LlmMessage>, Option<String>) {
+    let mut messages: Vec<LlmMessage> = Vec::new();
+    let mut summary = None;
+
+    for event in events {
+        match event {
+            drift_storage::SessionEvent::Message {
+                role,
+                content,
+                reasoning,
+            } => {
+                let mut content_parts = Vec::new();
+                if let Some(r) = reasoning
+                    && !r.is_empty()
+                {
+                    content_parts.push(ContentPart::Reasoning(r.clone()));
+                }
+                if !content.is_empty() {
+                    content_parts.push(ContentPart::Text(content.clone()));
+                }
+                messages.push(LlmMessage {
+                    role: role.clone(),
+                    content: content_parts,
+                });
+            }
+            drift_storage::SessionEvent::ToolCall {
+                call_id,
+                name,
+                args,
+            } => {
+                if let Some(last) = messages.last_mut()
+                    && last.role == "assistant"
+                {
+                    last.content.push(ContentPart::ToolCall {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: match args {
+                            serde_json::Value::String(raw) => raw.clone(),
+                            value => value.to_string(),
+                        },
+                    });
+                }
+            }
+            drift_storage::SessionEvent::ToolResult {
+                call_id,
+                name: _,
+                success,
+                content,
+                error,
+            } => {
+                let result_content = if *success {
+                    content.clone()
+                } else {
+                    match error {
+                        Some(err) if !content.is_empty() => format!("{} — Error: {}", content, err),
+                        Some(err) => format!("Error: {}", err),
+                        None => content.clone(),
+                    }
+                };
+
+                let mut needs_new_user_msg = true;
+                if let Some(last) = messages.last_mut()
+                    && last.role == "user"
+                {
+                    let only_results = last
+                        .content
+                        .iter()
+                        .all(|part| matches!(part, ContentPart::ToolResult { .. }));
+                    if only_results && !last.content.is_empty() {
+                        last.content.push(ContentPart::ToolResult {
+                            tool_use_id: call_id.clone(),
+                            content: result_content.clone(),
+                            is_error: !success,
+                        });
+                        needs_new_user_msg = false;
+                    }
+                }
+
+                if needs_new_user_msg {
+                    messages.push(LlmMessage {
+                        role: "user".into(),
+                        content: vec![ContentPart::ToolResult {
+                            tool_use_id: call_id.clone(),
+                            content: result_content,
+                            is_error: !success,
+                        }],
+                    });
+                }
+            }
+            // A persisted snapshot discards all earlier events from the active context.
+            drift_storage::SessionEvent::ContextCompacted {
+                summary: compacted_summary,
+                messages: compacted_messages,
+                saved_tokens: _,
+            } => {
+                messages = from_persisted_messages(compacted_messages);
+                summary = compacted_summary.clone();
+            }
+        }
+    }
+
+    (messages, summary)
 }
 
 impl ActiveToolCall {
@@ -66,10 +251,11 @@ impl Agent {
                 .map_err(|error| LlmError::Config(format!("file access guard: {:?}", error)))?,
         );
         let network = std::sync::Arc::new(permission_engine.network_guard());
-        let context = ContextManager::new(
+        let context = ContextManager::for_workspace(
             llm.context_window(),
             config.agent.compaction_threshold,
             config.agent.compaction_target,
+            &cwd,
         );
 
         info!(
@@ -97,10 +283,11 @@ impl Agent {
         })
     }
 
-
-
     // Set up the channel through which the TUI bridge sends permission responses back to the agent loop.
-    pub fn set_permission_channel(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>) {
+    pub fn set_permission_channel(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>,
+    ) {
         self.permission_rx = Some(rx);
     }
 
@@ -126,82 +313,8 @@ impl Agent {
 
     // Reconstruct the core messages history list from a vector of storage events.
     pub fn reconstruct_history(&mut self, events: &[drift_storage::SessionEvent]) {
-        let mut messages: Vec<LlmMessage> = Vec::new();
-
-        for event in events {
-            match event {
-                drift_storage::SessionEvent::Message { role, content, reasoning } => {
-                    let mut content_parts = Vec::new();
-                    if let Some(r) = reasoning {
-                        if !r.is_empty() {
-                            content_parts.push(drift_llm::ContentPart::Reasoning(r.clone()));
-                        }
-                    }
-                    if !content.is_empty() {
-                        content_parts.push(drift_llm::ContentPart::Text(content.clone()));
-                    }
-                    messages.push(LlmMessage {
-                        role: role.clone(),
-                        content: content_parts,
-                    });
-                }
-                drift_storage::SessionEvent::ToolCall { call_id, name, args } => {
-                    if let Some(last) = messages.last_mut() {
-                        if last.role == "assistant" {
-                            last.content.push(drift_llm::ContentPart::ToolCall {
-                                id: call_id.clone(),
-                                name: name.clone(),
-                                arguments: match args {
-                                    serde_json::Value::String(raw) => raw.clone(),
-                                    value => value.to_string(),
-                                },
-                            });
-                        }
-                    }
-                }
-                drift_storage::SessionEvent::ToolResult { call_id, name: _, success, content, error } => {
-                    let result_content = if *success {
-                        content.clone()
-                    } else {
-                        match error {
-                            Some(err) if !content.is_empty() => format!("{} — Error: {}", content, err),
-                            Some(err) => format!("Error: {}", err),
-                            None => content.clone(),
-                        }
-                    };
-
-                    // Check if the last message is already a tool-result user message
-                    let mut needs_new_user_msg = true;
-                    if let Some(last) = messages.last_mut() {
-                        if last.role == "user" {
-                            // Verify it only contains tool results so we can append to it
-                            let only_results = last.content.iter().all(|part| matches!(part, drift_llm::ContentPart::ToolResult { .. }));
-                            if only_results && !last.content.is_empty() {
-                                last.content.push(drift_llm::ContentPart::ToolResult {
-                                    tool_use_id: call_id.clone(),
-                                    content: result_content.clone(),
-                                    is_error: !success,
-                                });
-                                needs_new_user_msg = false;
-                            }
-                        }
-                    }
-
-                    if needs_new_user_msg {
-                        messages.push(LlmMessage {
-                            role: "user".into(),
-                            content: vec![drift_llm::ContentPart::ToolResult {
-                                tool_use_id: call_id.clone(),
-                                content: result_content,
-                                is_error: !success,
-                            }],
-                        });
-                    }
-                }
-            }
-        }
-
-        self.context.set_messages(messages);
+        let (messages, summary) = replay_history(events);
+        self.context.set_compacted_state(messages, summary);
     }
 
     // Subscribe returns a new broadcast receiver for consuming agent events in the TUI bridge.
@@ -217,7 +330,8 @@ impl Agent {
             .send(EventMsg::AgentState(AgentState::Thinking));
 
         // Add user message to history
-        self.context.push_message(LlmMessage::user(user_input.clone()));
+        self.context
+            .push_message(LlmMessage::user(user_input.clone()));
 
         // Write user message to SessionStore
         let _ = self.session_store.append_event(
@@ -230,22 +344,60 @@ impl Agent {
         );
 
         let max_iterations = self.config.agent.max_iterations;
+        // Suppress Done after any failure while still returning the agent to Idle.
+        let mut turn_failed = false;
 
         // Tool calling loop: iterate until LLM stops requesting tools or max reached
         for iteration in 0..max_iterations {
             // Collect tool definitions for the LLM
             let tool_defs = self.tool_registry.definitions().await;
-            let should_compact = self.config.agent.auto_compaction
-                && self.context.needs_compaction(&tool_defs);
+            let should_compact =
+                self.config.agent.auto_compaction && self.context.needs_compaction(&tool_defs);
             if should_compact {
                 let _ = self.event_tx.send(EventMsg::ContextCompacting);
             }
-            let built_context = self
+            // Prepare a candidate context without mutating the committed conversation.
+            let built_context = match self
                 .context
-                .build_context(&tool_defs, self.config.agent.auto_compaction);
-            if built_context.compacted {
+                .build_context(
+                    &tool_defs,
+                    self.config.agent.auto_compaction,
+                    Some(self.llm.as_ref()),
+                )
+                .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    turn_failed = true;
+                    let _ = self.event_tx.send(EventMsg::Error {
+                        message: format!("Context error: {}", error),
+                        recoverable: true,
+                    });
+                    break;
+                }
+            };
+            // Persist the candidate before committing it or sending it to the provider.
+            if let Some(snapshot) = built_context.compaction.as_ref() {
+                let event = drift_storage::SessionEvent::ContextCompacted {
+                    summary: snapshot.summary.clone(),
+                    messages: to_persisted_messages(&snapshot.messages),
+                    saved_tokens: built_context.saved_tokens,
+                };
+                if let Err(error) = self.session_store.append_event(self.session_id, &event) {
+                    turn_failed = true;
+                    let _ = self.event_tx.send(EventMsg::Error {
+                        message: format!("Context compaction persistence error: {}", error),
+                        recoverable: false,
+                    });
+                    break;
+                }
+                self.context.apply_compaction(snapshot);
+                let summary = snapshot
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "Local context compaction completed".into());
                 let _ = self.event_tx.send(EventMsg::ContextCompacted {
-                    summary: "Local context compaction completed".into(),
+                    summary,
                     saved_tokens: built_context.saved_tokens,
                 });
             }
@@ -268,6 +420,7 @@ impl Agent {
             let mut stream = match stream_result {
                 Ok(s) => s,
                 Err(e) => {
+                    turn_failed = true;
                     let _ = self.event_tx.send(EventMsg::Error {
                         message: format!("LLM error: {}", e),
                         recoverable: matches!(e, LlmError::Stream(_)),
@@ -292,14 +445,15 @@ impl Agent {
                 match stream.next().await {
                     Some(Ok(LlmChunk::TextDelta(text))) => {
                         if !streaming {
-                            if !full_reasoning.is_empty() && !reasoning_complete_emitted {
-                                if let Some(start) = reasoning_start {
-                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                    let _ = self
-                                        .event_tx
-                                        .send(EventMsg::ReasoningComplete { duration_ms });
-                                    reasoning_complete_emitted = true;
-                                }
+                            if !full_reasoning.is_empty()
+                                && !reasoning_complete_emitted
+                                && let Some(start) = reasoning_start
+                            {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                let _ = self
+                                    .event_tx
+                                    .send(EventMsg::ReasoningComplete { duration_ms });
+                                reasoning_complete_emitted = true;
                             }
                             let _ = self
                                 .event_tx
@@ -362,6 +516,7 @@ impl Agent {
                         break;
                     }
                     Some(Err(e)) => {
+                        turn_failed = true;
                         let _ = self.event_tx.send(EventMsg::Error {
                             message: e.to_string(),
                             recoverable: true,
@@ -374,13 +529,14 @@ impl Agent {
 
             // Emit ReasoningComplete for tool-call iterations that had
             // reasoning but no TextDelta (so the flag was never set).
-            if !full_reasoning.is_empty() && !reasoning_complete_emitted {
-                if let Some(start) = reasoning_start {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let _ = self
-                        .event_tx
-                        .send(EventMsg::ReasoningComplete { duration_ms });
-                }
+            if !full_reasoning.is_empty()
+                && !reasoning_complete_emitted
+                && let Some(start) = reasoning_start
+            {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let _ = self
+                    .event_tx
+                    .send(EventMsg::ReasoningComplete { duration_ms });
             }
 
             // If no tool calls were completed, this is a text-only response — finalize
@@ -410,7 +566,7 @@ impl Agent {
             let mut content_parts: Vec<drift_llm::ContentPart> = Vec::new();
             let mut has_reasoning = false;
             let mut has_text = false;
-            
+
             if !full_reasoning.is_empty() {
                 content_parts.push(drift_llm::ContentPart::Reasoning(full_reasoning.clone()));
                 has_reasoning = true;
@@ -436,8 +592,16 @@ impl Agent {
                 self.session_id,
                 &drift_storage::SessionEvent::Message {
                     role: "assistant".to_string(),
-                    content: if has_text { full_response } else { String::new() },
-                    reasoning: if has_reasoning { Some(full_reasoning) } else { None },
+                    content: if has_text {
+                        full_response
+                    } else {
+                        String::new()
+                    },
+                    reasoning: if has_reasoning {
+                        Some(full_reasoning)
+                    } else {
+                        None
+                    },
                 },
             );
 
@@ -470,10 +634,8 @@ impl Agent {
                     Ok(value) => value,
                     Err(error) => {
                         // Return malformed tool arguments to the LLM instead of executing with an empty object.
-                        let message = format!(
-                            "Invalid JSON arguments for tool '{}': {}",
-                            tc.name, error
-                        );
+                        let message =
+                            format!("Invalid JSON arguments for tool '{}': {}", tc.name, error);
                         let _ = self.event_tx.send(EventMsg::ToolExecEnd {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
@@ -508,138 +670,146 @@ impl Agent {
                 };
 
                 // ── Permission check ──
-                let permission_decision = self.permission_engine.check_tool_permission(&tc.name, &args);
-                let result: Result<drift_tools::ToolResult, drift_tools::ToolError> = match permission_decision {
-                    PermissionDecision::Allowed { .. } => {
-                        // Proceed to execute
-                        self.tool_registry.execute(&tc.name, args, &ctx).await
-                    }
-                    PermissionDecision::Denied { reason } => {
-                        let _ = self.event_tx.send(EventMsg::ToolExecStart {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                        });
-                        let _ = self.event_tx.send(EventMsg::ToolExecEnd {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            success: false,
-                            error: Some(reason.clone()),
-                        });
-                        Err(drift_tools::ToolError::PermissionDenied(reason))
-                    }
-                    PermissionDecision::AskUser { request } => {
-                        // Send permission request to TUI
-                        let _ = self.event_tx.send(EventMsg::PermissionRequest {
-                            request_id: request.request_id.clone(),
-                            tool_name: request.tool_name.clone(),
-                            args_summary: request.args_summary.clone(),
-                            reason: request.reason.clone(),
-                            risk_level: format!("{:?}", request.risk_level),
-                        });
+                let permission_decision = self
+                    .permission_engine
+                    .check_tool_permission(&tc.name, &args);
+                let result: Result<drift_tools::ToolResult, drift_tools::ToolError> =
+                    match permission_decision {
+                        PermissionDecision::Allowed { .. } => {
+                            // Proceed to execute
+                            self.tool_registry.execute(&tc.name, args, &ctx).await
+                        }
+                        PermissionDecision::Denied { reason } => {
+                            let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                            });
+                            let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                success: false,
+                                error: Some(reason.clone()),
+                            });
+                            Err(drift_tools::ToolError::PermissionDenied(reason))
+                        }
+                        PermissionDecision::AskUser { request } => {
+                            // Send permission request to TUI
+                            let _ = self.event_tx.send(EventMsg::PermissionRequest {
+                                request_id: request.request_id.clone(),
+                                tool_name: request.tool_name.clone(),
+                                args_summary: request.args_summary.clone(),
+                                reason: request.reason.clone(),
+                                risk_level: format!("{:?}", request.risk_level),
+                            });
 
-                        // Wait for user response
-                        let response = match &mut self.permission_rx {
-                            Some(rx) => {
-                                tokio::select! {
-                                    resp = rx.recv() => resp,
-                                    _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => None,
+                            // Wait for user response
+                            let response = match &mut self.permission_rx {
+                                Some(rx) => {
+                                    tokio::select! {
+                                        resp = rx.recv() => resp,
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => None,
+                                    }
+                                }
+                                None => {
+                                    // No channel configured — deny by default
+                                    tracing::warn!(
+                                        "Permission channel not set, denying tool call by default"
+                                    );
+                                    None
+                                }
+                            };
+
+                            match response {
+                                Some(drift_security::PermissionResponse::Allow) => {
+                                    let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                        request_id: request.request_id,
+                                        allowed: true,
+                                    });
+                                    self.tool_registry.execute(&tc.name, args, &ctx).await
+                                }
+                                Some(drift_security::PermissionResponse::AllowAlways) => {
+                                    let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                        request_id: request.request_id,
+                                        allowed: true,
+                                    });
+                                    // Record session-persistent allow rule
+                                    let pattern = drift_security::DoomLoopTracker::fingerprint(
+                                        &tc.name, &args,
+                                    );
+                                    self.permission_engine.add_session_rule(
+                                        &tc.name,
+                                        &pattern,
+                                        drift_security::types::PermissionAction::Allow,
+                                    );
+                                    self.tool_registry.execute(&tc.name, args, &ctx).await
+                                }
+                                Some(drift_security::PermissionResponse::Deny) => {
+                                    let reason = "User denied permission".to_string();
+                                    let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                        request_id: request.request_id,
+                                        allowed: false,
+                                    });
+                                    let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                    });
+                                    let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        success: false,
+                                        error: Some(reason.clone()),
+                                    });
+                                    Err(drift_tools::ToolError::PermissionDenied(reason))
+                                }
+                                Some(drift_security::PermissionResponse::DenyAlways) => {
+                                    let reason = "User denied permission".to_string();
+                                    let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                        request_id: request.request_id,
+                                        allowed: false,
+                                    });
+                                    // Record session-persistent deny rule
+                                    let pattern = drift_security::DoomLoopTracker::fingerprint(
+                                        &tc.name, &args,
+                                    );
+                                    self.permission_engine.add_session_rule(
+                                        &tc.name,
+                                        &pattern,
+                                        drift_security::types::PermissionAction::Deny,
+                                    );
+                                    let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                    });
+                                    let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        success: false,
+                                        error: Some(reason.clone()),
+                                    });
+                                    Err(drift_tools::ToolError::PermissionDenied(reason))
+                                }
+                                None => {
+                                    // Timeout or no response — deny
+                                    let reason = "Permission request timed out".to_string();
+                                    let _ = self.event_tx.send(EventMsg::PermissionResolved {
+                                        request_id: request.request_id,
+                                        allowed: false,
+                                    });
+                                    let _ = self.event_tx.send(EventMsg::ToolExecStart {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                    });
+                                    let _ = self.event_tx.send(EventMsg::ToolExecEnd {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        success: false,
+                                        error: Some(reason.clone()),
+                                    });
+                                    Err(drift_tools::ToolError::PermissionDenied(reason))
                                 }
                             }
-                            None => {
-                                // No channel configured — deny by default
-                                tracing::warn!("Permission channel not set, denying tool call by default");
-                                None
-                            }
-                        };
-
-                        match response {
-                            Some(drift_security::PermissionResponse::Allow) => {
-                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
-                                    request_id: request.request_id,
-                                    allowed: true,
-                                });
-                                self.tool_registry.execute(&tc.name, args, &ctx).await
-                            }
-                            Some(drift_security::PermissionResponse::AllowAlways) => {
-                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
-                                    request_id: request.request_id,
-                                    allowed: true,
-                                });
-                                // Record session-persistent allow rule
-                                let pattern = drift_security::DoomLoopTracker::fingerprint(&tc.name, &args);
-                                self.permission_engine.add_session_rule(
-                                    &tc.name,
-                                    &pattern,
-                                    drift_security::types::PermissionAction::Allow,
-                                );
-                                self.tool_registry.execute(&tc.name, args, &ctx).await
-                            }
-                            Some(drift_security::PermissionResponse::Deny) => {
-                                let reason = "User denied permission".to_string();
-                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
-                                    request_id: request.request_id,
-                                    allowed: false,
-                                });
-                                let _ = self.event_tx.send(EventMsg::ToolExecStart {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                });
-                                let _ = self.event_tx.send(EventMsg::ToolExecEnd {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    success: false,
-                                    error: Some(reason.clone()),
-                                });
-                                Err(drift_tools::ToolError::PermissionDenied(reason))
-                            }
-                            Some(drift_security::PermissionResponse::DenyAlways) => {
-                                let reason = "User denied permission".to_string();
-                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
-                                    request_id: request.request_id,
-                                    allowed: false,
-                                });
-                                // Record session-persistent deny rule
-                                let pattern = drift_security::DoomLoopTracker::fingerprint(&tc.name, &args);
-                                self.permission_engine.add_session_rule(
-                                    &tc.name,
-                                    &pattern,
-                                    drift_security::types::PermissionAction::Deny,
-                                );
-                                let _ = self.event_tx.send(EventMsg::ToolExecStart {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                });
-                                let _ = self.event_tx.send(EventMsg::ToolExecEnd {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    success: false,
-                                    error: Some(reason.clone()),
-                                });
-                                Err(drift_tools::ToolError::PermissionDenied(reason))
-                            }
-                            None => {
-                                // Timeout or no response — deny
-                                let reason = "Permission request timed out".to_string();
-                                let _ = self.event_tx.send(EventMsg::PermissionResolved {
-                                    request_id: request.request_id,
-                                    allowed: false,
-                                });
-                                let _ = self.event_tx.send(EventMsg::ToolExecStart {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                });
-                                let _ = self.event_tx.send(EventMsg::ToolExecEnd {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    success: false,
-                                    error: Some(reason.clone()),
-                                });
-                                Err(drift_tools::ToolError::PermissionDenied(reason))
-                            }
                         }
-                    }
-                };
-
+                    };
 
                 match result {
                     Ok(r) => {
@@ -724,7 +894,9 @@ impl Agent {
 
         // Finalize
         let _ = self.event_tx.send(EventMsg::AgentState(AgentState::Idle));
-        let _ = self.event_tx.send(EventMsg::Done);
+        if !turn_failed {
+            let _ = self.event_tx.send(EventMsg::Done);
+        }
     }
 
     // Returns a human-readable summary of the current connection.
@@ -845,5 +1017,278 @@ impl Agent {
             _ => Err(LlmError::Config(format!("Unknown provider: {}", provider))),
         }
     }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    // Build a snapshot message containing every persisted content variant.
+    fn compacted_message() -> drift_storage::PersistedMessage {
+        drift_storage::PersistedMessage {
+            role: "assistant".into(),
+            content: vec![
+                drift_storage::PersistedContentPart::Text("answer".into()),
+                drift_storage::PersistedContentPart::ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+                drift_storage::PersistedContentPart::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "result".into(),
+                    is_error: false,
+                },
+                drift_storage::PersistedContentPart::Reasoning("thought".into()),
+            ],
+        }
+    }
+
+    // Verify old events disappear while post-snapshot events remain active.
+    #[test]
+    fn replay_history_replaces_events_at_compaction_boundary() {
+        let events = vec![
+            drift_storage::SessionEvent::Message {
+                role: "user".into(),
+                content: "deleted old request".into(),
+                reasoning: None,
+            },
+            drift_storage::SessionEvent::ContextCompacted {
+                summary: Some("## summary ##".into()),
+                messages: vec![compacted_message()],
+                saved_tokens: 12,
+            },
+            drift_storage::SessionEvent::Message {
+                role: "user".into(),
+                content: "new request".into(),
+                reasoning: None,
+            },
+            drift_storage::SessionEvent::ToolResult {
+                call_id: "call-2".into(),
+                name: "read".into(),
+                success: true,
+                content: "new result".into(),
+                error: None,
+            },
+        ];
+
+        let (messages, summary) = replay_history(&events);
+        assert_eq!(summary.as_deref(), Some("## summary ##"));
+        assert_eq!(messages.len(), 3);
+        assert!(!messages.iter().any(|message| {
+            message.content.iter().any(
+                |part| matches!(part, ContentPart::Text(text) if text == "deleted old request"),
+            )
+        }));
+        assert!(matches!(
+            &messages[0].content[1],
+            ContentPart::ToolCall { id, .. } if id == "call-1"
+        ));
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "call-2"
+        ));
+    }
+
+    // Verify transcripts without compaction retain their original replay behavior.
+    #[test]
+    fn replay_history_preserves_legacy_transcript_semantics() {
+        let events = vec![
+            drift_storage::SessionEvent::Message {
+                role: "user".into(),
+                content: "request".into(),
+                reasoning: None,
+            },
+            drift_storage::SessionEvent::Message {
+                role: "assistant".into(),
+                content: "calling".into(),
+                reasoning: Some("thinking".into()),
+            },
+            drift_storage::SessionEvent::ToolCall {
+                call_id: "call-1".into(),
+                name: "read".into(),
+                args: serde_json::json!({"path": "x"}),
+            },
+            drift_storage::SessionEvent::ToolResult {
+                call_id: "call-1".into(),
+                name: "read".into(),
+                success: false,
+                content: String::new(),
+                error: Some("denied".into()),
+            },
+        ];
+
+        let (messages, summary) = replay_history(&events);
+        assert!(summary.is_none());
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[1].content[0], ContentPart::Reasoning(_)));
+        assert!(matches!(
+            messages[1].content[2],
+            ContentPart::ToolCall { .. }
+        ));
+        assert!(matches!(
+            messages[2].content[0],
+            ContentPart::ToolResult { is_error: true, .. }
+        ));
+    }
+
+    // Verify conversion preserves IDs, flags, arguments, text, and reasoning.
+    #[test]
+    fn persisted_message_conversion_preserves_all_content_parts() {
+        let source = vec![LlmMessage {
+            role: "assistant".into(),
+            content: vec![
+                ContentPart::Text("answer".into()),
+                ContentPart::ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+                ContentPart::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "result".into(),
+                    is_error: true,
+                },
+                ContentPart::Reasoning("thought".into()),
+            ],
+        }];
+        let restored = from_persisted_messages(&to_persisted_messages(&source));
+        assert_eq!(restored[0].role, source[0].role);
+        assert_eq!(restored[0].content.len(), 4);
+        assert!(matches!(
+            restored[0].content[2],
+            ContentPart::ToolResult { is_error: true, .. }
+        ));
+    }
+    // Empty stream fixture used by the provider implementation under test.
+    struct EmptyStream;
+
+    impl tokio_stream::Stream for EmptyStream {
+        type Item = Result<drift_llm::LlmChunk, drift_llm::LlmError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    // Provider fixture that fails during summary generation without network access.
+    struct FailingSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingSummaryProvider {
+        fn provider_id(&self) -> &str {
+            "fake"
+        }
+
+        fn model_name(&self) -> &str {
+            "fake"
+        }
+
+        fn context_window(&self) -> usize {
+            100
+        }
+
+        async fn stream_chat(
+            &self,
+            _messages: Vec<LlmMessage>,
+            _system_prompt: Option<String>,
+            _temperature: Option<f64>,
+            _max_output_tokens: Option<usize>,
+            _tools: Option<Vec<serde_json::Value>>,
+        ) -> Result<drift_llm::LlmResponseStream, drift_llm::LlmError> {
+            Ok(drift_llm::LlmResponseStream::new(EmptyStream))
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<LlmMessage>,
+            _system_prompt: Option<String>,
+        ) -> Result<String, drift_llm::LlmError> {
+            Err(drift_llm::LlmError::Stream("fake summary failure".into()))
+        }
+    }
+
+    // Verify failed summaries emit no Done event and no persisted snapshot.
+    #[tokio::test]
+    async fn failed_summary_does_not_persist_compaction_or_emit_done() {
+        let root = std::env::temp_dir().join(format!("drift-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config =
+            AppConfig::load_for_workspace(&root, None, None, None).expect("test config");
+        config.agent.auto_compaction = true;
+        config.agent.compaction_threshold = 0.1;
+        config.agent.compaction_target = 0.05;
+        let permission_engine = PermissionEngine::new(&config.security, "default");
+        let file_access = std::sync::Arc::new(permission_engine.file_access_guard(&root).unwrap());
+        let network = std::sync::Arc::new(permission_engine.network_guard());
+        let session_store =
+            std::sync::Arc::new(drift_storage::SessionStore::new(root.join("store")).unwrap());
+        let (session_id, _) = session_store
+            .create(root.to_string_lossy().as_ref(), "fake")
+            .unwrap();
+        let (event_tx, _) = broadcast::channel(32);
+        let mut agent = Agent {
+            config,
+            llm: Box::new(FailingSummaryProvider),
+            tool_registry: ToolRegistry::new(),
+            permission_engine,
+            permission_rx: None,
+            event_tx,
+            context: ContextManager::new(100, 0.1, 0.05),
+            cwd: root.clone(),
+            session_id,
+            session_store: session_store.clone(),
+            file_access,
+            network,
+        };
+        agent.set_messages(vec![LlmMessage::user("old request ".repeat(1000))]);
+        let mut events = agent.subscribe();
+
+        agent.submit("new request".into()).await;
+
+        let mut emitted_done = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, EventMsg::Done) {
+                emitted_done = true;
+            }
+        }
+        assert!(!emitted_done);
+        let stored = session_store.read_events(session_id).unwrap();
+        assert!(!stored.iter().any(|event| {
+            matches!(event, drift_storage::SessionEvent::ContextCompacted { .. })
+        }));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+    // Verify an applied snapshot survives JSONL persistence and replay.
+    #[test]
+    fn persisted_snapshot_replays_after_apply_compaction() {
+        let root = std::env::temp_dir().join(format!("drift-snapshot-{}", uuid::Uuid::new_v4()));
+        let store = drift_storage::SessionStore::new(root.join("store")).unwrap();
+        let (session_id, _) = store
+            .create(root.to_string_lossy().as_ref(), "fake")
+            .unwrap();
+        let snapshot = crate::context::CompactionSnapshot {
+            messages: vec![LlmMessage::user("initial request")],
+            summary: Some("## summary ##".into()),
+        };
+        let mut manager = ContextManager::new(1000, 0.75, 0.4);
+        manager.apply_compaction(&snapshot);
+        let event = drift_storage::SessionEvent::ContextCompacted {
+            summary: snapshot.summary.clone(),
+            messages: to_persisted_messages(&snapshot.messages),
+            saved_tokens: 42,
+        };
+        store.append_event(session_id, &event).unwrap();
+
+        let events = store.read_events(session_id).unwrap();
+        let (messages, summary) = replay_history(&events);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(summary.as_deref(), Some("## summary ##"));
+        assert_eq!(messages[0].role, "user");
+
+        std::fs::remove_dir_all(root).ok();
+    }
 }

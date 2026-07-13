@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use drift_config::AppConfig;
 use drift_core::{Agent, EventMsg};
+use drift_security::types::PermissionResponse;
 use drift_tools::{
     ToolRegistry,
     tools::{
@@ -9,8 +10,7 @@ use drift_tools::{
         write::WriteTool,
     },
 };
-use drift_security::types::PermissionResponse;
-use drift_tui::{AppEvent, TuiApp, TuiCommand, ChatMessage};
+use drift_tui::{AppEvent, ChatMessage, TuiApp, TuiCommand};
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -56,7 +56,11 @@ fn translate_events_to_chat_messages(events: &[drift_storage::SessionEvent]) -> 
 
     for event in events {
         match event {
-            drift_storage::SessionEvent::Message { role, content, reasoning } => {
+            drift_storage::SessionEvent::Message {
+                role,
+                content,
+                reasoning,
+            } => {
                 messages.push(ChatMessage {
                     role: role.clone(),
                     content: content.clone(),
@@ -67,14 +71,25 @@ fn translate_events_to_chat_messages(events: &[drift_storage::SessionEvent]) -> 
                     thinking_tools: Vec::new(),
                 });
             }
-            drift_storage::SessionEvent::ToolCall { call_id: _, name, args } => {
+            drift_storage::SessionEvent::ToolCall {
+                call_id: _,
+                name,
+                args,
+            } => {
                 if let Some(last) = messages.last_mut() {
                     if last.role == "assistant" {
-                        last.thinking_tools.push(format!("> Calling tool: {} with {}", name, args));
+                        last.thinking_tools
+                            .push(format!("> Calling tool: {} with {}", name, args));
                     }
                 }
             }
-            drift_storage::SessionEvent::ToolResult { call_id: _, name, success, content: _, error } => {
+            drift_storage::SessionEvent::ToolResult {
+                call_id: _,
+                name,
+                success,
+                content: _,
+                error,
+            } => {
                 if let Some(last) = messages.last_mut() {
                     if last.role == "assistant" {
                         last.thinking_tools.push(format!(
@@ -88,6 +103,8 @@ fn translate_events_to_chat_messages(events: &[drift_storage::SessionEvent]) -> 
                     }
                 }
             }
+            // Compaction snapshots are internal context state, not chat messages.
+            drift_storage::SessionEvent::ContextCompacted { .. } => {}
         }
     }
 
@@ -158,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
             tool_registry.register_builtin(Arc::new(TodoWriteTool));
 
             // Establish Persistence Paths & Handle Boot Bootstrapping
-            let drift_dir = AppConfig::global_config_dir().unwrap_or_else(|| std::path::PathBuf::from(".drift"));
+            let drift_dir = AppConfig::global_config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from(".drift"));
             let session_store = std::sync::Arc::new(drift_storage::SessionStore::new(drift_dir)?);
 
             let (session_id, history_events) = if let Some(ref s_str) = cli.session {
@@ -166,15 +184,18 @@ async fn main() -> anyhow::Result<()> {
                     if let Ok(events) = session_store.read_events(parsed_id) {
                         (parsed_id, events)
                     } else {
-                        let (new_id, _) = session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
+                        let (new_id, _) =
+                            session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
                         (new_id, Vec::new())
                     }
                 } else {
-                    let (new_id, _) = session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
+                    let (new_id, _) =
+                        session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
                     (new_id, Vec::new())
                 }
             } else {
-                let (new_id, _) = session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
+                let (new_id, _) =
+                    session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
                 (new_id, Vec::new())
             };
 
@@ -258,9 +279,8 @@ async fn main() -> anyhow::Result<()> {
                             let _ = tui_tx.send(AppEvent::ProviderConfig { name, config });
                         }
                         Ok(EventMsg::ContextCompacting) => {
-                            let _ = tui_tx.send(AppEvent::AgentStatus(
-                                "Compacting context...".to_string(),
-                            ));
+                            let _ = tui_tx
+                                .send(AppEvent::AgentStatus("Compacting context...".to_string()));
                         }
                         Ok(EventMsg::ContextCompacted { saved_tokens, .. }) => {
                             let _ = tui_tx.send(AppEvent::AgentStatus(format!(
@@ -294,11 +314,28 @@ async fn main() -> anyhow::Result<()> {
                                 messages: translate_events_to_chat_messages(&events),
                             });
                         }
-                        Ok(EventMsg::PermissionRequest { request_id, tool_name, args_summary, reason, .. }) => {
-                            let _ = tui_tx.send(AppEvent::PermissionRequest { request_id, tool_name, args_summary, reason });
+                        Ok(EventMsg::PermissionRequest {
+                            request_id,
+                            tool_name,
+                            args_summary,
+                            reason,
+                            ..
+                        }) => {
+                            let _ = tui_tx.send(AppEvent::PermissionRequest {
+                                request_id,
+                                tool_name,
+                                args_summary,
+                                reason,
+                            });
                         }
-                        Ok(EventMsg::PermissionResolved { request_id, allowed }) => {
-                            let _ = tui_tx.send(AppEvent::PermissionResolved { request_id, allowed });
+                        Ok(EventMsg::PermissionResolved {
+                            request_id,
+                            allowed,
+                        }) => {
+                            let _ = tui_tx.send(AppEvent::PermissionResolved {
+                                request_id,
+                                allowed,
+                            });
                         }
                         _ => {}
                     }
@@ -455,7 +492,10 @@ async fn main() -> anyhow::Result<()> {
                         TuiCommand::SwitchSession(target_id) => {
                             if let Ok(events) = session_store.read_events(target_id) {
                                 agent.lock().await.switch_session(target_id, &events);
-                                let _ = event_tx.send(EventMsg::SessionLoaded { session_id: target_id, events });
+                                let _ = event_tx.send(EventMsg::SessionLoaded {
+                                    session_id: target_id,
+                                    events,
+                                });
                             } else {
                                 let _ = event_tx.send(EventMsg::Error {
                                     message: format!("Failed to read session {}", target_id),
@@ -463,7 +503,11 @@ async fn main() -> anyhow::Result<()> {
                                 });
                             }
                         }
-                        TuiCommand::PermissionResponse { request_id, allowed, remember } => {
+                        TuiCommand::PermissionResponse {
+                            request_id,
+                            allowed,
+                            remember,
+                        } => {
                             // Map the TUI decision to a PermissionResponse variant.
                             let resp = match (allowed, remember) {
                                 (true, false) => PermissionResponse::Allow,
@@ -473,7 +517,10 @@ async fn main() -> anyhow::Result<()> {
                             };
                             let _ = perm_tx.send(resp);
                             // Mark the request as resolved for TUI display.
-                            let _ = event_tx.send(EventMsg::PermissionResolved { request_id, allowed });
+                            let _ = event_tx.send(EventMsg::PermissionResolved {
+                                request_id,
+                                allowed,
+                            });
                         }
                     }
                 }
