@@ -3,3 +3,24 @@ name = "drift-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "drift-mcp-test-server"
+path = "tests/support/stdio_server.rs"
+test = false
+
+[dependencies]
+drift-config = { path = "../drift-config" }
+drift-tools = { path = "../drift-tools" }
+rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "which-command"] }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+tracing.workspace = true
+
+[dev-dependencies]
+drift-security = { path = "../drift-security" }
+uuid.workspace = true
