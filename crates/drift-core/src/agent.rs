@@ -217,7 +217,7 @@ impl ActiveToolCall {
 pub struct Agent {
     config: AppConfig,
     llm: Box<dyn LlmProvider>,
-    tool_registry: ToolRegistry,
+    tool_registry: std::sync::Arc<ToolRegistry>,
     /// Permission engine for tool call approval.
     permission_engine: PermissionEngine,
     /// Channel the bridge task writes user permission responses into.
@@ -236,7 +236,7 @@ impl Agent {
     pub fn new(
         config: AppConfig,
         cwd: PathBuf,
-        tool_registry: ToolRegistry,
+        tool_registry: std::sync::Arc<ToolRegistry>,
         session_id: uuid::Uuid,
         session_store: std::sync::Arc<drift_storage::SessionStore>,
         security_config: &SecurityConfig,
@@ -1232,7 +1232,7 @@ mod tests {
         let mut agent = Agent {
             config,
             llm: Box::new(FailingSummaryProvider),
-            tool_registry: ToolRegistry::new(),
+            tool_registry: std::sync::Arc::new(ToolRegistry::new()),
             permission_engine,
             permission_rx: None,
             event_tx,

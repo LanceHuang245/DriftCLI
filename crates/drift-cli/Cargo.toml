@@ -15,6 +15,7 @@ clap.workspace = true
 drift-config = { path = "../drift-config" }
 drift-core = { path = "../drift-core" }
 drift-tools = { path = "../drift-tools" }
+drift-mcp = { path = "../drift-mcp" }
 drift-security = { path = "../drift-security" }
 drift-tui = { path = "../drift-tui" }
 anyhow.workspace = true
