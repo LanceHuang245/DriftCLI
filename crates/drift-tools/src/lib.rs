@@ -49,6 +49,8 @@ pub enum ToolError {
     InvalidArgs(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("tool execution failed: {0}")]
+    ExecutionFailed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("tool error: {0}")]
@@ -116,6 +118,23 @@ impl ToolRegistry {
         self.dynamic.write().await.remove(name);
     }
 
+    /// Remove several dynamic tools while holding one write lock.
+    pub async fn unregister_many<I, S>(&self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut dynamic = self.dynamic.write().await;
+        for name in names {
+            dynamic.remove(name.as_ref());
+        }
+    }
+
+    /// Remove all dynamic tools without touching built-ins.
+    pub async fn clear_dynamic(&self) {
+        self.dynamic.write().await.clear();
+    }
+
     /// Look up a tool by name (synchronous, blocks for a read lock if needed).
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.builtins
@@ -161,5 +180,62 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "dummy"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                success: true,
+                content: self.name.clone(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unregister_many_only_removes_requested_dynamic_tools() {
+        let registry = ToolRegistry::new();
+        registry
+            .register_dynamic(Arc::new(DummyTool { name: "one".into() }))
+            .await;
+        registry
+            .register_dynamic(Arc::new(DummyTool { name: "two".into() }))
+            .await;
+        registry
+            .register_dynamic(Arc::new(DummyTool { name: "three".into() }))
+            .await;
+
+        registry.unregister_many(["one", "three"]).await;
+
+        assert!(registry.get_async("one").await.is_none());
+        assert!(registry.get_async("three").await.is_none());
+        assert!(registry.get_async("two").await.is_some());
     }
 }
