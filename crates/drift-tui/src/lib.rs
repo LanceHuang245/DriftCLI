@@ -37,6 +37,8 @@ pub enum AppEvent {
         duration_ms: u64,
     },
     AgentStatus(String),
+    /// Status update emitted by an MCP server lifecycle task.
+    McpStatus { server_id: String, status: String },
     Error(String),
     Done,
     Interrupted,
@@ -992,6 +994,9 @@ impl TuiApp {
             // Update the status bar text directly.
             AppEvent::AgentStatus(status) => {
                 self.status_text = status;
+            }
+            AppEvent::McpStatus { server_id, status } => {
+                self.status_text = format!("MCP {}: {}", server_id, status);
             }
             // Display an error — in connect mode show in form, otherwise as system message.
             AppEvent::Error(msg) => {
@@ -2097,3 +2102,27 @@ impl TuiApp {
 }
 
 pub use input::InputAction;
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_status_updates_status_bar() {
+        let config = LlmConfig::Anthropic {
+            api_key: String::new(),
+            model: "test-model".into(),
+            base_url: "https://example.com".into(),
+            reasoning_effort: None,
+        };
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+        app.handle_app_event(AppEvent::McpStatus {
+            server_id: "fixture".into(),
+            status: "connected (1 tools)".into(),
+        });
+        assert_eq!(app.status_text, "MCP fixture: connected (1 tools)");
+    }
+}
