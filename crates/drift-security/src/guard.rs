@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Guards file access: ensures operations stay within the working directory
 /// and don't touch protected paths.
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub struct FileAccessGuard {
     /// Absolute, canonical working directory.
     working_dir: PathBuf,
-    /// Glob-like patterns for paths that are always read-only.
+    /// Workspace-relative glob-like patterns for paths that are always read-only.
     protected_patterns: Vec<String>,
 }
 
@@ -50,8 +50,11 @@ impl FileAccessGuard {
                 resolved.display().to_string(),
             ));
         }
-        // Check protected patterns
-        let path_str = resolved.to_string_lossy();
+        // Match configured patterns against the workspace-relative path they describe.
+        let path_str = resolved
+            .strip_prefix(&self.working_dir)
+            .expect("workspace boundary was checked above")
+            .to_string_lossy();
         for pattern in &self.protected_patterns {
             if Self::simple_glob_match(pattern, &path_str) {
                 return Err(AccessDenied::ProtectedPath(path_str.to_string()));
@@ -60,33 +63,33 @@ impl FileAccessGuard {
         Ok(())
     }
 
-    /// Resolve a path: if absolute, use as-is; if relative, join with working_dir.
-    /// Resolve a path before a tool performs its filesystem operation.
+    /// Resolve existing components through symlinks while preserving a missing target suffix.
     pub fn resolve(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            // Try to canonicalize; if it doesn't exist yet, normalize manually
-            path.canonicalize().unwrap_or_else(|_| {
-                // Normalize ".." and "." manually
-                let mut components = Vec::new();
-                for c in path.components() {
-                    match c {
-                        std::path::Component::ParentDir => {
-                            components.pop();
-                        }
-                        std::path::Component::CurDir => {}
-                        other => components.push(other),
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_dir.join(path)
+        };
+
+        let mut resolved = PathBuf::new();
+        for component in candidate.components() {
+            match component {
+                Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+                Component::RootDir => resolved.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(part) => {
+                    resolved.push(part);
+                    // Canonicalize each existing component so a symlink cannot hide an escape.
+                    if let Ok(canonical) = resolved.canonicalize() {
+                        resolved = canonical;
                     }
                 }
-                let mut result = PathBuf::new();
-                for c in components {
-                    result.push(c);
-                }
-                result
-            })
-        } else {
-            let joined = self.working_dir.join(path);
-            joined.canonicalize().unwrap_or(joined)
+            }
         }
+        resolved
     }
 
     /// Simple glob matching: `*` matches any sequence, `?` matches one char.
@@ -168,6 +171,34 @@ impl FileAccessGuard {
 mod tests {
     use super::*;
 
+    struct TestWorkspace {
+        root: PathBuf,
+        workspace: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("drift-guard-{}", uuid::Uuid::new_v4()));
+            let workspace = root.join("workspace");
+            let outside = root.join("outside");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            Self {
+                root,
+                workspace,
+                outside,
+            }
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            // Keep temporary test data from leaking into later test runs.
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn test_within_workspace() {
         let dir = std::env::current_dir().unwrap();
@@ -188,6 +219,44 @@ mod tests {
         };
         assert!(guard.check_read(outside).is_err());
     }
+
+    #[test]
+    fn test_missing_target_cannot_traverse_outside_workspace() {
+        let fixture = TestWorkspace::new();
+        let guard = FileAccessGuard::new(&fixture.workspace, &[]).unwrap();
+
+        let error = guard
+            .check_write(Path::new("../outside/new-file.txt"))
+            .unwrap_err();
+
+        assert!(matches!(error, AccessDenied::OutsideWorkspace(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_missing_target_cannot_escape_through_symlink_parent() {
+        let fixture = TestWorkspace::new();
+        std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("linked")).unwrap();
+        let guard = FileAccessGuard::new(&fixture.workspace, &[]).unwrap();
+
+        let error = guard
+            .check_write(Path::new("linked/new-file.txt"))
+            .unwrap_err();
+
+        assert!(matches!(error, AccessDenied::OutsideWorkspace(_)));
+    }
+
+    #[test]
+    fn test_protected_pattern_matches_workspace_relative_path() {
+        let fixture = TestWorkspace::new();
+        std::fs::create_dir(fixture.workspace.join(".git")).unwrap();
+        let guard = FileAccessGuard::new(&fixture.workspace, &[String::from(".git/*")]).unwrap();
+
+        let error = guard.check_write(Path::new(".git/config")).unwrap_err();
+
+        assert!(matches!(error, AccessDenied::ProtectedPath(_)));
+    }
+
     #[test]
     fn test_simple_glob_match() {
         assert!(FileAccessGuard::simple_glob_match("*.env", ".env"));
