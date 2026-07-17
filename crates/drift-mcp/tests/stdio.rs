@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use drift_config::{McpConfig, McpServerConfig, McpTransport};
 use drift_mcp::McpManager;
-use drift_security::{PermissionEngine, SecurityConfig};
+use drift_security::{PermissionEngine, ProcessSandbox, SandboxMode, SecurityConfig};
 use drift_tools::tools::read::ReadTool;
 use drift_tools::{ToolContext, ToolRegistry};
 use tokio::sync::mpsc;
@@ -15,6 +15,11 @@ fn marker_path() -> PathBuf {
         .expect("clock must be valid")
         .as_nanos();
     std::env::temp_dir().join(format!("drift-mcp-fixture-{suffix}.marker"))
+}
+
+fn unrestricted_sandbox() -> Arc<ProcessSandbox> {
+    let cwd = std::env::current_dir().expect("cwd must exist");
+    Arc::new(ProcessSandbox::new(SandboxMode::DangerFullAccess, &cwd).unwrap())
 }
 
 #[tokio::test]
@@ -61,6 +66,7 @@ async fn stdio_servers_register_call_and_shutdown() {
         },
         registry.clone(),
         status_tx,
+        unrestricted_sandbox(),
     ));
 
     manager.clone().start_auto_servers().await;
@@ -98,6 +104,7 @@ async fn stdio_servers_register_call_and_shutdown() {
         tool_call_id: "test-call".into(),
         file_access: Arc::new(engine.file_access_guard(&cwd).expect("guard must build")),
         network: Arc::new(engine.network_guard()),
+        process_sandbox: unrestricted_sandbox(),
     };
     let result = tool
         .execute(serde_json::json!({"text": "hello"}), &ctx)
@@ -144,6 +151,7 @@ async fn shutdown_cancels_in_progress_startup() {
         },
         registry.clone(),
         status_tx,
+        unrestricted_sandbox(),
     ));
     let start_task = tokio::spawn(manager.clone().start_auto_servers());
 
@@ -187,6 +195,7 @@ async fn provider_invalid_tool_name_fails_without_registration() {
         },
         registry.clone(),
         status_tx,
+        unrestricted_sandbox(),
     ));
 
     manager.clone().start_auto_servers().await;
@@ -203,4 +212,37 @@ async fn provider_invalid_tool_name_fails_without_registration() {
             .is_none()
     );
     manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_only_sandbox_does_not_start_mcp_processes() {
+    let server = McpServerConfig {
+        id: "read-only".into(),
+        command: "this-command-must-not-be-resolved".into(),
+        args: Vec::new(),
+        env: Default::default(),
+        transport: McpTransport::Stdio,
+        auto_start: true,
+    };
+    let registry = Arc::new(ToolRegistry::new());
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let cwd = std::env::current_dir().expect("cwd must exist");
+    let sandbox = Arc::new(ProcessSandbox::new(SandboxMode::ReadOnly, &cwd).unwrap());
+    let manager = Arc::new(McpManager::with_status_sender(
+        McpConfig {
+            enabled: true,
+            servers: vec![server],
+        },
+        registry,
+        status_tx,
+        sandbox,
+    ));
+
+    // Read-only mode reports the disabled server without resolving or spawning its command.
+    manager.start_auto_servers().await;
+
+    assert_eq!(
+        status_rx.try_recv().unwrap(),
+        ("read-only".into(), "disabled: read-only sandbox".into())
+    );
 }

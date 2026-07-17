@@ -26,6 +26,7 @@ pub struct ToolContext {
     pub tool_call_id: String,
     pub file_access: Arc<drift_security::FileAccessGuard>,
     pub network: Arc<drift_security::NetworkGuard>,
+    pub process_sandbox: Arc<drift_security::ProcessSandbox>,
 }
 
 /// Result returned by a tool after execution.

@@ -7,9 +7,9 @@ use std::collections::HashMap;
 /// Core permission engine: checks tool calls against the active security profile.
 ///
 /// Decision flow:
-/// 1. If security is disabled → Allow
-/// 2. If tool is in safe_tools → Allow
-/// 3. If sandbox is ReadOnly and tool mutates → Deny
+/// 1. If sandbox is ReadOnly and tool mutates → Deny
+/// 2. If security is disabled → Allow
+/// 3. If tool is in safe_tools → Allow
 /// 4. Check do_loop circuit breaker → escalate to Ask
 /// 5. Check critical command patterns → escalate to Ask
 /// 6. Match tool_rules patterns (last-match-wins) → Allow/Ask/Deny
@@ -102,7 +102,17 @@ impl PermissionEngine {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> PermissionDecision {
-        // 0. Security disabled → allow everything
+        // The OS sandbox is a hard boundary and cannot be bypassed by approval settings.
+        if self.profile.sandbox_mode == SandboxMode::ReadOnly && self.is_mutating_tool(tool_name) {
+            return PermissionDecision::Denied {
+                reason: format!(
+                    "Tool '{}' is not allowed in ReadOnly sandbox mode",
+                    tool_name
+                ),
+            };
+        }
+
+        // 0. Security disabled → allow everything within the sandbox boundary
         if !self.enabled {
             return PermissionDecision::Allowed {
                 rule: "security_disabled".into(),
@@ -132,17 +142,6 @@ impl PermissionEngine {
                 };
             }
         }
-        // 2. ReadOnly sandbox — deny all mutating tools
-        if self.profile.sandbox_mode == SandboxMode::ReadOnly && self.is_mutating_tool(tool_name)
-        {
-            return PermissionDecision::Denied {
-                reason: format!(
-                    "Tool '{}' is not allowed in ReadOnly sandbox mode",
-                    tool_name
-                ),
-            };
-        }
-
         // 3. Doom loop circuit breaker
         if self.profile.circuit_breakers.doom_loop {
             let fp = DoomLoopTracker::fingerprint(tool_name, args);
@@ -243,14 +242,22 @@ impl PermissionEngine {
 
     /// Check if a tool mutates files or executes commands.
     fn is_mutating_tool(&self, tool_name: &str) -> bool {
-        matches!(
-            tool_name,
-            "bash" | "Bash"
-                | "write" | "Write"
-                | "edit" | "Edit"
-                | "web_fetch" | "webfetch" | "WebFetch"
-                | "web_search" | "websearch" | "WebSearch"
-        )
+        tool_name.starts_with("mcp__")
+            || matches!(
+                tool_name,
+                "bash"
+                    | "Bash"
+                    | "write"
+                    | "Write"
+                    | "edit"
+                    | "Edit"
+                    | "web_fetch"
+                    | "webfetch"
+                    | "WebFetch"
+                    | "web_search"
+                    | "websearch"
+                    | "WebSearch"
+            )
     }
 
     /// Extract a human-readable arg string for pattern matching.
@@ -482,12 +489,20 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tools_default_to_ask_across_profiles() {
+    fn mcp_tools_ask_unless_read_only_denies_execution() {
         let config = SecurityConfig::default();
-        for profile in ["default", "auto", "readonly", "danger"] {
+        for profile in ["default", "auto", "danger"] {
             let mut engine = PermissionEngine::new(&config, profile);
-            assert!(is_ask(engine.check_tool_permission("mcp__server__tool", &serde_json::json!({}))));
+            assert!(is_ask(engine.check_tool_permission(
+                "mcp__server__tool",
+                &serde_json::json!({})
+            )));
         }
+        let mut read_only = PermissionEngine::new(&config, "readonly");
+        assert!(matches!(
+            read_only.check_tool_permission("mcp__server__tool", &serde_json::json!({})),
+            PermissionDecision::Denied { .. }
+        ));
     }
 
     #[test]
@@ -543,5 +558,19 @@ mod tests {
             engine.check_tool_permission("mcp__server__tool", &serde_json::json!({})),
             PermissionDecision::Allowed { .. }
         ));
+    }
+
+    #[test]
+    fn read_only_boundary_survives_disabled_approval_checks() {
+        let config = SecurityConfig::default();
+        let profile = config.profiles["readonly"].clone();
+        let mut engine = PermissionEngine::with_profile(profile, false);
+
+        for tool in ["bash", "write", "edit", "mcp__server__tool"] {
+            assert!(matches!(
+                engine.check_tool_permission(tool, &serde_json::json!({})),
+                PermissionDecision::Denied { .. }
+            ));
+        }
     }
 }

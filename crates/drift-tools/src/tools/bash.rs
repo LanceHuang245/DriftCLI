@@ -3,7 +3,6 @@
 use crate::{Tool, ToolContext, ToolError, ToolResult};
 use std::path::Path;
 use std::process::Stdio;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 pub struct BashTool;
@@ -132,11 +131,13 @@ impl Tool for BashTool {
         // Detect the best available shell
         let shell = ShellConfig::detect();
 
-        // Build the command: shell -c "command"
-        let mut cmd = Command::new(&shell.program);
-        cmd.args(&shell.arg_prefix);
-        cmd.arg(command_text);
-        cmd.current_dir(&canonical_workdir);
+        // Build the shell command inside the active OS sandbox boundary.
+        let mut shell_args = shell.arg_prefix;
+        shell_args.push(command_text.to_string());
+        let mut cmd = ctx
+            .process_sandbox
+            .command(&shell.program, &shell_args, &canonical_workdir)
+            .map_err(|error| ToolError::PermissionDenied(error.to_string()))?;
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());

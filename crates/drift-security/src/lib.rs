@@ -11,6 +11,7 @@ pub mod guard;
 pub mod network;
 pub mod pattern;
 pub mod redact;
+pub mod sandbox;
 pub mod types;
 
 pub use circuit::DoomLoopTracker;
@@ -19,4 +20,5 @@ pub use guard::FileAccessGuard;
 pub use network::{NetworkAccessDenied, NetworkGuard};
 pub use pattern::PatternMatcher;
 pub use redact::SensitiveDataFilter;
+pub use sandbox::{ProcessSandbox, SandboxError};
 pub use types::*;

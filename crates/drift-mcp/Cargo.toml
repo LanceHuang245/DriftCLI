@@ -11,6 +11,7 @@ test = false
 
 [dependencies]
 drift-config = { path = "../drift-config" }
+drift-security = { path = "../drift-security" }
 drift-tools = { path = "../drift-tools" }
 rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "which-command"] }
 async-trait.workspace = true
@@ -22,5 +23,4 @@ tokio-util = "0.7"
 tracing.workspace = true
 
 [dev-dependencies]
-drift-security = { path = "../drift-security" }
 uuid.workspace = true

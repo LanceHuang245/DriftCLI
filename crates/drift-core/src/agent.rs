@@ -9,7 +9,7 @@ use drift_llm::{
     ContentPart, LlmChunk, LlmError, LlmMessage, LlmProvider, ModelInfo, create_provider,
     fetch_anthropic_models, fetch_openai_compat_models,
 };
-use drift_security::{PermissionDecision, PermissionEngine, SecurityConfig};
+use drift_security::{PermissionDecision, PermissionEngine, ProcessSandbox, SecurityConfig};
 use drift_tools::{ToolContext, ToolRegistry};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -229,6 +229,7 @@ pub struct Agent {
     session_store: std::sync::Arc<drift_storage::SessionStore>,
     file_access: std::sync::Arc<drift_security::FileAccessGuard>,
     network: std::sync::Arc<drift_security::NetworkGuard>,
+    process_sandbox: std::sync::Arc<ProcessSandbox>,
 }
 
 impl Agent {
@@ -251,6 +252,10 @@ impl Agent {
                 .map_err(|error| LlmError::Config(format!("file access guard: {:?}", error)))?,
         );
         let network = std::sync::Arc::new(permission_engine.network_guard());
+        let process_sandbox = std::sync::Arc::new(
+            ProcessSandbox::new(permission_engine.sandbox_mode(), &cwd)
+                .map_err(|error| LlmError::Config(format!("process sandbox: {error}")))?,
+        );
         let context = ContextManager::for_workspace(
             llm.context_window(),
             config.agent.compaction_threshold,
@@ -278,6 +283,7 @@ impl Agent {
             session_store,
             file_access,
             network,
+            process_sandbox,
             permission_engine,
             permission_rx: None,
         })
@@ -299,6 +305,11 @@ impl Agent {
     // Retrieve active session ID.
     pub fn session_id(&self) -> uuid::Uuid {
         self.session_id
+    }
+
+    /// Share the immutable process boundary with MCP child-process management.
+    pub fn process_sandbox(&self) -> std::sync::Arc<ProcessSandbox> {
+        self.process_sandbox.clone()
     }
 
     // Switch the active session and rebuild the LLM history from its transcript.
@@ -667,6 +678,7 @@ impl Agent {
                     tool_call_id: tc.id.clone(),
                     file_access: self.file_access.clone(),
                     network: self.network.clone(),
+                    process_sandbox: self.process_sandbox.clone(),
                 };
 
                 // ── Permission check ──

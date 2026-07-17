@@ -229,10 +229,12 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let (mcp_status_tx, mcp_status_rx) = mpsc::unbounded_channel();
+            let process_sandbox = agent.process_sandbox();
             let mcp_manager = Arc::new(McpManager::with_status_sender(
                 config.mcp.clone(),
                 tool_registry,
                 mcp_status_tx,
+                process_sandbox,
             ));
             let mcp_start_task = tokio::spawn(mcp_manager.clone().start_auto_servers());
 

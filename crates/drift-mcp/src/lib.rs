@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use drift_config::{McpConfig, McpServerConfig, McpTransport};
+use drift_security::{ProcessSandbox, SandboxError, SandboxMode};
 use drift_tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ContentBlock};
@@ -24,6 +25,7 @@ pub struct McpManager {
     status_tx: Option<mpsc::UnboundedSender<(String, String)>>,
     shutdown: CancellationToken,
     connections: Mutex<HashMap<String, McpConnection>>,
+    process_sandbox: Arc<ProcessSandbox>,
 }
 
 struct McpConnection {
@@ -35,6 +37,8 @@ struct McpConnection {
 enum McpRuntimeError {
     #[error("MCP command error: {0}")]
     Command(#[from] std::io::Error),
+    #[error("MCP sandbox error: {0}")]
+    Sandbox(#[from] SandboxError),
     #[error("MCP initialization failed: {0}")]
     Initialize(String),
     #[error("MCP tool discovery failed: {0}")]
@@ -59,13 +63,18 @@ enum McpRuntimeError {
 
 impl McpManager {
     /// Creates a manager that shares the caller's registry.
-    pub fn new(config: McpConfig, tool_registry: Arc<ToolRegistry>) -> Self {
+    pub fn new(
+        config: McpConfig,
+        tool_registry: Arc<ToolRegistry>,
+        process_sandbox: Arc<ProcessSandbox>,
+    ) -> Self {
         Self {
             config,
             tool_registry,
             status_tx: None,
             shutdown: CancellationToken::new(),
             connections: Mutex::new(HashMap::new()),
+            process_sandbox,
         }
     }
 
@@ -74,6 +83,7 @@ impl McpManager {
         config: McpConfig,
         tool_registry: Arc<ToolRegistry>,
         status_tx: mpsc::UnboundedSender<(String, String)>,
+        process_sandbox: Arc<ProcessSandbox>,
     ) -> Self {
         Self {
             config,
@@ -81,12 +91,26 @@ impl McpManager {
             status_tx: Some(status_tx),
             shutdown: CancellationToken::new(),
             connections: Mutex::new(HashMap::new()),
+            process_sandbox,
         }
     }
 
     /// Starts configured auto-start servers in declaration order.
     pub async fn start_auto_servers(self: Arc<Self>) {
         if !self.config.enabled {
+            return;
+        }
+
+        if self.process_sandbox.mode() == SandboxMode::ReadOnly {
+            // Read-only mode must not start MCP executables before any tool is invoked.
+            for server in self
+                .config
+                .servers
+                .iter()
+                .filter(|server| server.auto_start)
+            {
+                self.send_status(&server.id, "disabled: read-only sandbox".into());
+            }
             return;
         }
 
@@ -176,8 +200,13 @@ impl McpManager {
             return Err(McpRuntimeError::UnsupportedTransport(server.id.clone()));
         }
 
-        let mut command = which_command(&server.command)?;
-        command.args(&server.args);
+        let resolved = which_command(&server.command)?;
+        let program = resolved.as_std().get_program().to_owned();
+        let mut command = self.process_sandbox.command(
+            program,
+            &server.args,
+            self.process_sandbox.workspace(),
+        )?;
         for (name, value) in &server.env {
             command.env(name, expand_environment_value(&server.id, value)?);
         }
