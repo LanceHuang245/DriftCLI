@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use drift_config::AppConfig;
 use drift_core::{Agent, EventMsg};
+use drift_mcp::McpManager;
 use drift_security::types::PermissionResponse;
 use drift_tools::{
     ToolRegistry,
@@ -173,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
             tool_registry.register_builtin(Arc::new(WebFetchTool));
             tool_registry.register_builtin(Arc::new(WebSearchTool));
             tool_registry.register_builtin(Arc::new(TodoWriteTool));
+            let tool_registry = Arc::new(tool_registry);
 
             // Establish Persistence Paths & Handle Boot Bootstrapping
             let drift_dir = AppConfig::global_config_dir()
@@ -212,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
             let mut agent = Agent::new(
                 config.clone(),
                 cwd.clone(),
-                tool_registry,
+                tool_registry.clone(),
                 session_id,
                 session_store.clone(),
                 &security_cfg,
@@ -226,10 +228,25 @@ async fn main() -> anyhow::Result<()> {
                 agent.reconstruct_history(&history_events);
             }
 
+            let (mcp_status_tx, mcp_status_rx) = mpsc::unbounded_channel();
+            let mcp_manager = Arc::new(McpManager::with_status_sender(
+                config.mcp.clone(),
+                tool_registry,
+                mcp_status_tx,
+            ));
+            let mcp_start_task = tokio::spawn(mcp_manager.clone().start_auto_servers());
+
             let event_tx = agent.event_sender();
             let llm_config = config.active_llm_config().cloned().unwrap();
 
             let (tui_tx, tui_rx) = mpsc::unbounded_channel();
+            let mcp_tui_tx = tui_tx.clone();
+            let mcp_bridge_task = tokio::spawn(async move {
+                let mut status_rx = mcp_status_rx;
+                while let Some((server_id, status)) = status_rx.recv().await {
+                    let _ = mcp_tui_tx.send(AppEvent::McpStatus { server_id, status });
+                }
+            });
             let mut core_rx = agent.subscribe();
             let agent = Arc::new(tokio::sync::Mutex::new(agent));
             // Event bridge task: subscribes to core Agent events and forwards them to the TUI via an mpsc channel.
@@ -537,7 +554,12 @@ async fn main() -> anyhow::Result<()> {
                 tui.set_messages(translate_events_to_chat_messages(&history_events));
             }
             tui.set_session_id(session_id);
-            tui.run()?;
+            let tui_result = tui.run();
+            mcp_manager.shutdown().await;
+            let _ = mcp_start_task.await;
+            drop(mcp_manager);
+            let _ = mcp_bridge_task.await;
+            tui_result?;
         }
     }
 

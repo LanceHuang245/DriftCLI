@@ -189,6 +189,11 @@ impl PermissionEngine {
             };
         }
 
+        // MCP tools remain user-approved unless an explicit rule matched above.
+        if tool_name.starts_with("mcp__") {
+            return self.make_ask(tool_name, args, "MCP tool requires confirmation");
+        }
+
         // 6. Fall back to approval policy
         match self.profile.approval_policy {
             ApprovalPolicy::Never => PermissionDecision::Allowed {
@@ -464,5 +469,79 @@ impl PermissionEngine {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_ask(decision: PermissionDecision) -> bool {
+        matches!(decision, PermissionDecision::AskUser { .. })
+    }
+
+    #[test]
+    fn mcp_tools_default_to_ask_across_profiles() {
+        let config = SecurityConfig::default();
+        for profile in ["default", "auto", "readonly", "danger"] {
+            let mut engine = PermissionEngine::new(&config, profile);
+            assert!(is_ask(engine.check_tool_permission("mcp__server__tool", &serde_json::json!({}))));
+        }
+    }
+
+    #[test]
+    fn mcp_explicit_and_session_rules_keep_priority() {
+        let mut config = SecurityConfig::default();
+        config
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .tool_rules
+            .insert(
+                "mcp__server__allow".into(),
+                vec![PatternRule {
+                    pattern: "*".into(),
+                    action: PermissionAction::Allow,
+                }],
+            );
+        config
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .tool_rules
+            .insert(
+                "mcp__server__deny".into(),
+                vec![PatternRule {
+                    pattern: "*".into(),
+                    action: PermissionAction::Deny,
+                }],
+            );
+        let mut engine = PermissionEngine::new(&config, "default");
+        assert!(matches!(
+            engine.check_tool_permission("mcp__server__allow", &serde_json::json!({})),
+            PermissionDecision::Allowed { .. }
+        ));
+        assert!(matches!(
+            engine.check_tool_permission("mcp__server__deny", &serde_json::json!({})),
+            PermissionDecision::Denied { .. }
+        ));
+
+        engine.add_session_rule("mcp__server__tool", "*", PermissionAction::Allow);
+        assert!(matches!(
+            engine.check_tool_permission("mcp__server__tool", &serde_json::json!({})),
+            PermissionDecision::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn disabled_security_allows_mcp_tools() {
+        let config = SecurityConfig::default();
+        let profile = config.profiles["default"].clone();
+        let mut engine = PermissionEngine::with_profile(profile, false);
+        assert!(matches!(
+            engine.check_tool_permission("mcp__server__tool", &serde_json::json!({})),
+            PermissionDecision::Allowed { .. }
+        ));
     }
 }

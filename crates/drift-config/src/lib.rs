@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ---------- Core Config ----------
@@ -26,16 +26,63 @@ pub struct AppConfig {
     /// Security / permission configuration
     #[serde(default)]
     pub security: SecurityConfig,
+    /// MCP server configuration.
+    #[serde(default)]
+    pub mcp: McpConfig,
     // Legacy migration marker
     #[serde(skip)]
     #[allow(dead_code)]
     migrated: bool,
 }
 
+/// Top-level MCP configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            servers: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for one MCP server process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub transport: McpTransport,
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+}
+
+/// Supported MCP transports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio,
+}
+
 // Wrapper used to serialize the security configuration under the [security] TOML table.
 #[derive(Serialize)]
 struct SecurityConfigWrapper<'a> {
     security: &'a SecurityConfig,
+}
+
+#[derive(Serialize)]
+struct McpConfigWrapper<'a> {
+    mcp: &'a McpConfig,
 }
 
 // AgentConfig: tunable parameters for the agent's behaviour — model, iteration cap, temperature, thinking budget.
@@ -86,6 +133,10 @@ pub enum LlmConfig {
 
 // ---------- Defaults ----------
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_model() -> String {
     "claude-sonnet-4-5-20250101".into()
 }
@@ -130,8 +181,50 @@ pub enum ConfigError {
     InvalidPermissionMode(String),
     #[error("Security profile not found: {0}")]
     UnknownSecurityProfile(String),
+    #[error("Invalid MCP configuration: {0}")]
+    InvalidMcp(String),
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
+}
+
+impl McpConfig {
+    /// Validates identifiers and process fields before MCP startup.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut server_ids = HashSet::with_capacity(self.servers.len());
+        for server in &self.servers {
+            if server.id.is_empty()
+                || server.id.len() > 56
+                || !server.id.chars().enumerate().all(|(index, ch)| {
+                    (index == 0 && ch.is_ascii_alphanumeric())
+                        || (index > 0 && (ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+                })
+            {
+                return Err(ConfigError::InvalidMcp(format!(
+                    "server '{}' has an invalid or overly long id",
+                    server.id
+                )));
+            }
+            if !server_ids.insert(&server.id) {
+                return Err(ConfigError::InvalidMcp(format!(
+                    "server '{}' has a duplicate id",
+                    server.id
+                )));
+            }
+            if server.command.trim().is_empty() {
+                return Err(ConfigError::InvalidMcp(format!(
+                    "server '{}' has an empty command",
+                    server.id
+                )));
+            }
+            if server.env.keys().any(String::is_empty) {
+                return Err(ConfigError::InvalidMcp(format!(
+                    "server '{}' has an empty environment key",
+                    server.id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AppConfig {
@@ -141,6 +234,7 @@ impl AppConfig {
         let mut config = Self::load_defaults_with_files()?;
         config.apply_env_overrides();
         config.apply_cli_overrides(cli_model, cli_api_key);
+        config.mcp.validate()?;
         Ok(config)
     }
 
@@ -158,6 +252,7 @@ impl AppConfig {
         }
         config.apply_env_overrides();
         config.apply_cli_overrides(cli_model, cli_api_key);
+        config.mcp.validate()?;
         Ok(config)
     }
 
@@ -314,6 +409,7 @@ impl AppConfig {
             active_provider: default_name,
             providers,
             security: SecurityConfig::default(),
+            mcp: McpConfig::default(),
             migrated: false,
         };
 
@@ -485,6 +581,28 @@ impl AppConfig {
             }
         }
 
+        // Merge MCP settings and replace complete server entries by id.
+        if let Some(mcp) = overlay.get("mcp").and_then(|v| v.as_table()) {
+            if let Some(enabled) = mcp.get("enabled").and_then(|v| v.as_bool()) {
+                config.mcp.enabled = enabled;
+            }
+            if let Some(servers) = mcp.get("servers").and_then(|v| v.as_array()) {
+                for value in servers {
+                    let server: McpServerConfig = value.clone().try_into()?;
+                    if let Some(existing) = config
+                        .mcp
+                        .servers
+                        .iter_mut()
+                        .find(|existing| existing.id == server.id)
+                    {
+                        *existing = server;
+                    } else {
+                        config.mcp.servers.push(server);
+                    }
+                }
+            }
+        }
+
         // Backward compat: handle old [llm] format
         if let Some(llm) = overlay.get("llm")
             && config.providers.is_empty()
@@ -607,6 +725,16 @@ auto_compaction = true
 compaction_threshold = 0.75
 compaction_target = 0.4
 
+[mcp]
+enabled = true
+
+# [[mcp.servers]]
+# id = "example"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# transport = "stdio"
+# auto_start = true
+
 [[providers]]
 name = "default"
 provider = "anthropic"
@@ -711,17 +839,19 @@ base_url = "https://api.anthropic.com/v1"
                 name, inner
             ));
         }
+        let mcp = toml::to_string(&McpConfigWrapper { mcp: &self.mcp })?;
         let security = toml::to_string(&SecurityConfigWrapper {
             security: &self.security,
         })?;
         Ok(format!(
-            "# DriftCLI Configuration\n\nactive_provider = \"{}\"\n\n[agent]\nmodel = \"{}\"\nmax_iterations = {}\nauto_compaction = {}\ncompaction_threshold = {}\ncompaction_target = {}\n\n{}",
+            "# DriftCLI Configuration\n\nactive_provider = \"{}\"\n\n[agent]\nmodel = \"{}\"\nmax_iterations = {}\nauto_compaction = {}\ncompaction_threshold = {}\ncompaction_target = {}\n\n{}\n{}",
             self.active_provider,
             self.agent.model,
             self.agent.max_iterations,
             self.agent.auto_compaction,
             self.agent.compaction_threshold,
             self.agent.compaction_target,
+            mcp,
             providers_str,
         ) + &security)
     }
@@ -730,7 +860,6 @@ base_url = "https://api.anthropic.com/v1"
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_default_config() {
         let tmpl = AppConfig::default_template();
@@ -787,6 +916,7 @@ mod tests {
             active_provider: "test".into(),
             providers,
             security: SecurityConfig::default(),
+            mcp: McpConfig::default(),
             migrated: false,
         };
         let summary = config.connection_summary();
@@ -810,6 +940,7 @@ mod tests {
             active_provider: String::new(),
             providers: HashMap::new(),
             security: SecurityConfig::default(),
+            mcp: McpConfig::default(),
             migrated: false,
         };
         let overlay: toml::Value = toml::from_str(
@@ -849,6 +980,151 @@ sandbox_mode = "read-only"
         assert_eq!(
             value["security"]["profiles"]["audit"]["approval_policy"].as_str(),
             Some("never")
+        );
+    }
+
+
+    #[test]
+    fn test_mcp_defaults_and_template() {
+        let config = McpConfig::default();
+        assert!(config.enabled);
+        assert!(config.servers.is_empty());
+        let template = AppConfig::default_template();
+        assert!(template.contains("[mcp]"));
+        assert!(template.contains("# [[mcp.servers]]"));
+    }
+
+    #[test]
+    fn test_mcp_parse_validation_and_layered_merge() {
+        let server = |id: &str| McpServerConfig {
+            id: id.into(),
+            command: "server".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            transport: McpTransport::Stdio,
+            auto_start: true,
+        };
+        let mut config = AppConfig::load_defaults_with_files().unwrap();
+        let first: toml::Value = toml::from_str(
+            r#"
+[mcp]
+enabled = true
+[[mcp.servers]]
+id = "alpha"
+command = "first"
+transport = "stdio"
+[[mcp.servers]]
+id = "keep"
+command = "keep"
+transport = "stdio"
+"#,
+        )
+        .unwrap();
+        let second: toml::Value = toml::from_str(
+            r#"
+[mcp]
+[[mcp.servers]]
+id = "alpha"
+command = "second"
+args = ["--flag"]
+transport = "stdio"
+"#,
+        )
+        .unwrap();
+        AppConfig::merge_toml_value(&mut config, &first).unwrap();
+        AppConfig::merge_toml_value(&mut config, &second).unwrap();
+        assert_eq!(config.mcp.servers.len(), 2);
+        assert_eq!(config.mcp.servers[0].command, "second");
+        assert_eq!(config.mcp.servers[0].args, vec!["--flag"]);
+        assert_eq!(config.mcp.servers[1].id, "keep");
+        config.mcp.validate().unwrap();
+
+        for id in ["bad id", "bad.id", &"a".repeat(57)] {
+            let invalid = McpConfig {
+                enabled: true,
+                servers: vec![server(id)],
+            };
+            assert!(matches!(
+                invalid.validate(),
+                Err(ConfigError::InvalidMcp(_))
+            ));
+        }
+        let duplicate = server("duplicate");
+        let duplicates = McpConfig {
+            enabled: true,
+            servers: vec![duplicate.clone(), duplicate],
+        };
+        assert!(matches!(
+            duplicates.validate(),
+            Err(ConfigError::InvalidMcp(_))
+        ));
+        let invalid_transport = toml::from_str::<McpConfig>(
+            r#"[[servers]]
+id = "bad-transport"
+command = "server"
+transport = "sse"
+"#,
+        );
+        assert!(invalid_transport.is_err());
+        let empty_command = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "empty-command".into(),
+                command: "  ".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                transport: McpTransport::Stdio,
+                auto_start: true,
+            }],
+        };
+        assert!(matches!(
+            empty_command.validate(),
+            Err(ConfigError::InvalidMcp(_))
+        ));
+        let empty_env_key = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "empty-env".into(),
+                command: "server".into(),
+                args: Vec::new(),
+                env: [(String::new(), "value".into())].into_iter().collect(),
+                transport: McpTransport::Stdio,
+                auto_start: true,
+            }],
+        };
+        assert!(matches!(
+            empty_env_key.validate(),
+            Err(ConfigError::InvalidMcp(_))
+        ));
+    }
+
+    #[test]
+    fn test_mcp_serialization_round_trip() {
+        let mut config = AppConfig::load_defaults_with_files().unwrap();
+        let overlay: toml::Value = toml::from_str(
+            r#"
+[mcp]
+enabled = false
+[[mcp.servers]]
+id = "roundtrip"
+command = "server"
+env = { TOKEN = "${TOKEN}" }
+transport = "stdio"
+auto_start = false
+"#,
+        )
+        .unwrap();
+        AppConfig::merge_toml_value(&mut config, &overlay).unwrap();
+        let serialized = config.to_toml_string().unwrap();
+        let parsed: toml::Value = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed["mcp"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            parsed["mcp"]["servers"][0]["id"].as_str(),
+            Some("roundtrip")
+        );
+        assert_eq!(
+            parsed["mcp"]["servers"][0]["auto_start"].as_bool(),
+            Some(false)
         );
     }
 }
