@@ -47,9 +47,7 @@ pub enum PermissionDecision {
     /// Tool call is denied — return error to LLM.
     Denied { reason: String },
     /// User confirmation required — agent pauses and waits for TUI input.
-    AskUser {
-        request: PermissionRequest,
-    },
+    AskUser { request: PermissionRequest },
 }
 
 /// A permission request sent from the agent to the TUI.

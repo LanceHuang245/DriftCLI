@@ -58,7 +58,10 @@ impl PermissionEngine {
                         circuit_breakers: CircuitBreakerConfig::default(),
                         protected_paths: vec![],
                         safe_tools: vec![
-                            "read".into(), "grep".into(), "glob".into(), "todowrite".into(),
+                            "read".into(),
+                            "grep".into(),
+                            "glob".into(),
+                            "todowrite".into(),
                         ],
                     })
             });
@@ -71,10 +74,7 @@ impl PermissionEngine {
             doom_loop,
             request_counter: 0,
             session_rules: Vec::new(),
-            network_guard: NetworkGuard::new(
-                &config.allowed_domains,
-                &config.blocked_domains,
-            ),
+            network_guard: NetworkGuard::new(&config.allowed_domains, &config.blocked_domains),
         }
     }
 
@@ -137,7 +137,11 @@ impl PermissionEngine {
                         reason: format!("Session rule denies '{}'", arg_text),
                     },
                     PermissionAction::Ask => {
-                        return self.make_ask(tool_name, args, "Session rule requires confirmation");
+                        return self.make_ask(
+                            tool_name,
+                            args,
+                            "Session rule requires confirmation",
+                        );
                     }
                 };
             }
@@ -151,16 +155,17 @@ impl PermissionEngine {
                     fingerprint = %fp,
                     "Doom loop detected — forcing Ask"
                 );
-                return self.make_ask(tool_name, args, "Doom loop detected: repeated identical call");
+                return self.make_ask(
+                    tool_name,
+                    args,
+                    "Doom loop detected: repeated identical call",
+                );
             }
         }
 
         // 4. Critical command always-ask (even in Never mode)
         if tool_name == "bash" || tool_name == "Bash" {
-            let cmd = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if DoomLoopTracker::is_critical_command(
                 &self.profile.circuit_breakers.always_ask_commands,
                 cmd,
@@ -218,7 +223,12 @@ impl PermissionEngine {
     }
 
     /// Build an AskUser decision with a unique request ID.
-    fn make_ask(&mut self, tool_name: &str, args: &serde_json::Value, reason: &str) -> PermissionDecision {
+    fn make_ask(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        reason: &str,
+    ) -> PermissionDecision {
         self.request_counter += 1;
         let request_id = format!("perm-{}", self.request_counter);
 
@@ -422,21 +432,27 @@ impl PermissionEngine {
         }
     }
 
-
     /// Record a session-persistent rule from an AllowAlways/DenyAlways decision.
     /// The pattern string should be the tool's arg text (e.g., "cargo build" for bash).
-    pub fn add_session_rule(&mut self, tool_name: &str, args_pattern: &str, action: PermissionAction) {
-        self.session_rules.push((
-            tool_name.to_string(),
-            args_pattern.to_string(),
-            action,
-        ));
+    pub fn add_session_rule(
+        &mut self,
+        tool_name: &str,
+        args_pattern: &str,
+        action: PermissionAction,
+    ) {
+        self.session_rules
+            .push((tool_name.to_string(), args_pattern.to_string(), action));
     }
 
     /// Check whether a file path is accessible given the current sandbox and protected paths.
     /// `working_dir` should be the canonical working directory from the tool context.
     /// `write` indicates whether the operation is a write/edit (enforces protected paths).
-    pub fn check_file_access(&self, working_dir: &std::path::Path, file_path: &std::path::Path, write: bool) -> Result<(), crate::guard::AccessDenied> {
+    pub fn check_file_access(
+        &self,
+        working_dir: &std::path::Path,
+        file_path: &std::path::Path,
+        write: bool,
+    ) -> Result<(), crate::guard::AccessDenied> {
         let guard = self.file_access_guard(working_dir)?;
         if write {
             guard.check_write(file_path)
@@ -459,7 +475,6 @@ impl PermissionEngine {
         self.network_guard.clone()
     }
 
-
     // ── Accessors ──
 
     pub fn profile_name(&self) -> &str {
@@ -478,7 +493,6 @@ impl PermissionEngine {
         self.enabled
     }
 }
-
 
 #[cfg(test)]
 mod tests {

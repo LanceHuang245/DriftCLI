@@ -66,8 +66,13 @@ impl SensitiveDataFilter {
 
         // Sensitive key=value patterns
         let sensitive_keys = &[
-            "password=", "passwd=", "pwd=",
-            "secret=", "api_key=", "apikey=", "token=",
+            "password=",
+            "passwd=",
+            "pwd=",
+            "secret=",
+            "api_key=",
+            "apikey=",
+            "token=",
         ];
 
         // Collect all redaction spans (start, end) before modifying the string
@@ -164,7 +169,8 @@ mod tests {
 
     #[test]
     fn test_redact_private_key() {
-        let input = "File contents:\n-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE KEY-----";
+        let input =
+            "File contents:\n-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE KEY-----";
         let result = SensitiveDataFilter::filter(input);
         assert!(result.contains("[REDACTED"));
         assert!(!result.contains("BEGIN PRIVATE KEY"));

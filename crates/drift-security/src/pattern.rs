@@ -59,7 +59,10 @@ impl PatternMatcher {
 
     /// Find the last matching rule's action in an ordered list of rules.
     /// Returns None if no rule matches (caller should fall back to default behavior).
-    pub fn evaluate_rules(rules: &[super::types::PatternRule], input: &str) -> Option<super::types::PermissionAction> {
+    pub fn evaluate_rules(
+        rules: &[super::types::PatternRule],
+        input: &str,
+    ) -> Option<super::types::PermissionAction> {
         let mut last_match: Option<super::types::PermissionAction> = None;
 
         for rule in rules {
@@ -108,9 +111,18 @@ mod tests {
     #[test]
     fn test_last_match_wins() {
         let rules = vec![
-            super::super::types::PatternRule { pattern: "*".into(), action: super::super::types::PermissionAction::Ask },
-            super::super::types::PatternRule { pattern: "git *".into(), action: super::super::types::PermissionAction::Allow },
-            super::super::types::PatternRule { pattern: "git push *".into(), action: super::super::types::PermissionAction::Ask },
+            super::super::types::PatternRule {
+                pattern: "*".into(),
+                action: super::super::types::PermissionAction::Ask,
+            },
+            super::super::types::PatternRule {
+                pattern: "git *".into(),
+                action: super::super::types::PermissionAction::Allow,
+            },
+            super::super::types::PatternRule {
+                pattern: "git push *".into(),
+                action: super::super::types::PermissionAction::Ask,
+            },
         ];
 
         assert_eq!(
@@ -135,7 +147,10 @@ mod tests {
     fn test_complex_patterns() {
         assert!(PatternMatcher::matches("rm -rf /*", "rm -rf /"));
         assert!(PatternMatcher::matches("rm -rf /*", "rm -rf /home/user"));
-        assert!(PatternMatcher::matches("dd if=*", "dd if=/dev/zero of=image"));
+        assert!(PatternMatcher::matches(
+            "dd if=*",
+            "dd if=/dev/zero of=image"
+        ));
         assert!(PatternMatcher::matches("> /dev/*", "> /dev/null"));
         assert!(PatternMatcher::matches(":(){ :|:& };:", ":(){ :|:& };:"));
     }

@@ -1,5 +1,5 @@
-use crate::types::CircuitBreakerConfig;
 use crate::pattern::PatternMatcher;
+use crate::types::CircuitBreakerConfig;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -35,9 +35,8 @@ impl DoomLoopTracker {
         let now = Instant::now();
 
         // Clean expired entries
-        self.history.retain(|_, (_, first)| {
-            now.duration_since(*first).as_secs() < self.window_secs
-        });
+        self.history
+            .retain(|_, (_, first)| now.duration_since(*first).as_secs() < self.window_secs);
 
         let entry = self.history.entry(key).or_insert((0, now));
         entry.0 += 1;
@@ -69,39 +68,34 @@ impl DoomLoopTracker {
     /// For bash: the command string. For file tools: the target path.
     pub fn fingerprint(tool_name: &str, args: &serde_json::Value) -> String {
         match tool_name {
-            "bash" | "Bash" => {
-                args.get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            }
-            "read" | "Read" | "edit" | "Edit" | "write" | "Write" => {
-                args.get("path")
-                    .or_else(|| args.get("file_path"))
-                    .or_else(|| args.get("filePath"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            }
-            "glob" | "Glob" => {
-                args.get("pattern")
-                    .or_else(|| args.get("path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            }
-            "grep" | "Grep" => {
-                args.get("pattern")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            }
-            "web_fetch" | "webfetch" | "WebFetch" => {
-                args.get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            }
+            "bash" | "Bash" => args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            "read" | "Read" | "edit" | "Edit" | "write" | "Write" => args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .or_else(|| args.get("filePath"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            "glob" | "Glob" => args
+                .get("pattern")
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            "grep" | "Grep" => args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            "web_fetch" | "webfetch" | "WebFetch" => args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             "web_search" | "websearch" | "WebSearch" => args
                 .get("query")
                 .and_then(|v| v.as_str())
