@@ -212,6 +212,26 @@ impl ActiveToolCall {
     }
 }
 
+// Receive only the decision correlated with the active permission request.
+async fn receive_permission_response(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, drift_security::PermissionResponse)>,
+    expected_request_id: &str,
+) -> Option<drift_security::PermissionResponse> {
+    while let Some((request_id, response)) = rx.recv().await {
+        if request_id == expected_request_id {
+            return Some(response);
+        }
+
+        tracing::debug!(
+            request_id,
+            expected_request_id,
+            "Ignoring stale permission response"
+        );
+    }
+
+    None
+}
+
 // Agent: orchestrates a chat session with tool calling — holds config, LLM provider,
 // tool registry, event bus, message history, and working directory.
 pub struct Agent {
@@ -221,7 +241,8 @@ pub struct Agent {
     /// Permission engine for tool call approval.
     permission_engine: PermissionEngine,
     /// Channel the bridge task writes user permission responses into.
-    permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>>,
+    permission_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<(String, drift_security::PermissionResponse)>>,
     event_tx: broadcast::Sender<EventMsg>,
     context: ContextManager,
     cwd: PathBuf,
@@ -292,7 +313,7 @@ impl Agent {
     // Set up the channel through which the TUI bridge sends permission responses back to the agent loop.
     pub fn set_permission_channel(
         &mut self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<drift_security::PermissionResponse>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<(String, drift_security::PermissionResponse)>,
     ) {
         self.permission_rx = Some(rx);
     }
@@ -714,14 +735,15 @@ impl Agent {
                                 risk_level: format!("{:?}", request.risk_level),
                             });
 
-                            // Wait for user response
+                            // Wait for the response matching this request within one total timeout.
                             let response = match &mut self.permission_rx {
-                                Some(rx) => {
-                                    tokio::select! {
-                                        resp = rx.recv() => resp,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => None,
-                                    }
-                                }
+                                Some(rx) => tokio::time::timeout(
+                                    std::time::Duration::from_secs(120),
+                                    receive_permission_response(rx, &request.request_id),
+                                )
+                                .await
+                                .ok()
+                                .flatten(),
                                 None => {
                                     // No channel configured — deny by default
                                     tracing::warn!(
@@ -1302,5 +1324,28 @@ mod tests {
         assert_eq!(messages[0].role, "user");
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    // Verify a stale permission reply cannot authorize a later request.
+    #[tokio::test]
+    async fn permission_response_ignores_stale_request_ids() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send((
+            "expired-request".to_string(),
+            drift_security::PermissionResponse::Allow,
+        ))
+        .unwrap();
+        tx.send((
+            "current-request".to_string(),
+            drift_security::PermissionResponse::Deny,
+        ))
+        .unwrap();
+
+        let response = receive_permission_response(&mut rx, "current-request").await;
+
+        assert!(matches!(
+            response,
+            Some(drift_security::PermissionResponse::Deny)
+        ));
     }
 }

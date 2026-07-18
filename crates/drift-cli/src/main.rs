@@ -534,7 +534,8 @@ async fn main() -> anyhow::Result<()> {
                                 (false, false) => PermissionResponse::Deny,
                                 (false, true) => PermissionResponse::DenyAlways,
                             };
-                            let _ = perm_tx.send(resp);
+                            // Correlate the decision with the exact request shown by the TUI.
+                            let _ = perm_tx.send((request_id.clone(), resp));
                             // Mark the request as resolved for TUI display.
                             let _ = event_tx.send(EventMsg::PermissionResolved {
                                 request_id,
