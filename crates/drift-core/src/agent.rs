@@ -61,6 +61,14 @@ fn to_persisted_messages(messages: &[LlmMessage]) -> Vec<drift_storage::Persiste
         .collect()
 }
 
+/// Apply one redaction boundary to every event before transcript persistence.
+fn redact_session_event(event: &mut drift_storage::SessionEvent) -> Result<(), serde_json::Error> {
+    let mut value = serde_json::to_value(&*event)?;
+    drift_security::SensitiveDataFilter::filter_json(&mut value);
+    *event = serde_json::from_value(value)?;
+    Ok(())
+}
+
 /// Restore provider messages from the dependency-free storage representation.
 fn from_persisted_messages(messages: &[drift_storage::PersistedMessage]) -> Vec<LlmMessage> {
     messages
@@ -354,6 +362,15 @@ impl Agent {
         self.event_tx.subscribe()
     }
 
+    /// Redact all transcript payloads immediately before writing them to disk.
+    fn append_session_event(
+        &self,
+        mut event: drift_storage::SessionEvent,
+    ) -> Result<(), drift_storage::StorageError> {
+        redact_session_event(&mut event)?;
+        self.session_store.append_event(self.session_id, &event)
+    }
+
     // Submit: sends user input to the LLM, handles tool calls in a loop,
     // streams chunks as events, and appends the reply to history.
     pub async fn submit(&mut self, user_input: String) {
@@ -366,14 +383,11 @@ impl Agent {
             .push_message(LlmMessage::user(user_input.clone()));
 
         // Write user message to SessionStore
-        let _ = self.session_store.append_event(
-            self.session_id,
-            &drift_storage::SessionEvent::Message {
-                role: "user".to_string(),
-                content: user_input,
-                reasoning: None,
-            },
-        );
+        let _ = self.append_session_event(drift_storage::SessionEvent::Message {
+            role: "user".to_string(),
+            content: user_input,
+            reasoning: None,
+        });
 
         let max_iterations = self.config.agent.max_iterations;
         // Suppress Done after any failure while still returning the agent to Idle.
@@ -415,7 +429,7 @@ impl Agent {
                     messages: to_persisted_messages(&snapshot.messages),
                     saved_tokens: built_context.saved_tokens,
                 };
-                if let Err(error) = self.session_store.append_event(self.session_id, &event) {
+                if let Err(error) = self.append_session_event(event) {
                     turn_failed = true;
                     let _ = self.event_tx.send(EventMsg::Error {
                         message: format!("Context compaction persistence error: {}", error),
@@ -582,14 +596,11 @@ impl Agent {
                     } else {
                         None
                     };
-                    let _ = self.session_store.append_event(
-                        self.session_id,
-                        &drift_storage::SessionEvent::Message {
-                            role: "assistant".to_string(),
-                            content: full_response,
-                            reasoning: reasoning_opt,
-                        },
-                    );
+                    let _ = self.append_session_event(drift_storage::SessionEvent::Message {
+                        role: "assistant".to_string(),
+                        content: full_response,
+                        reasoning: reasoning_opt,
+                    });
                 }
                 break;
             }
@@ -620,22 +631,19 @@ impl Agent {
             });
 
             // Write assistant message and tool calls to SessionStore
-            let _ = self.session_store.append_event(
-                self.session_id,
-                &drift_storage::SessionEvent::Message {
-                    role: "assistant".to_string(),
-                    content: if has_text {
-                        full_response
-                    } else {
-                        String::new()
-                    },
-                    reasoning: if has_reasoning {
-                        Some(full_reasoning)
-                    } else {
-                        None
-                    },
+            let _ = self.append_session_event(drift_storage::SessionEvent::Message {
+                role: "assistant".to_string(),
+                content: if has_text {
+                    full_response
+                } else {
+                    String::new()
                 },
-            );
+                reasoning: if has_reasoning {
+                    Some(full_reasoning)
+                } else {
+                    None
+                },
+            });
 
             for tc in &completed_tool_calls {
                 let raw_args = tc.args_string();
@@ -643,14 +651,11 @@ impl Agent {
                     Ok(value) => value,
                     Err(_) => serde_json::Value::String(raw_args),
                 };
-                let _ = self.session_store.append_event(
-                    self.session_id,
-                    &drift_storage::SessionEvent::ToolCall {
-                        call_id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        args: args_val,
-                    },
-                );
+                let _ = self.append_session_event(drift_storage::SessionEvent::ToolCall {
+                    call_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    args: args_val,
+                });
             }
 
             // Execute each tool call sequentially
@@ -679,16 +684,14 @@ impl Agent {
                             content: message.clone(),
                             is_error: true,
                         });
-                        let _ = self.session_store.append_event(
-                            self.session_id,
-                            &drift_storage::SessionEvent::ToolResult {
+                        let _ =
+                            self.append_session_event(drift_storage::SessionEvent::ToolResult {
                                 call_id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 success: false,
                                 content: String::new(),
                                 error: Some(message),
-                            },
-                        );
+                            });
                         continue;
                     }
                 };
@@ -871,16 +874,14 @@ impl Agent {
                         });
 
                         // Write ToolResult to SessionStore
-                        let _ = self.session_store.append_event(
-                            self.session_id,
-                            &drift_storage::SessionEvent::ToolResult {
+                        let _ =
+                            self.append_session_event(drift_storage::SessionEvent::ToolResult {
                                 call_id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 success: r.success,
-                                content: drift_security::SensitiveDataFilter::filter(&r.content),
+                                content: r.content,
                                 error: r.error,
-                            },
-                        );
+                            });
                     }
                     Err(e) => {
                         let _ = self.event_tx.send(EventMsg::ToolExecEnd {
@@ -897,16 +898,14 @@ impl Agent {
                         });
 
                         // Write ToolResult (Failure) to SessionStore
-                        let _ = self.session_store.append_event(
-                            self.session_id,
-                            &drift_storage::SessionEvent::ToolResult {
+                        let _ =
+                            self.append_session_event(drift_storage::SessionEvent::ToolResult {
                                 call_id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 success: false,
                                 error: Some(err_str),
                                 content: String::new(), // No content for permission-denied errors
-                            },
-                        );
+                            });
                     }
                 }
             }
@@ -1192,6 +1191,61 @@ mod tests {
             restored[0].content[2],
             ContentPart::ToolResult { is_error: true, .. }
         ));
+    }
+
+    // Verify every payload written to a transcript crosses the same redaction boundary.
+    #[test]
+    fn transcript_redaction_covers_all_persisted_payloads() {
+        let prefixed_secret = "sk-proj-transcript-secret";
+        let plain_secret = "plain-tool-token";
+        let mut events = vec![
+            drift_storage::SessionEvent::Message {
+                role: "assistant".into(),
+                content: prefixed_secret.into(),
+                reasoning: Some(prefixed_secret.into()),
+            },
+            drift_storage::SessionEvent::ToolCall {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                args: serde_json::json!({ "token": plain_secret }),
+            },
+            drift_storage::SessionEvent::ToolResult {
+                call_id: "call-1".into(),
+                name: "bash".into(),
+                success: false,
+                content: prefixed_secret.into(),
+                error: Some(prefixed_secret.into()),
+            },
+            drift_storage::SessionEvent::ContextCompacted {
+                summary: Some(prefixed_secret.into()),
+                messages: vec![drift_storage::PersistedMessage {
+                    role: "assistant".into(),
+                    content: vec![
+                        drift_storage::PersistedContentPart::Text(prefixed_secret.into()),
+                        drift_storage::PersistedContentPart::ToolCall {
+                            id: "call-1".into(),
+                            name: "bash".into(),
+                            arguments: prefixed_secret.into(),
+                        },
+                        drift_storage::PersistedContentPart::ToolResult {
+                            tool_use_id: "call-1".into(),
+                            content: prefixed_secret.into(),
+                            is_error: false,
+                        },
+                        drift_storage::PersistedContentPart::Reasoning(prefixed_secret.into()),
+                    ],
+                }],
+                saved_tokens: 1,
+            },
+        ];
+
+        for event in &mut events {
+            redact_session_event(event).unwrap();
+        }
+
+        let transcript = serde_json::to_string(&events).unwrap();
+        assert!(!transcript.contains(prefixed_secret));
+        assert!(!transcript.contains(plain_secret));
     }
     // Empty stream fixture used by the provider implementation under test.
     struct EmptyStream;

@@ -1,48 +1,70 @@
-/// Strip sensitive data from tool output before persisting to transcript.
+/// Strip sensitive data from session payloads before persisting a transcript.
 ///
-/// Scans for API keys, private keys, tokens, and passwords using substring heuristics.
-/// Matched content is replaced with safe labels.
+/// Scans text and structured arguments for API keys, private keys, tokens, and passwords.
+/// Matched content is replaced with safe labels while preserving non-sensitive structure.
 pub struct SensitiveDataFilter;
 
 impl SensitiveDataFilter {
-    /// Substrings that indicate the entire surrounding line should be redacted.
-    const BLOCK_PATTERNS: &'static [&'static str] = &[
-        "-----BEGIN RSA PRIVATE KEY-----",
-        "-----BEGIN EC PRIVATE KEY-----",
-        "-----BEGIN DSA PRIVATE KEY-----",
-        "-----BEGIN OPENSSH PRIVATE KEY-----",
-        "-----BEGIN PRIVATE KEY-----",
-        "Authorization: Bearer",
-        "authorization: bearer",
+    /// Substrings that make the entire surrounding line sensitive.
+    const BLOCK_PATTERNS: &'static [&'static str] = &["authorization: bearer"];
+
+    /// Prefixes that identify common provider and service credentials.
+    const SECRET_PREFIXES: &'static [&'static str] = &[
+        "sk-ant-api",
+        "sk-proj-",
+        "nvapi-",
+        "ghp_",
+        "github_pat_",
+        "akia",
+    ];
+
+    /// Assignments whose values should be removed from free-form text.
+    const SENSITIVE_ASSIGNMENTS: &'static [&'static str] = &[
+        "password=",
+        "passwd=",
+        "pwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "token=",
     ];
 
     /// Filter the given text, replacing sensitive content with redaction markers.
     pub fn filter(text: &str) -> String {
         let mut result = String::with_capacity(text.len());
+        let mut in_private_key = false;
 
         for line in text.lines() {
-            let lower = line.to_lowercase();
+            let lower = line.to_ascii_lowercase();
 
-            // Check block patterns (whole line redacted)
-            let mut block_redacted = false;
-            for pattern in Self::BLOCK_PATTERNS {
-                if lower.contains(&pattern.to_lowercase()) {
-                    result.push_str("[REDACTED: sensitive data]\n");
-                    block_redacted = true;
-                    break;
+            // Drop every line from a private-key header through its matching footer.
+            if in_private_key {
+                if lower.contains("-----end ") && lower.contains("private key-----") {
+                    in_private_key = false;
                 }
+                continue;
             }
-            if block_redacted {
+            if lower.contains("-----begin ") && lower.contains("private key-----") {
+                result.push_str("[REDACTED: private key]\n");
+                in_private_key = true;
                 continue;
             }
 
-            // Check for API key / secret patterns and redact inline
-            let filtered = Self::redact_inline(line);
-            result.push_str(&filtered);
+            // Replace lines whose structure cannot be preserved without exposing a secret.
+            if Self::BLOCK_PATTERNS
+                .iter()
+                .any(|pattern| lower.contains(pattern))
+            {
+                result.push_str("[REDACTED: sensitive data]\n");
+                continue;
+            }
+
+            // Preserve non-sensitive text around every inline secret.
+            result.push_str(&Self::redact_inline(line));
             result.push('\n');
         }
 
-        // Trim trailing newline if the original didn't have one
+        // Match the original trailing-newline behavior.
         if !text.ends_with('\n') && result.ends_with('\n') {
             result.pop();
         }
@@ -50,60 +72,79 @@ impl SensitiveDataFilter {
         result
     }
 
-    /// Redact known sensitive patterns within a single line.
+    /// Recursively redact strings and values under sensitive JSON keys.
+    pub fn filter_json(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::filter_json(value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if Self::is_sensitive_json_key(key) {
+                        *value = serde_json::Value::String("[REDACTED]".into());
+                        continue;
+                    }
+
+                    // Parse serialized tool arguments so their field names remain visible.
+                    if key == "arguments"
+                        && let serde_json::Value::String(arguments) = value
+                        && let Ok(mut parsed) = serde_json::from_str(arguments)
+                    {
+                        Self::filter_json(&mut parsed);
+                        if let Ok(redacted) = serde_json::to_string(&parsed) {
+                            *arguments = redacted;
+                            continue;
+                        }
+                    }
+
+                    Self::filter_json(value);
+                }
+            }
+            serde_json::Value::String(text) => {
+                *text = Self::filter(text);
+            }
+            _ => {}
+        }
+    }
+
+    /// Redact every known sensitive pattern within a single line.
     fn redact_inline(line: &str) -> String {
-        let lower = line.to_lowercase();
-
-        // API key prefixes: redact the prefix + following identifier characters
-        let prefixes = &[
-            "sk-ant-api",
-            "sk-proj-",
-            "nvapi-",
-            "ghp_",
-            "github_pat_",
-            "AKIA",
-        ];
-
-        // Sensitive key=value patterns
-        let sensitive_keys = &[
-            "password=",
-            "passwd=",
-            "pwd=",
-            "secret=",
-            "api_key=",
-            "apikey=",
-            "token=",
-        ];
-
-        // Collect all redaction spans (start, end) before modifying the string
+        let lower = line.to_ascii_lowercase();
         let mut spans: Vec<(usize, usize)> = Vec::new();
 
-        for prefix in prefixes {
-            let prefix_lower = prefix.to_lowercase();
-            if let Some(pos) = lower.find(&prefix_lower) {
-                // Find end of the key: whitespace, quote, newline, or end of line
-                let end = line[pos..]
+        // Collect all prefixed credentials instead of stopping after the first match.
+        for prefix in Self::SECRET_PREFIXES {
+            let mut offset = 0;
+            while offset < line.len() {
+                let Some(relative_pos) = lower[offset..].find(prefix) else {
+                    break;
+                };
+                let start = offset + relative_pos;
+                let end = line[start..]
                     .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-                    .map(|p| pos + p)
+                    .map(|pos| start + pos)
                     .unwrap_or(line.len());
-                // Avoid overlapping spans
-                if !spans.iter().any(|(s, e)| *s <= pos && pos < *e) {
-                    spans.push((pos, end));
-                }
+                spans.push((start, end));
+                offset = end.max(start + prefix.len());
             }
         }
 
-        for key in sensitive_keys {
-            let key_lower = key.to_lowercase();
-            if let Some(pos) = lower.find(&key_lower) {
-                let val_start = pos + key.len();
-                let val_end = line[val_start..]
-                    .find(|c: char| c.is_whitespace() || c == ';' || c == '&')
-                    .map(|p| val_start + p)
+        // Collect all values from sensitive key=value assignments.
+        for assignment in Self::SENSITIVE_ASSIGNMENTS {
+            let mut offset = 0;
+            while offset < line.len() {
+                let Some(relative_pos) = lower[offset..].find(assignment) else {
+                    break;
+                };
+                let value_start = offset + relative_pos + assignment.len();
+                let value_end = line[value_start..]
+                    .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | ',' | '\'' | '"'))
+                    .map(|pos| value_start + pos)
                     .unwrap_or(line.len());
-                if !spans.iter().any(|(s, e)| *s <= val_start && val_start < *e) {
-                    spans.push((val_start, val_end));
-                }
+                spans.push((value_start, value_end));
+                offset = value_end.max(value_start);
             }
         }
 
@@ -111,39 +152,66 @@ impl SensitiveDataFilter {
             return line.to_string();
         }
 
-        // Sort spans and build output
-        spans.sort_by_key(|(s, _)| *s);
+        // Merge overlapping matches so each secret is replaced exactly once.
+        spans.sort_by_key(|(start, _)| *start);
+        let mut merged_spans: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (start, end) in spans {
+            if let Some((_, previous_end)) = merged_spans.last_mut()
+                && start <= *previous_end
+            {
+                *previous_end = (*previous_end).max(end);
+            } else {
+                merged_spans.push((start, end));
+            }
+        }
+
+        // Rebuild the line while retaining all non-sensitive segments.
         let mut result = String::with_capacity(line.len());
         let mut cursor = 0;
-        for (start, end) in &spans {
-            if *start > cursor {
-                result.push_str(&line[cursor..*start]);
-            }
+        for (start, end) in merged_spans {
+            result.push_str(&line[cursor..start]);
             result.push_str("[REDACTED]");
-            cursor = *end;
+            cursor = end;
         }
-        if cursor < line.len() {
-            result.push_str(&line[cursor..]);
-        }
+        result.push_str(&line[cursor..]);
         result
+    }
+
+    /// Identify JSON object keys that conventionally hold credentials.
+    fn is_sensitive_json_key(key: &str) -> bool {
+        let key = key.to_ascii_lowercase();
+        matches!(
+            key.as_str(),
+            "password"
+                | "passwd"
+                | "pwd"
+                | "secret"
+                | "api_key"
+                | "apikey"
+                | "token"
+                | "access_token"
+                | "refresh_token"
+                | "client_secret"
+                | "authorization"
+        ) || key.ends_with("_password")
+            || key.ends_with("_secret")
+            || key.ends_with("_token")
+            || key.ends_with("_api_key")
     }
 
     /// Quick check: does the text contain anything sensitive?
     pub fn contains_sensitive(text: &str) -> bool {
-        let lower = text.to_lowercase();
-        for pattern in Self::BLOCK_PATTERNS {
-            if lower.contains(&pattern.to_lowercase()) {
-                return true;
-            }
-        }
-        // Check for API key prefix patterns
-        let prefixes = ["sk-ant-api", "sk-proj-", "nvapi-", "ghp_", "github_pat_"];
-        for p in &prefixes {
-            if lower.contains(p) {
-                return true;
-            }
-        }
-        false
+        let lower = text.to_ascii_lowercase();
+        (lower.contains("-----begin ") && lower.contains("private key-----"))
+            || Self::BLOCK_PATTERNS
+                .iter()
+                .any(|pattern| lower.contains(pattern))
+            || Self::SECRET_PREFIXES
+                .iter()
+                .any(|prefix| lower.contains(prefix))
+            || Self::SENSITIVE_ASSIGNMENTS
+                .iter()
+                .any(|assignment| lower.contains(assignment))
     }
 }
 
@@ -167,6 +235,7 @@ mod tests {
         assert!(!result.contains("sk-proj"));
     }
 
+    // Verify the complete private-key block is removed from persisted text.
     #[test]
     fn test_redact_private_key() {
         let input =
@@ -174,6 +243,37 @@ mod tests {
         let result = SensitiveDataFilter::filter(input);
         assert!(result.contains("[REDACTED"));
         assert!(!result.contains("BEGIN PRIVATE KEY"));
+        assert!(!result.contains("MIIEvQ"));
+        assert!(!result.contains("END PRIVATE KEY"));
+    }
+
+    // Verify every sensitive value on a line is removed, not only the first match.
+    #[test]
+    fn test_redact_multiple_values_on_one_line() {
+        let input = "first=sk-proj-one second=sk-proj-two password=alpha token=beta";
+        let result = SensitiveDataFilter::filter(input);
+        assert_eq!(result.matches("[REDACTED]").count(), 4);
+        assert!(!result.contains("sk-proj"));
+        assert!(!result.contains("alpha"));
+        assert!(!result.contains("beta"));
+    }
+
+    // Verify structured and serialized arguments redact secrets without damaging other values.
+    #[test]
+    fn test_redact_json_secret_fields() {
+        let mut input = serde_json::json!({
+            "token": "plain-secret",
+            "arguments": r#"{"access_token":"nested-secret","path":"src/lib.rs"}"#,
+            "nested": { "client_secret": "other-secret", "path": "src/main.rs" }
+        });
+        SensitiveDataFilter::filter_json(&mut input);
+        assert_eq!(input["token"], "[REDACTED]");
+        assert_eq!(
+            input["arguments"],
+            r#"{"access_token":"[REDACTED]","path":"src/lib.rs"}"#
+        );
+        assert_eq!(input["nested"]["client_secret"], "[REDACTED]");
+        assert_eq!(input["nested"]["path"], "src/main.rs");
     }
 
     #[test]

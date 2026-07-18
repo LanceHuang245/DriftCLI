@@ -7,7 +7,8 @@ CLAUDE.md
 .claude/
 
 # Dev
-dev-docs
+dev-docs/temp/
+dev-docs/
 .drift/
 
 # Rust
