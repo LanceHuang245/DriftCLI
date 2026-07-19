@@ -38,18 +38,18 @@ impl WebSearchTool {
                 let href_end = remaining[abs_href..]
                     .find('"')
                     .map(|e| abs_href + e)
-                    .unwrap_or(abs_href + 200);
+                    .unwrap_or(remaining.len());
                 let url_str = &remaining[abs_href..href_end];
 
                 // Find the closing > of the <a> tag, then text until </a>
                 let tag_close = remaining[href_end..]
                     .find('>')
                     .map(|i| href_end + i + 1)
-                    .unwrap_or(href_end + 1);
+                    .unwrap_or(href_end);
                 let title_end = remaining[tag_close..]
                     .find("</a>")
                     .map(|i| tag_close + i)
-                    .unwrap_or(tag_close + 200);
+                    .unwrap_or(remaining.len());
                 let title_str = &remaining[tag_close..title_end];
 
                 (
@@ -228,4 +228,30 @@ fn urlencoding(input: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WebSearchTool;
+
+    #[test]
+    fn malformed_result_without_href_quote_does_not_panic() {
+        // A truncated href must stay within the supplied HTML buffer.
+        let html = r#"<a class="result__a" href="https://example.com"#;
+
+        let results = WebSearchTool::parse_duckduckgo_results(html, 1);
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn malformed_result_without_closing_tag_does_not_panic() {
+        // A missing closing anchor must use the remaining buffer as its title.
+        let html = r#"<a href="https://example.com" class="result__a">Example"#;
+
+        let results = WebSearchTool::parse_duckduckgo_results(html, 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Example");
+    }
 }
