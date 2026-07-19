@@ -6,7 +6,7 @@ use async_trait::async_trait;
 pub use types::*;
 
 use bytes::Bytes;
-use futures::ready;
+use futures::{StreamExt, ready};
 use reqwest::Response;
 use serde::Deserialize;
 use std::pin::Pin;
@@ -14,52 +14,100 @@ use std::task::{Context, Poll};
 use tokio_stream::Stream;
 
 struct SseLineStream {
-    byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, LlmError>> + Send>>,
     buffer: Vec<u8>,
+    failed: bool,
 }
+
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 
 impl SseLineStream {
     fn new(response: Response) -> Self {
+        Self::from_stream(
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(LlmError::Http)),
+        )
+    }
+
+    fn from_stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Bytes, LlmError>> + Send + 'static,
+    {
         Self {
-            byte_stream: Box::pin(response.bytes_stream()),
+            byte_stream: Box::pin(stream),
             buffer: Vec::new(),
+            failed: false,
         }
     }
 }
 
 impl Stream for SseLineStream {
-    type Item = String;
+    type Item = Result<String, LlmError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.failed {
+            return Poll::Ready(None);
+        }
+
         loop {
             if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                if pos > MAX_SSE_LINE_BYTES {
+                    self.buffer.clear();
+                    self.failed = true;
+                    return Poll::Ready(Some(Err(LlmError::Stream(format!(
+                        "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
+                    )))));
+                }
                 let line_bytes: Vec<u8> = self.buffer[..pos].to_vec();
                 self.buffer.drain(..pos + 1);
-                if let Ok(text) = String::from_utf8(line_bytes) {
-                    let trimmed = text.trim_end_matches('\r');
-                    if !trimmed.is_empty() {
-                        return Poll::Ready(Some(trimmed.to_string()));
+                let text = match String::from_utf8(line_bytes) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        self.failed = true;
+                        return Poll::Ready(Some(Err(LlmError::Stream(format!(
+                            "invalid UTF-8 in SSE stream: {error}"
+                        )))));
                     }
-                    continue;
+                };
+                let trimmed = text.trim_end_matches('\r');
+                if !trimmed.is_empty() {
+                    return Poll::Ready(Some(Ok(trimmed.to_string())));
                 }
                 continue;
             }
 
+            if self.buffer.len() > MAX_SSE_LINE_BYTES {
+                self.buffer.clear();
+                self.failed = true;
+                return Poll::Ready(Some(Err(LlmError::Stream(format!(
+                    "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
+                )))));
+            }
+
             match ready!(self.byte_stream.as_mut().poll_next(cx)) {
                 Some(Ok(bytes)) => self.buffer.extend_from_slice(&bytes),
-                Some(Err(_)) => return Poll::Ready(None),
+                Some(Err(error)) => {
+                    self.failed = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
                 None => {
                     if !self.buffer.is_empty() {
                         let remaining = std::mem::take(&mut self.buffer);
-                        return if let Ok(text) = String::from_utf8(remaining) {
-                            let trimmed = text.trim_end_matches('\r');
-                            if !trimmed.is_empty() {
-                                Poll::Ready(Some(trimmed.to_string()))
-                            } else {
-                                Poll::Ready(None)
+                        let text = match String::from_utf8(remaining) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                self.failed = true;
+                                return Poll::Ready(Some(Err(LlmError::Stream(format!(
+                                    "invalid UTF-8 in SSE stream: {error}"
+                                )))));
                             }
-                        } else {
+                        };
+                        let trimmed = text.trim_end_matches('\r');
+                        return if trimmed.is_empty() {
                             Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(Ok(trimmed.to_string())))
                         };
                     }
                     return Poll::Ready(None);
@@ -69,7 +117,7 @@ impl Stream for SseLineStream {
     }
 }
 
-pub fn sse_text_stream(response: Response) -> impl Stream<Item = String> {
+pub fn sse_text_stream(response: Response) -> impl Stream<Item = Result<String, LlmError>> {
     SseLineStream::new(response)
 }
 
@@ -337,4 +385,45 @@ pub async fn fetch_openai_compat_models(
         "No model list found. Tried: {}",
         urls.join(", ")
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LlmError, MAX_SSE_LINE_BYTES, SseLineStream};
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn sse_stream_propagates_transport_errors() {
+        // Transport failures must remain distinguishable from a clean EOF.
+        let source = futures::stream::iter(vec![Err(LlmError::Stream("transport".into()))]);
+        let mut stream = SseLineStream::from_stream(source);
+
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert!(matches!(error, LlmError::Stream(message) if message == "transport"));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_rejects_invalid_utf8() {
+        // Invalid event bytes must be reported instead of silently discarded.
+        let source = futures::stream::iter(vec![Ok(Bytes::from_static(b"\xff\n"))]);
+        let mut stream = SseLineStream::from_stream(source);
+
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert!(matches!(error, LlmError::Stream(message) if message.contains("invalid UTF-8")));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_rejects_oversized_lines() {
+        // A line cap prevents an unbounded SSE buffer from exhausting memory.
+        let bytes = Bytes::from(vec![b'x'; MAX_SSE_LINE_BYTES + 1]);
+        let source = futures::stream::iter(vec![Ok(bytes)]);
+        let mut stream = SseLineStream::from_stream(source);
+
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert!(matches!(error, LlmError::Stream(message) if message.contains("exceeds")));
+    }
 }

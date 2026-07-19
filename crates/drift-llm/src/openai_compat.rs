@@ -3,6 +3,7 @@ use crate::types::*;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 
 pub struct OpenAiCompatibleProvider {
     api_key: String,
@@ -185,61 +186,67 @@ impl LlmProvider for OpenAiCompatibleProvider {
         use futures::StreamExt;
 
         let line_stream = crate::sse_text_stream(response);
+        // OpenAI identifies each streamed tool call by index after omitting its ID.
+        let tool_call_ids = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
 
         let event_stream = line_stream
-            .filter_map(|line| async move {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    let data = data.trim();
-                    if data == "[DONE]" {
-                        return Some(vec![Ok(LlmChunk::Done)]);
-                    }
-                    if let Ok(event) = serde_json::from_str::<OpenAiStreamEvent>(data) {
-                        let mut chunks: Vec<Result<LlmChunk, LlmError>> = Vec::new();
-                        for choice in &event.choices {
-                            if let Some(delta) = &choice.delta {
-                                if let Some(ref tool_calls) = delta.tool_calls {
-                                    for tc in tool_calls {
-                                        if let Some(ref name) = tc.function.name {
-                                            if !name.is_empty() {
-                                                chunks.push(Ok(LlmChunk::ToolCallStart {
-                                                    id: tc.id.clone().unwrap_or_default(),
-                                                    name: name.clone(),
-                                                }));
-                                            }
+            .filter_map({
+                let tool_call_ids = Arc::clone(&tool_call_ids);
+                move |line| {
+                    let tool_call_ids = Arc::clone(&tool_call_ids);
+                    async move {
+                        let line = match line {
+                            Ok(line) => line,
+                            Err(error) => return Some(vec![Err(error)]),
+                        };
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            let data = data.trim();
+                            if data == "[DONE]" {
+                                return Some(vec![Ok(LlmChunk::Done)]);
+                            }
+                            let event = match serde_json::from_str::<OpenAiStreamEvent>(data) {
+                                Ok(event) => event,
+                                Err(error) => {
+                                    return Some(vec![Err(LlmError::Stream(format!(
+                                        "invalid OpenAI SSE event: {error}"
+                                    )))]);
+                                }
+                            };
+                            let mut chunks: Vec<Result<LlmChunk, LlmError>> = Vec::new();
+                            for choice in &event.choices {
+                                if let Some(delta) = &choice.delta {
+                                    if let Some(ref tool_calls) = delta.tool_calls {
+                                        for tc in tool_calls {
+                                            chunks.extend(openai_tool_call_chunks(
+                                                tc,
+                                                &mut tool_call_ids.lock().unwrap(),
+                                            ));
                                         }
-                                        if let Some(ref args) = tc.function.arguments {
-                                            let delta = normalize_args(args);
-                                            if !delta.is_empty() {
-                                                chunks.push(Ok(LlmChunk::ToolCallArgs {
-                                                    id: tc.id.clone().unwrap_or_default(),
-                                                    delta,
-                                                }));
-                                            }
+                                    }
+                                    if let Some(content) = &delta.content {
+                                        chunks.push(Ok(LlmChunk::TextDelta(content.clone())));
+                                    }
+                                    if let Some(reasoning) = &delta.reasoning_content {
+                                        if !reasoning.is_empty() {
+                                            chunks.push(Ok(LlmChunk::ReasoningDelta(
+                                                reasoning.clone(),
+                                            )));
                                         }
                                     }
                                 }
-                                if let Some(content) = &delta.content {
-                                    chunks.push(Ok(LlmChunk::TextDelta(content.clone())));
-                                }
-                                if let Some(reasoning) = &delta.reasoning_content {
-                                    if !reasoning.is_empty() {
-                                        chunks
-                                            .push(Ok(LlmChunk::ReasoningDelta(reasoning.clone())));
+                                if let Some(reason) = &choice.finish_reason {
+                                    if reason == "stop" || reason == "tool_calls" {
+                                        chunks.push(Ok(LlmChunk::Done));
                                     }
                                 }
                             }
-                            if let Some(reason) = &choice.finish_reason {
-                                if reason == "stop" || reason == "tool_calls" {
-                                    chunks.push(Ok(LlmChunk::Done));
-                                }
+                            if !chunks.is_empty() {
+                                return Some(chunks);
                             }
                         }
-                        if !chunks.is_empty() {
-                            return Some(chunks);
-                        }
+                        None
                     }
                 }
-                None
             })
             .flat_map(|chunks| futures::stream::iter(chunks));
 
@@ -274,6 +281,8 @@ struct OpenAiDelta {
 #[derive(Debug, Deserialize)]
 struct OpenAiToolCall {
     #[serde(default)]
+    index: usize,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     function: OpenAiToolCallFunction,
@@ -295,5 +304,104 @@ fn normalize_args(args: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+/// Correlate one OpenAI tool-call delta with the ID stored for its stream index.
+fn openai_tool_call_chunks(
+    tool_call: &OpenAiToolCall,
+    ids: &mut Vec<Option<String>>,
+) -> Vec<Result<LlmChunk, LlmError>> {
+    if ids.len() <= tool_call.index {
+        ids.resize(tool_call.index + 1, None);
+    }
+    if let Some(id) = tool_call.id.as_ref().filter(|id| !id.is_empty()) {
+        ids[tool_call.index] = Some(id.clone());
+    }
+
+    let id = ids[tool_call.index].clone().unwrap_or_default();
+    let mut chunks = Vec::new();
+    if let Some(name) = tool_call
+        .function
+        .name
+        .as_ref()
+        .filter(|name| !name.is_empty())
+    {
+        if id.is_empty() {
+            return vec![Err(LlmError::Stream(format!(
+                "tool call at index {} is missing an ID",
+                tool_call.index
+            )))];
+        }
+        chunks.push(Ok(LlmChunk::ToolCallStart {
+            id: id.clone(),
+            name: name.clone(),
+        }));
+    }
+
+    if let Some(arguments) = &tool_call.function.arguments {
+        let delta = normalize_args(arguments);
+        if !delta.is_empty() {
+            if id.is_empty() {
+                return vec![Err(LlmError::Stream(format!(
+                    "tool-call arguments at index {} have no known ID",
+                    tool_call.index
+                )))];
+            }
+            chunks.push(Ok(LlmChunk::ToolCallArgs { id, delta }));
+        }
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OpenAiToolCall, OpenAiToolCallFunction, openai_tool_call_chunks};
+    use crate::LlmChunk;
+
+    #[test]
+    fn correlates_interleaved_tool_arguments_by_index() {
+        // Each continuation must reuse the ID assigned to its own stream index.
+        let mut ids = Vec::new();
+        let starts = [
+            tool_call(0, Some("call-0"), Some("first"), Some("{")),
+            tool_call(1, Some("call-1"), Some("second"), Some("{")),
+        ];
+        for tool_call in &starts {
+            let chunks = openai_tool_call_chunks(tool_call, &mut ids);
+            assert!(chunks.iter().all(Result::is_ok));
+        }
+
+        let first =
+            openai_tool_call_chunks(&tool_call(0, None, None, Some("\"value\":0}")), &mut ids);
+        let second =
+            openai_tool_call_chunks(&tool_call(1, None, None, Some("\"value\":1}")), &mut ids);
+
+        assert!(matches!(
+            &first[0],
+            Ok(LlmChunk::ToolCallArgs { id, .. }) if id == "call-0"
+        ));
+        assert!(matches!(
+            &second[0],
+            Ok(LlmChunk::ToolCallArgs { id, .. }) if id == "call-1"
+        ));
+    }
+
+    /// Build one wire-format delta for focused index-correlation tests.
+    fn tool_call(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> OpenAiToolCall {
+        OpenAiToolCall {
+            index,
+            id: id.map(str::to_string),
+            function: OpenAiToolCallFunction {
+                name: name.map(str::to_string),
+                arguments: arguments.map(|value| serde_json::Value::String(value.to_string())),
+            },
+        }
     }
 }

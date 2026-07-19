@@ -483,6 +483,8 @@ impl Agent {
             let mut streaming = false;
             // Map call_id -> ActiveToolCall for correlating chunks
             let mut active_tool_calls: HashMap<String, ActiveToolCall> = HashMap::new();
+            // Preserve tool-call start order independently from HashMap iteration.
+            let mut active_tool_call_order: Vec<String> = Vec::new();
             // Completed tool calls ready for execution (preserve order)
             let mut completed_tool_calls: Vec<ActiveToolCall> = Vec::new();
 
@@ -521,29 +523,32 @@ impl Agent {
                             id: id.clone(),
                             name: name.clone(),
                         });
-                        active_tool_calls.insert(
-                            id.clone(),
-                            ActiveToolCall {
-                                id,
-                                name,
-                                args: Vec::new(),
-                            },
-                        );
+                        if !active_tool_calls.contains_key(&id) {
+                            active_tool_call_order.push(id.clone());
+                            active_tool_calls.insert(
+                                id.clone(),
+                                ActiveToolCall {
+                                    id,
+                                    name,
+                                    args: Vec::new(),
+                                },
+                            );
+                        }
                     }
                     Some(Ok(LlmChunk::ToolCallArgs { id, delta })) => {
-                        // Some providers (DeepSeek) omit the id in subsequent
-                        // tool-call deltas; fall back to the first active call.
-                        let effective_id = if id.is_empty() {
-                            active_tool_calls.keys().next().cloned().unwrap_or_default()
-                        } else {
-                            id
-                        };
                         let _ = self.event_tx.send(EventMsg::ToolCallArgs {
-                            id: effective_id.clone(),
+                            id: id.clone(),
                             delta: delta.clone(),
                         });
-                        if let Some(tc) = active_tool_calls.get_mut(&effective_id) {
+                        if let Some(tc) = active_tool_calls.get_mut(&id) {
                             tc.args.push(delta);
+                        } else {
+                            turn_failed = true;
+                            let _ = self.event_tx.send(EventMsg::Error {
+                                message: format!("Received arguments for unknown tool call {id}"),
+                                recoverable: true,
+                            });
+                            break;
                         }
                     }
                     Some(Ok(LlmChunk::ToolCallEnd { id })) => {
@@ -554,10 +559,11 @@ impl Agent {
                     }
                     Some(Ok(LlmChunk::Done)) => {
                         // Drain remaining active tool calls — some providers
-                        // (OpenAI compat) don't emit ToolCallEnd, so everything
-                        // left in active_tool_calls is a complete tool call.
-                        for (_, tc) in active_tool_calls.drain() {
-                            completed_tool_calls.push(tc);
+                        // omit ToolCallEnd, so finish them in their start order.
+                        for id in active_tool_call_order {
+                            if let Some(tool_call) = active_tool_calls.remove(&id) {
+                                completed_tool_calls.push(tool_call);
+                            }
                         }
                         break;
                     }
@@ -569,7 +575,14 @@ impl Agent {
                         });
                         break;
                     }
-                    None => break,
+                    None => {
+                        turn_failed = true;
+                        let _ = self.event_tx.send(EventMsg::Error {
+                            message: "LLM stream ended before a completion event".to_string(),
+                            recoverable: true,
+                        });
+                        break;
+                    }
                 }
             }
 
