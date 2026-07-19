@@ -109,6 +109,18 @@ impl SessionStore {
     // Create a new session with metadata as the first JSONL line.
     pub fn create(&self, working_dir: &str, model: &str) -> Result<(Uuid, PathBuf), StorageError> {
         let session_id = Uuid::new_v4();
+        let path = self.create_with_id(session_id, working_dir, model)?;
+
+        Ok((session_id, path))
+    }
+
+    // Creates the first transcript line for a session ID allocated before persistence.
+    pub fn create_with_id(
+        &self,
+        session_id: Uuid,
+        working_dir: &str,
+        model: &str,
+    ) -> Result<PathBuf, StorageError> {
         let filename = format!("{}.jsonl", session_id);
         let path = self.sessions_dir.join(&filename);
 
@@ -122,7 +134,7 @@ impl SessionStore {
         let line = serde_json::to_string(&meta)? + "\n";
         std::fs::write(&path, line)?;
 
-        Ok((session_id, path))
+        Ok(path)
     }
 
     // Append an event to the session's JSONL file.
@@ -139,6 +151,26 @@ impl SessionStore {
         let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
         file.write_all(line.as_bytes())?;
         file.flush()?;
+
+        Ok(())
+    }
+
+    // Updates the metadata displayed by the session picker after a provider change.
+    pub fn update_model(&self, session_id: Uuid, model: &str) -> Result<(), StorageError> {
+        let filename = format!("{}.jsonl", session_id);
+        let path = self.sessions_dir.join(&filename);
+
+        if !path.exists() {
+            return Err(StorageError::NotFound(session_id.to_string()));
+        }
+
+        let content = std::fs::read_to_string(&path)?;
+        let (metadata, events) = content.split_once('\n').unwrap_or((&content, ""));
+        let mut metadata = serde_json::from_str::<SessionMeta>(metadata)?;
+        metadata.model = model.to_string();
+
+        let content = format!("{}\n{}", serde_json::to_string(&metadata)?, events);
+        std::fs::write(path, content)?;
 
         Ok(())
     }

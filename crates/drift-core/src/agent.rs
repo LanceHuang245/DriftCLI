@@ -141,12 +141,27 @@ impl Agent {
         self.event_tx.subscribe()
     }
 
+    // Creates the transcript only when the first user-facing event needs to be persisted.
+    fn ensure_session(&self) -> Result<(), drift_storage::StorageError> {
+        if self.session_store.session_path(self.session_id).exists() {
+            return Ok(());
+        }
+
+        self.session_store.create_with_id(
+            self.session_id,
+            &self.cwd.to_string_lossy(),
+            self.llm.model_name(),
+        )?;
+        Ok(())
+    }
+
     /// Redact all transcript payloads immediately before writing them to disk.
     fn append_session_event(
         &self,
         mut event: drift_storage::SessionEvent,
     ) -> Result<(), drift_storage::StorageError> {
         redact_session_event(&mut event)?;
+        self.ensure_session()?;
         self.session_store.append_event(self.session_id, &event)
     }
 }

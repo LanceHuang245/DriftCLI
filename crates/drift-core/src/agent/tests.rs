@@ -284,9 +284,8 @@ async fn tool_turn_forces_a_user_facing_final_response() {
         std::sync::Arc::new(ProcessSandbox::new(permission_engine.sandbox_mode(), &root).unwrap());
     let session_store =
         std::sync::Arc::new(drift_storage::SessionStore::new(root.join("store")).unwrap());
-    let (session_id, _) = session_store
-        .create(root.to_string_lossy().as_ref(), "scripted")
-        .unwrap();
+    let session_id = uuid::Uuid::new_v4();
+    assert!(!session_store.session_path(session_id).exists());
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = ScriptedTurnProvider {
         responses: std::sync::Mutex::new(
@@ -339,6 +338,7 @@ async fn tool_turn_forces_a_user_facing_final_response() {
 
     agent.submit("update the task".into()).await;
 
+    assert!(session_store.session_path(session_id).exists());
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
     assert!(!requests[2].0, "forced finalization must disable tools");
@@ -480,7 +480,7 @@ async fn activate_provider_persists_selection() {
         root.clone(),
         std::sync::Arc::new(ToolRegistry::new()),
         session_id,
-        session_store,
+        session_store.clone(),
         &security,
         "default",
     )
@@ -490,6 +490,7 @@ async fn activate_provider_persists_selection() {
 
     let restored = AppConfig::load_for_workspace(&root, None, None, None).unwrap();
     assert_eq!(restored.active_provider, "alternate");
+    assert_eq!(session_store.list().unwrap()[0].model, "alternate-model");
     std::fs::remove_dir_all(root).ok();
 }
 

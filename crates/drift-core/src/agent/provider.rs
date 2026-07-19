@@ -21,6 +21,20 @@ impl Agent {
         self.event_tx.clone()
     }
 
+    // Keeps the session picker metadata aligned with the active provider after a runtime change.
+    fn update_session_model(&self) {
+        if !self.session_store.session_path(self.session_id).exists() {
+            return;
+        }
+
+        if let Err(error) = self
+            .session_store
+            .update_model(self.session_id, self.llm.model_name())
+        {
+            warn!(%error, session_id = %self.session_id, "failed to update session model metadata");
+        }
+    }
+
     // Reconfigure: swaps the LLM provider at runtime and persists to disk.
     pub async fn reconfigure(&mut self, llm_config: LlmConfig) -> Result<(), LlmError> {
         let model = match &llm_config {
@@ -44,6 +58,7 @@ impl Agent {
         self.config
             .save_to_project(&self.cwd)
             .map_err(|e| LlmError::Config(e.to_string()))?;
+        self.update_session_model();
         let _ = self.event_tx.send(EventMsg::ProviderSwitched {
             name: self.config.active_provider.clone(),
             model: self.llm.model_name().to_string(),
@@ -70,6 +85,7 @@ impl Agent {
         self.config
             .save_to_project(&self.cwd)
             .map_err(|e| LlmError::Config(e.to_string()))?;
+        self.update_session_model();
         let _ = self.event_tx.send(EventMsg::ProviderSwitched {
             name: name.to_string(),
             model: self.llm.model_name().to_string(),

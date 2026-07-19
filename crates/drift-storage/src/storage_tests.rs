@@ -31,6 +31,18 @@ fn test_create_and_list_sessions() {
     let events = store.read_events(id1).unwrap();
     assert_eq!(events.len(), 1);
 
+    store.update_model(id1, "deepseek-chat").unwrap();
+    let sessions = store.list().unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.session_id == id1.to_string())
+            .unwrap()
+            .model,
+        "deepseek-chat"
+    );
+    assert_eq!(store.read_events(id1).unwrap().len(), 1);
+
     std::fs::remove_dir_all(&dir).ok();
 }
 

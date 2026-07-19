@@ -127,19 +127,13 @@ async fn main() -> anyhow::Result<()> {
                     if let Ok(events) = session_store.read_events(parsed_id) {
                         (parsed_id, events)
                     } else {
-                        let (new_id, _) =
-                            session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
-                        (new_id, Vec::new())
+                        (uuid::Uuid::new_v4(), Vec::new())
                     }
                 } else {
-                    let (new_id, _) =
-                        session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
-                    (new_id, Vec::new())
+                    (uuid::Uuid::new_v4(), Vec::new())
                 }
             } else {
-                let (new_id, _) =
-                    session_store.create(&cwd.to_string_lossy(), &config.agent.model)?;
-                (new_id, Vec::new())
+                (uuid::Uuid::new_v4(), Vec::new())
             };
 
             // Use CLI flag profile if set; otherwise default
