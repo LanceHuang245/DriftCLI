@@ -122,7 +122,8 @@ impl Writer {
                     Some(_) => ListKind::Ordered,
                     None => ListKind::Unordered,
                 });
-                self.ordered_counters.push(start.map_or(0, |s| s.saturating_sub(1)));
+                self.ordered_counters
+                    .push(start.map_or(0, |s| s.saturating_sub(1)));
             }
             Tag::Item => {
                 self.commit_line();
@@ -515,12 +516,8 @@ impl Writer {
                 Self::build_border(&col_widths, '├', '┼', '┤'),
                 border_style,
             )));
-            self.lines.push(Self::build_row(
-                row,
-                &col_widths,
-                &alignments,
-                border_style,
-            ));
+            self.lines
+                .push(Self::build_row(row, &col_widths, &alignments, border_style));
         }
 
         self.lines.push(Line::from(Span::styled(
@@ -658,7 +655,10 @@ mod tests {
         let md = "| A | B |\n| - | - |\n| 1 | 2 |\n";
         let lines = render_markdown(md, 80);
         // Should produce bordered table rows (at least top border, header, separator)
-        assert!(lines.len() >= 4, "expected at least 4 lines for bordered table");
+        assert!(
+            lines.len() >= 4,
+            "expected at least 4 lines for bordered table"
+        );
         let text = lines_to_string(&lines);
         assert!(text.contains("┌"), "table top border missing: {text}");
         assert!(text.contains("├"), "table header sep missing: {text}");
@@ -698,6 +698,9 @@ mod tests {
         let text = lines_to_string(&lines);
         // Count occurrences of the separator border ├
         let sep_count = text.chars().filter(|&c| c == '├').count();
-        assert_eq!(sep_count, 2, "expected 2 separators (header-body + body-body), got {sep_count}: {text}");
+        assert_eq!(
+            sep_count, 2,
+            "expected 2 separators (header-body + body-body), got {sep_count}: {text}"
+        );
     }
 }

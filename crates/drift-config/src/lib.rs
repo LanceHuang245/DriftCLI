@@ -608,86 +608,86 @@ impl AppConfig {
             && config.providers.is_empty()
             && let Some(provider) = llm.get("provider").and_then(|v| v.as_str())
         {
-                    let config_llm = match provider {
-                        "anthropic" => Some(LlmConfig::Anthropic {
-                            api_key: llm
-                                .get("api_key")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .into(),
-                            model: llm
-                                .get("model")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&default_model())
-                                .into(),
-                            base_url: llm
-                                .get("base_url")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&default_anthropic_base_url())
-                                .into(),
-                            reasoning_effort: llm
-                                .get("reasoning_effort")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()),
-                        }),
-                        "openai_compatible" | "openai-compatible" => {
-                            Some(LlmConfig::OpenAiCompatible {
-                                api_key: llm
-                                    .get("api_key")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .into(),
-                                model: llm
-                                    .get("model")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("gpt-4o")
-                                    .into(),
-                                base_url: llm
-                                    .get("base_url")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or(&default_openai_compat_base_url())
-                                    .into(),
-                                supports_thinking: llm
-                                    .get("supports_thinking")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false),
-                            })
-                        }
-                        _ => None,
-                    };
-                    if let Some(config_llm) = config_llm {
-                        let name = "default".to_string();
-                        config.providers.insert(
-                            name.clone(),
-                            ProviderEntry {
-                                name: name.clone(),
-                                config: config_llm,
-                            },
-                        );
-                        if config.active_provider.is_empty() {
-                            config.active_provider = name;
-                        }
-                    }
+            let config_llm = match provider {
+                "anthropic" => Some(LlmConfig::Anthropic {
+                    api_key: llm
+                        .get("api_key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    model: llm
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&default_model())
+                        .into(),
+                    base_url: llm
+                        .get("base_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&default_anthropic_base_url())
+                        .into(),
+                    reasoning_effort: llm
+                        .get("reasoning_effort")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                }),
+                "openai_compatible" | "openai-compatible" => Some(LlmConfig::OpenAiCompatible {
+                    api_key: llm
+                        .get("api_key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    model: llm
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gpt-4o")
+                        .into(),
+                    base_url: llm
+                        .get("base_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&default_openai_compat_base_url())
+                        .into(),
+                    supports_thinking: llm
+                        .get("supports_thinking")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                }),
+                _ => None,
+            };
+            if let Some(config_llm) = config_llm {
+                let name = "default".to_string();
+                config.providers.insert(
+                    name.clone(),
+                    ProviderEntry {
+                        name: name.clone(),
+                        config: config_llm,
+                    },
+                );
+                if config.active_provider.is_empty() {
+                    config.active_provider = name;
+                }
+            }
         }
 
         // Merge security settings, profiles, and network domain restrictions.
         if let Some(security) = overlay.get("security").and_then(|v| v.as_table()) {
-            if let Some(default_profile) = security
-                .get("default_profile")
-                .and_then(|v| v.as_str())
+            if let Some(default_profile) = security.get("default_profile").and_then(|v| v.as_str())
             {
                 config.security.default_profile = default_profile.to_string();
             }
             if let Some(enabled) = security.get("enabled").and_then(|v| v.as_bool()) {
                 config.security.enabled = enabled;
             }
-            if let Some(allowed_domains) = security.get("allowed_domains").and_then(|v| v.as_array()) {
+            if let Some(allowed_domains) =
+                security.get("allowed_domains").and_then(|v| v.as_array())
+            {
                 config.security.allowed_domains = allowed_domains
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
-            if let Some(blocked_domains) = security.get("blocked_domains").and_then(|v| v.as_array()) {
+            if let Some(blocked_domains) =
+                security.get("blocked_domains").and_then(|v| v.as_array())
+            {
                 config.security.blocked_domains = blocked_domains
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -982,7 +982,6 @@ sandbox_mode = "read-only"
             Some("never")
         );
     }
-
 
     #[test]
     fn test_mcp_defaults_and_template() {

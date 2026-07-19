@@ -156,10 +156,7 @@ impl Tool for WebSearchTool {
             .build()
             .map_err(|e| ToolError::Other(format!("failed to build HTTP client: {e}")))?;
 
-        let search_url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencoding(query)
-        );
+        let search_url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
         ctx.network
             .check_url(&search_url)
             .map_err(|error| ToolError::PermissionDenied(error.to_string()))?;

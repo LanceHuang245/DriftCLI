@@ -38,7 +38,10 @@ pub enum AppEvent {
     },
     AgentStatus(String),
     /// Status update emitted by an MCP server lifecycle task.
-    McpStatus { server_id: String, status: String },
+    McpStatus {
+        server_id: String,
+        status: String,
+    },
     Error(String),
     Done,
     Interrupted,
@@ -135,7 +138,6 @@ pub enum TuiCommand {
     // Switch to a different historical session by UUID.
     SwitchSession(uuid::Uuid),
 }
-
 
 /// Pending permission prompt — blocks normal input until the user responds.
 #[derive(Debug, Clone)]
@@ -362,7 +364,6 @@ impl TuiApp {
                         // ── End permission interceptor ──
 
                         match self.mode {
-
                             TuiMode::Normal => {
                                 // Slash completion popup key intercept
                                 let mut popup_handled = false;
@@ -580,7 +581,9 @@ impl TuiApp {
                                         }
                                     }
                                     TuiMode::SessionPicker => {
-                                        if !self.session_list.is_empty() && self.session_selected + 1 < self.session_list.len() {
+                                        if !self.session_list.is_empty()
+                                            && self.session_selected + 1 < self.session_list.len()
+                                        {
                                             self.session_selected += 1;
                                         }
                                     }
@@ -872,12 +875,15 @@ impl TuiApp {
                 self.session_selected = self.session_selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                if !self.session_list.is_empty() && self.session_selected + 1 < self.session_list.len() {
+                if !self.session_list.is_empty()
+                    && self.session_selected + 1 < self.session_list.len()
+                {
                     self.session_selected += 1;
                 }
             }
             KeyCode::Enter => {
-                if !self.session_list.is_empty() && self.session_selected < self.session_list.len() {
+                if !self.session_list.is_empty() && self.session_selected < self.session_list.len()
+                {
                     let s_meta = &self.session_list[self.session_selected];
                     if let Ok(parsed_id) = uuid::Uuid::parse_str(&s_meta.session_id) {
                         let _ = self.cmd_tx.send(TuiCommand::SwitchSession(parsed_id));
@@ -1090,13 +1096,17 @@ impl TuiApp {
             }
             AppEvent::SessionList(meta_list) => {
                 self.session_list = meta_list;
-                self.session_selected = self.session_list
+                self.session_selected = self
+                    .session_list
                     .iter()
                     .position(|s| s.session_id == self.session_id.to_string())
                     .unwrap_or(0);
                 self.mode = TuiMode::SessionPicker;
             }
-            AppEvent::SessionLoaded { session_id, messages } => {
+            AppEvent::SessionLoaded {
+                session_id,
+                messages,
+            } => {
                 self.session_id = session_id;
                 self.messages = messages;
                 self.current_response.clear();
@@ -1106,7 +1116,13 @@ impl TuiApp {
                 self.status_text = format!("Loaded session {}", &session_id.to_string()[..8]);
                 self.mode = TuiMode::Normal;
             }
-            AppEvent::PermissionRequest { request_id, tool_name, args_summary, reason, .. } => {
+            AppEvent::PermissionRequest {
+                request_id,
+                tool_name,
+                args_summary,
+                reason,
+                ..
+            } => {
                 // Set the interactive permission prompt — blocks normal input until resolved.
                 self.permission_prompt = Some(PermissionPromptState {
                     request_id,
@@ -1259,7 +1275,8 @@ impl TuiApp {
             let dialog = self.render_permission_dialog(prompt);
             f.render_widget(dialog, input_area);
         } else {
-            let input_widget = Paragraph::new(input_line).block(Block::default().borders(Borders::TOP));
+            let input_widget =
+                Paragraph::new(input_line).block(Block::default().borders(Borders::TOP));
             f.render_widget(input_widget, input_area);
         }
 
@@ -1312,7 +1329,7 @@ impl TuiApp {
                 if self.session_id.is_nil() {
                     "(none)".to_string()
                 } else {
-                    self.session_id.to_string()[..8].to_string()
+                    self.session_id.to_string()
                 },
                 Style::default().fg(Color::Yellow),
             ),
@@ -1356,7 +1373,12 @@ impl TuiApp {
     }
 
     /// Push wrapped reasoning lines into the lines vector with indent and dim style.
-    fn push_wrapped_lines(lines: &mut Vec<Line<'static>>, text: &str, area_width: u16, indent: &str) {
+    fn push_wrapped_lines(
+        lines: &mut Vec<Line<'static>>,
+        text: &str,
+        area_width: u16,
+        indent: &str,
+    ) {
         let max_w = area_width.saturating_sub(indent.len() as u16) as usize;
         for paragraph in text.split('\n') {
             let mut current = String::new();
@@ -1977,7 +1999,7 @@ impl TuiApp {
             for (i, meta) in self.session_list.iter().enumerate() {
                 let is_active = meta.session_id == self.session_id.to_string();
                 let active_marker = if is_active { "*" } else { " " };
-                
+
                 let text = format!(
                     "  {} [{}]  Created: {}  Dir: {}  Model: {}",
                     active_marker,
@@ -2074,7 +2096,9 @@ impl TuiApp {
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
             format!("  Permission Required — {}", prompt.tool_name),
-            Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             format!("  {}", prompt.args_summary),
@@ -2103,7 +2127,6 @@ impl TuiApp {
 
 pub use input::InputAction;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2124,5 +2147,35 @@ mod tests {
             status: "connected (1 tools)".into(),
         });
         assert_eq!(app.status_text, "MCP fixture: connected (1 tools)");
+    }
+
+    #[test]
+    fn status_bar_displays_full_session_id() {
+        let config = LlmConfig::Anthropic {
+            api_key: String::new(),
+            model: "test-model".into(),
+            base_url: "https://example.com".into(),
+            reasoning_effort: None,
+        };
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+        app.session_id = uuid::Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap();
+        let backend = ratatui::backend::TestBackend::new(160, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        // Read the rendered status row to verify the user-visible session identifier.
+        let buffer = terminal.backend().buffer();
+        let status_row = (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, buffer.area.height - 1)))
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(
+            status_row.contains("Session: 12345678-1234-5678-9abc-def012345678"),
+            "rendered status row: {status_row:?}"
+        );
     }
 }

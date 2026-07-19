@@ -184,7 +184,6 @@ impl Default for ToolRegistry {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +229,9 @@ mod tests {
             .register_dynamic(Arc::new(DummyTool { name: "two".into() }))
             .await;
         registry
-            .register_dynamic(Arc::new(DummyTool { name: "three".into() }))
+            .register_dynamic(Arc::new(DummyTool {
+                name: "three".into(),
+            }))
             .await;
 
         registry.unregister_many(["one", "three"]).await;
