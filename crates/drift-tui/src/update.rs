@@ -59,6 +59,7 @@ impl TuiApp {
                 self.current_response.clear();
                 self.current_reasoning.clear();
                 self.reasoning_start_time = None;
+                self.current_reasoning_duration_ms = 0;
                 self.current_reasoning_collapsed = true;
             }
             // Unknown command — show a help message.
@@ -329,11 +330,25 @@ impl TuiApp {
                 }
                 self.status_text = "Generating...".into();
             }
-            // A reasoning delta always belongs to the current independent thinking phase.
+            // Resume the prior reasoning-only block as soon as a new phase starts.
             AppEvent::Reasoning(text) => {
                 if self.current_reasoning.is_empty() {
+                    if self.messages.last().is_some_and(|previous| {
+                        previous.role == "assistant"
+                            && previous.content.is_empty()
+                            && previous.reasoning.is_some()
+                    }) {
+                        let previous = self.messages.pop().expect("checked non-empty history");
+                        self.current_reasoning_duration_ms =
+                            previous.reasoning_duration_ms.unwrap_or(0);
+                        self.current_reasoning =
+                            previous.reasoning.expect("checked reasoning block");
+                        self.current_reasoning.push_str("\n\n");
+                    } else {
+                        self.current_reasoning_duration_ms = 0;
+                    }
                     self.reasoning_start_time = Some(Instant::now());
-                    self.current_reasoning_collapsed = false;
+                    self.current_reasoning_collapsed = true;
                 }
                 self.current_reasoning.push_str(&text);
                 self.status_text = "Thinking...".into();
@@ -438,6 +453,7 @@ impl TuiApp {
                 self.current_response.clear();
                 self.current_reasoning.clear();
                 self.reasoning_start_time = None;
+                self.current_reasoning_duration_ms = 0;
                 self.chat_scroll_offset = 0;
                 self.status_text = format!("Loaded session {}", &session_id.to_string()[..8]);
                 self.mode = TuiMode::Normal;
@@ -504,17 +520,34 @@ impl TuiApp {
             .map(|start| start.elapsed().as_millis() as u64)
             .unwrap_or(0);
         if self.current_reasoning.is_empty() {
+            self.current_reasoning_duration_ms = 0;
             self.current_reasoning_collapsed = true;
             return;
         }
-        let duration_ms = elapsed.max(duration_hint.unwrap_or(0));
-        self.messages.push(ChatMessage {
-            role: "assistant".into(),
-            content: String::new(),
-            reasoning: Some(std::mem::take(&mut self.current_reasoning)),
-            reasoning_duration_ms: Some(duration_ms),
-            reasoning_collapsed: true,
-        });
+        let duration_ms = self
+            .current_reasoning_duration_ms
+            .saturating_add(elapsed.max(duration_hint.unwrap_or(0)));
+        self.current_reasoning_duration_ms = 0;
+        let reasoning = std::mem::take(&mut self.current_reasoning);
+        if let Some(previous) = self.messages.last_mut()
+            && previous.role == "assistant"
+            && previous.content.is_empty()
+            && let Some(previous_reasoning) = previous.reasoning.as_mut()
+        {
+            // Consecutive reasoning-only messages have no visible output between them.
+            previous_reasoning.push_str("\n\n");
+            previous_reasoning.push_str(&reasoning);
+            previous.reasoning_duration_ms =
+                Some(previous.reasoning_duration_ms.unwrap_or(0) + duration_ms);
+        } else {
+            self.messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning: Some(reasoning),
+                reasoning_duration_ms: Some(duration_ms),
+                reasoning_collapsed: true,
+            });
+        }
         self.current_reasoning_collapsed = true;
     }
 

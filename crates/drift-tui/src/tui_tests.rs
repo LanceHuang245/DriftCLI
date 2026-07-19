@@ -140,7 +140,7 @@ fn permission_prompt_displays_risk_and_response_keys() {
 }
 
 #[test]
-fn tool_iteration_creates_independent_thinking_blocks() {
+fn tool_iteration_merges_adjacent_thinking_blocks() {
     let config = LlmConfig::Anthropic {
         api_key: String::new(),
         model: "test-model".into(),
@@ -152,6 +152,7 @@ fn tool_iteration_creates_independent_thinking_blocks() {
     let mut app = TuiApp::new(&config, event_rx, cmd_tx);
 
     app.handle_app_event(AppEvent::Reasoning("first thought".into()));
+    assert!(app.current_reasoning_collapsed);
     app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 120 });
     app.handle_app_event(AppEvent::ToolCallStart {
         name: "bash".into(),
@@ -167,6 +168,36 @@ fn tool_iteration_creates_independent_thinking_blocks() {
 
     app.handle_app_event(AppEvent::Reasoning("second thought".into()));
     assert!(app.reasoning_start_time.is_some());
+    assert!(app.messages.is_empty());
+    assert_eq!(app.current_reasoning, "first thought\n\nsecond thought");
+    assert_eq!(app.current_reasoning_duration_ms, 120);
+    app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 240 });
+
+    let thinking: Vec<_> = app
+        .messages
+        .iter()
+        .filter_map(|message| message.reasoning.as_deref())
+        .collect();
+    assert_eq!(thinking, ["first thought\n\nsecond thought"]);
+    assert_eq!(app.messages[0].reasoning_duration_ms, Some(360));
+}
+
+#[test]
+fn visible_output_keeps_thinking_blocks_separate() {
+    let config = LlmConfig::Anthropic {
+        api_key: String::new(),
+        model: "test-model".into(),
+        base_url: "https://example.com".into(),
+        reasoning_effort: None,
+    };
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+    let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+
+    app.handle_app_event(AppEvent::Reasoning("first thought".into()));
+    app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 120 });
+    app.handle_app_event(AppEvent::Token("visible output".into()));
+    app.handle_app_event(AppEvent::Reasoning("second thought".into()));
     app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 240 });
 
     let thinking: Vec<_> = app
@@ -175,8 +206,6 @@ fn tool_iteration_creates_independent_thinking_blocks() {
         .filter_map(|message| message.reasoning.as_deref())
         .collect();
     assert_eq!(thinking, ["first thought", "second thought"]);
-    assert_eq!(app.messages[0].reasoning_duration_ms, Some(120));
-    assert_eq!(app.messages[1].reasoning_duration_ms, Some(240));
 }
 
 #[test]

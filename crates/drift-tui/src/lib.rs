@@ -158,6 +158,8 @@ pub struct TuiApp {
     current_response: String,
     current_reasoning: String,
     reasoning_start_time: Option<Instant>,
+    // Duration accumulated before a reasoning-only message resumes streaming.
+    current_reasoning_duration_ms: u64,
     current_reasoning_collapsed: bool,
     reasoning_header_positions: Vec<(ReasoningTarget, usize)>,
     total_chat_lines: usize,
@@ -230,6 +232,7 @@ impl TuiApp {
             current_response: String::new(),
             current_reasoning: String::new(),
             reasoning_start_time: None,
+            current_reasoning_duration_ms: 0,
             current_reasoning_collapsed: true,
             reasoning_header_positions: Vec::new(),
             total_chat_lines: 0,

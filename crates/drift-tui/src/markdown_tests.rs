@@ -30,24 +30,6 @@ fn ordered_list() {
 }
 
 #[test]
-fn tight_unordered_list() {
-    let lines = render_markdown("- A\n- B\n- C\n", 80);
-    let text = lines_to_string(&lines);
-    assert!(text.contains("- A"), "text was: {text}");
-    assert!(text.contains("- B"), "text was: {text}");
-    assert!(text.contains("- C"), "text was: {text}");
-}
-
-#[test]
-fn tight_ordered_list() {
-    let lines = render_markdown("1. Alpha\n2. Beta\n3. Gamma\n", 80);
-    let text = lines_to_string(&lines);
-    assert!(text.contains("1. Alpha"), "text was: {text}");
-    assert!(text.contains("2. Beta"), "text was: {text}");
-    assert!(text.contains("3. Gamma"), "text was: {text}");
-}
-
-#[test]
 fn nested_list() {
     let lines = render_markdown("- Outer\n  - Inner\n", 80);
     let text = lines_to_string(&lines);

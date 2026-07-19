@@ -237,11 +237,13 @@ impl TuiApp {
         current_reasoning: &str,
         current_reasoning_collapsed: bool,
         reasoning_start_time: Option<Instant>,
+        current_reasoning_duration_ms: u64,
         area_width: u16,
     ) {
         let live_duration = match reasoning_start_time {
             Some(start) => {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let elapsed_ms = current_reasoning_duration_ms
+                    .saturating_add(start.elapsed().as_millis() as u64);
                 if elapsed_ms >= 1000 {
                     format!(" for {:.1}s", elapsed_ms as f64 / 1000.0)
                 } else {
@@ -363,6 +365,7 @@ impl TuiApp {
                 &self.current_reasoning,
                 self.current_reasoning_collapsed,
                 self.reasoning_start_time,
+                self.current_reasoning_duration_ms,
                 area.width,
             );
         }
