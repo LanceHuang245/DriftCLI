@@ -185,7 +185,6 @@ pub struct TuiApp {
     // Multi-provider support: configured providers, selection index, and active name.
     providers: Vec<String>,
     provider_selected: usize,
-    provider_action_selected: usize,
     provider_name: String,
     // Active session metadata and switching list
     session_id: uuid::Uuid,
@@ -214,8 +213,6 @@ pub enum TuiMode {
     VariantPicker,
     // Provider switcher overlay (list configured providers with delete option)
     ProviderPicker,
-    // Sub-menu after selecting a provider in the provider picker: Apply / Modify
-    ProviderAction { provider_name: String },
     // Session list and load picker overlay
     SessionPicker,
 }
@@ -263,7 +260,6 @@ impl TuiApp {
             variant_selected: 0,
             providers: Vec::new(),
             provider_selected: 0,
-            provider_action_selected: 0,
             provider_name: "default".to_string(),
             session_id: uuid::Uuid::nil(),
             session_list: Vec::new(),
@@ -508,9 +504,6 @@ impl TuiApp {
                             TuiMode::ProviderPicker => {
                                 self.handle_provider_key(key.code);
                             }
-                            TuiMode::ProviderAction { .. } => {
-                                self.handle_provider_action_key(key.code);
-                            }
                             TuiMode::SessionPicker => {
                                 self.handle_session_picker_key(key.code);
                             }
@@ -536,10 +529,6 @@ impl TuiApp {
                                     TuiMode::ProviderPicker => {
                                         self.provider_selected =
                                             self.provider_selected.saturating_sub(1);
-                                    }
-                                    TuiMode::ProviderAction { .. } => {
-                                        self.provider_action_selected =
-                                            self.provider_action_selected.saturating_sub(1);
                                     }
                                     TuiMode::SessionPicker => {
                                         self.session_selected =
@@ -573,11 +562,6 @@ impl TuiApp {
                                     TuiMode::ProviderPicker => {
                                         if self.provider_selected <= self.providers.len() {
                                             self.provider_selected += 1;
-                                        }
-                                    }
-                                    TuiMode::ProviderAction { .. } => {
-                                        if self.provider_action_selected < 1 {
-                                            self.provider_action_selected += 1;
                                         }
                                     }
                                     TuiMode::SessionPicker => {
@@ -811,13 +795,17 @@ impl TuiApp {
             KeyCode::Enter => {
                 if self.provider_selected < self.providers.len() {
                     let name = self.providers[self.provider_selected].clone();
-                    self.provider_action_selected = 0;
-                    self.mode = TuiMode::ProviderAction {
-                        provider_name: name,
-                    };
+                    let _ = self.cmd_tx.send(TuiCommand::SetActiveProvider(name));
+                    self.mode = TuiMode::Normal;
                 } else {
                     // [+ New Provider]
                     self.mode = TuiMode::ConnectSettings;
+                }
+            }
+            KeyCode::Char('e') => {
+                if self.provider_selected < self.providers.len() {
+                    let name = self.providers[self.provider_selected].clone();
+                    let _ = self.cmd_tx.send(TuiCommand::GetProviderConfig(name));
                 }
             }
             KeyCode::Char('d') => {
@@ -826,41 +814,6 @@ impl TuiApp {
                     let _ = self.cmd_tx.send(TuiCommand::DeleteProvider(name));
                     // Re-request list
                     let _ = self.cmd_tx.send(TuiCommand::GetProviders);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Handle key presses in the provider action sub-menu (Apply / Modify).
-    fn handle_provider_action_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc => self.mode = TuiMode::ProviderPicker,
-            KeyCode::Up => {
-                self.provider_action_selected = self.provider_action_selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                if self.provider_action_selected < 1 {
-                    self.provider_action_selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let TuiMode::ProviderAction { ref provider_name } = self.mode {
-                    match self.provider_action_selected {
-                        0 => {
-                            let _ = self
-                                .cmd_tx
-                                .send(TuiCommand::SetActiveProvider(provider_name.clone()));
-                            self.mode = TuiMode::Normal;
-                        }
-                        1 => {
-                            let _ = self
-                                .cmd_tx
-                                .send(TuiCommand::GetProviderConfig(provider_name.clone()));
-                            // Mode switches to ConnectSettings when ProviderConfig event arrives.
-                        }
-                        _ => {}
-                    }
                 }
             }
             _ => {}
@@ -1231,9 +1184,6 @@ impl TuiApp {
             }
             TuiMode::ProviderPicker => {
                 f.render_widget(self.render_provider_picker(), content_area);
-            }
-            TuiMode::ProviderAction { .. } => {
-                f.render_widget(self.render_provider_action(), content_area);
             }
             TuiMode::SessionPicker => {
                 f.render_widget(self.render_session_picker(), content_area);
@@ -1846,56 +1796,13 @@ impl TuiApp {
 
         lines.push(Line::from(Span::raw("")));
         lines.push(Line::from(Span::styled(
-            "  Up/Down: choose  Enter: select  d: delete  Esc: cancel",
+            "  Up/Down: choose  Enter: switch  e: edit  d: delete  Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" /provider — Select Provider ")
-            .border_style(Style::default().fg(Color::Cyan));
-        Paragraph::new(lines).block(block)
-    }
-
-    // Render the provider action sub-menu (Apply / Modify) after selecting a provider.
-    fn render_provider_action(&self) -> Paragraph<'_> {
-        let name = match &self.mode {
-            TuiMode::ProviderAction { provider_name } => provider_name.clone(),
-            _ => return Paragraph::new(vec![]),
-        };
-
-        let mut lines = Vec::new();
-        lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(Span::styled(
-            format!("  Provider: {}", name),
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(Line::from(Span::raw("")));
-
-        for (i, label) in [
-            "  Apply  (switch to this provider)",
-            "  Modify (edit provider config)",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let style = if i == self.provider_action_selected {
-                Style::default().fg(Color::Black).bg(Color::Green)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            lines.push(Line::from(Span::styled(*label, style)));
-        }
-
-        lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(Span::styled(
-            "  Up/Down: choose  Enter: confirm  Esc: back",
-            Style::default().fg(Color::DarkGray),
-        )));
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" /provider — Action ")
             .border_style(Style::default().fg(Color::Cyan));
         Paragraph::new(lines).block(block)
     }
@@ -2045,6 +1952,11 @@ impl TuiApp {
         self.session_id = session_id;
     }
 
+    // Set the provider name loaded from persistent configuration.
+    pub fn set_provider_name(&mut self, provider_name: String) {
+        self.provider_name = provider_name;
+    }
+
     // Render the slash command completion popup with bordered list.
     fn render_slash_popup(&self, state: &SlashCompletionState) -> Paragraph<'_> {
         let max_visible = 8usize;
@@ -2177,5 +2089,52 @@ mod tests {
             status_row.contains("Session: 12345678-1234-5678-9abc-def012345678"),
             "rendered status row: {status_row:?}"
         );
+    }
+
+    #[test]
+    fn provider_picker_enter_switches_selected_provider() {
+        let config = LlmConfig::Anthropic {
+            api_key: String::new(),
+            model: "test-model".into(),
+            base_url: "https://example.com".into(),
+            reasoning_effort: None,
+        };
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+        app.providers = vec!["default".into(), "alternate".into()];
+        app.provider_selected = 1;
+        app.mode = TuiMode::ProviderPicker;
+
+        app.handle_provider_key(KeyCode::Enter);
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::SetActiveProvider(name)) if name == "alternate"
+        ));
+        assert_eq!(app.mode, TuiMode::Normal);
+    }
+
+    #[test]
+    fn provider_picker_edit_key_opens_selected_config() {
+        let config = LlmConfig::Anthropic {
+            api_key: String::new(),
+            model: "test-model".into(),
+            base_url: "https://example.com".into(),
+            reasoning_effort: None,
+        };
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+        app.providers = vec!["default".into(), "alternate".into()];
+        app.provider_selected = 1;
+        app.mode = TuiMode::ProviderPicker;
+
+        app.handle_provider_key(KeyCode::Char('e'));
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::GetProviderConfig(name)) if name == "alternate"
+        ));
     }
 }

@@ -1011,6 +1011,9 @@ impl Agent {
             .ok_or(LlmError::Config("No config".into()))?;
         self.llm = create_provider(llm_config)?;
         self.context.set_context_window(self.llm.context_window());
+        self.config
+            .save_to_project(&self.cwd)
+            .map_err(|e| LlmError::Config(e.to_string()))?;
         let _ = self.event_tx.send(EventMsg::ProviderSwitched {
             name: name.to_string(),
             model: self.llm.model_name().to_string(),
@@ -1368,6 +1371,46 @@ mod tests {
 
         std::fs::remove_dir_all(root).ok();
     }
+
+    // Verify provider selection is restored from project config after a restart.
+    #[tokio::test]
+    async fn activate_provider_persists_selection() {
+        let root = std::env::temp_dir().join(format!("drift-provider-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::load_for_workspace(&root, None, None, None).unwrap();
+        config.save_provider(
+            "alternate".into(),
+            LlmConfig::OpenAiCompatible {
+                api_key: String::new(),
+                model: "alternate-model".into(),
+                base_url: "https://example.com/v1".into(),
+                supports_thinking: false,
+            },
+        );
+        let security = config.security.clone();
+        let session_store =
+            std::sync::Arc::new(drift_storage::SessionStore::new(root.join("store")).unwrap());
+        let (session_id, _) = session_store
+            .create(root.to_string_lossy().as_ref(), "test-model")
+            .unwrap();
+        let mut agent = Agent::new(
+            config,
+            root.clone(),
+            std::sync::Arc::new(ToolRegistry::new()),
+            session_id,
+            session_store,
+            &security,
+            "default",
+        )
+        .unwrap();
+
+        agent.activate_provider("alternate").await.unwrap();
+
+        let restored = AppConfig::load_for_workspace(&root, None, None, None).unwrap();
+        assert_eq!(restored.active_provider, "alternate");
+        std::fs::remove_dir_all(root).ok();
+    }
+
     // Verify an applied snapshot survives JSONL persistence and replay.
     #[test]
     fn persisted_snapshot_replays_after_apply_compaction() {

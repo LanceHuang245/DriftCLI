@@ -553,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Start the TUI app on the main thread — blocks until the user exits.
             let mut tui = TuiApp::new(&llm_config, tui_rx, cmd_tx);
+            tui.set_provider_name(config.active_provider.clone());
             if !history_events.is_empty() {
                 tui.set_messages(translate_events_to_chat_messages(&history_events));
             }
