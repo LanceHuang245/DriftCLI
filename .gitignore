@@ -2,12 +2,13 @@
 AGENTS.md
 CLAUDE.md
 .serena/
+.codebase-memory/
 .kilo/
 .omc/
 .claude/
 
 # Dev
-dev-docs/temp/
+temp/
 dev-docs/
 .drift/
 
