@@ -1311,6 +1311,10 @@ mod tests {
         let permission_engine = PermissionEngine::new(&config.security, "default");
         let file_access = std::sync::Arc::new(permission_engine.file_access_guard(&root).unwrap());
         let network = std::sync::Arc::new(permission_engine.network_guard());
+        // Match production construction so the test uses the same process boundary.
+        let process_sandbox = std::sync::Arc::new(
+            ProcessSandbox::new(permission_engine.sandbox_mode(), &root).unwrap(),
+        );
         let session_store =
             std::sync::Arc::new(drift_storage::SessionStore::new(root.join("store")).unwrap());
         let (session_id, _) = session_store
@@ -1330,6 +1334,7 @@ mod tests {
             session_store: session_store.clone(),
             file_access,
             network,
+            process_sandbox,
         };
         agent.set_messages(vec![LlmMessage::user("old request ".repeat(1000))]);
         let mut events = agent.subscribe();
