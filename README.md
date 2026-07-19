@@ -22,21 +22,6 @@ DriftCLI is a terminal AI coding agent that reads, writes, edits, and searches y
 
 **BYOK** — DriftCLI is a pure client. No proxy, no markup, no vendor lock-in. Use your own API keys with Anthropic, OpenAI, Google, Groq, Ollama, or any OpenAI-compatible endpoint.
 
-## Why DriftCLI
-
-| | DriftCLI | Claude Code | CodexCLI | OpenCode/Kilo |
-|---|---|---|---|---|
-| **Language** | Rust | TypeScript | Rust | TypeScript |
-| **Startup** | < 5ms | ~200ms | < 5ms | ~200ms |
-| **Binary size** | ~5 MB | — | ~50 MB | ~15 MB |
-| **Runtime** | None (static) | Bun | None (static) | Bun |
-| **BYOK** | Yes | Anthropic only | OpenAI only | Yes |
-| **MCP** | rmcp (native) | Partial | rmcp (native) | MCP SDK |
-| **Plugins** | WASM (wasmtime) | — | — | WASM |
-| **Sub-agents** | Tokio task isolation | Yes | Yes | Yes |
-| **Sandbox** | bubblewrap / Seatbelt (opt) | — | bubblewrap | — |
-| **License** | MIT | Proprietary | Apache 2.0 | MIT |
-
 ## Features
 
 - **Submit/Event streaming architecture** — the agent loop never blocks the TUI. Every token, tool call, and status change is a typed event pushed to subscribers.
