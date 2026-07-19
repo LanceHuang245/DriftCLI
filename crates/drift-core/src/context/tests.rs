@@ -67,7 +67,12 @@ async fn keeps_system_prompt_and_tool_definitions_in_context() {
         .await
         .unwrap();
 
-    assert!(built.system_prompt.unwrap().contains("DriftCLI"));
+    let system_prompt = built.system_prompt.unwrap();
+    assert!(system_prompt.contains("DriftCLI"));
+    assert!(system_prompt.contains("Keep working until the user's request is resolved"));
+    assert!(system_prompt.contains("Report the outcome first"));
+    assert!(system_prompt.contains("Questions and read-only requests"));
+    assert!(!system_prompt.contains("CALL THE TOOL immediately"));
     assert_eq!(built.tools.unwrap().len(), 1);
 }
 

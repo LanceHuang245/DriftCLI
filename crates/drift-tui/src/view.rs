@@ -13,10 +13,16 @@ impl TuiApp {
             }
         });
 
+        // Give the permission prompt enough rows to keep every response key visible.
+        let input_height = if self.permission_prompt.is_some() {
+            9
+        } else {
+            3
+        };
         // Split the screen: content, optional popup, input, status bar.
         let mut constraints = vec![
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(1),
         ];
         if let Some(h) = popup_height {
@@ -93,16 +99,19 @@ impl TuiApp {
             f.render_widget(input_widget, input_area);
         }
 
-        // Calculate cursor position accounting for unicode width and prompt prefix.
-        let before_cursor = &self.input_buffer[..self.cursor_position.min(self.input_buffer.len())];
-        let prompt_width = 2;
-        let visual_before = unicode_width::UnicodeWidthStr::width(before_cursor);
-        let visual_total = prompt_width + visual_before;
-        let inner_width = input_area.width as usize;
+        // Keep the text cursor hidden while keyboard input belongs to the permission prompt.
+        if self.permission_prompt.is_none() {
+            let before_cursor =
+                &self.input_buffer[..self.cursor_position.min(self.input_buffer.len())];
+            let prompt_width = 2;
+            let visual_before = unicode_width::UnicodeWidthStr::width(before_cursor);
+            let visual_total = prompt_width + visual_before;
+            let inner_width = input_area.width as usize;
 
-        let cursor_x = (visual_total % inner_width.max(1)) as u16;
-        let cursor_y = input_area.y + 1 + (visual_total / inner_width.max(1)) as u16;
-        f.set_cursor_position(Position::new(cursor_x, cursor_y));
+            let cursor_x = (visual_total % inner_width.max(1)) as u16;
+            let cursor_y = input_area.y + 1 + (visual_total / inner_width.max(1)) as u16;
+            f.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
 
         // Status bar: color-coded status, provider name, model name, and keyboard shortcuts.
         let status_style = match self.status_text.as_str() {
@@ -228,30 +237,18 @@ impl TuiApp {
         current_reasoning: &str,
         current_reasoning_collapsed: bool,
         reasoning_start_time: Option<Instant>,
-        current_reasoning_duration: Option<u64>,
         area_width: u16,
-        thinking_tools: &[String],
     ) {
         let live_duration = match reasoning_start_time {
             Some(start) => {
-                let current_ms = start.elapsed().as_millis() as u64;
-                let total = current_reasoning_duration.unwrap_or(0) + current_ms;
-                if total >= 1000 {
-                    format!(" for {:.1}s", total as f64 / 1000.0)
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if elapsed_ms >= 1000 {
+                    format!(" for {:.1}s", elapsed_ms as f64 / 1000.0)
                 } else {
-                    format!(" for {}ms", total)
+                    format!(" for {}ms", elapsed_ms)
                 }
             }
-            None => match current_reasoning_duration {
-                Some(ms) if ms > 0 => {
-                    if ms >= 1000 {
-                        format!(" for {:.1}s", ms as f64 / 1000.0)
-                    } else {
-                        format!(" for {}ms", ms)
-                    }
-                }
-                _ => String::new(),
-            },
+            None => String::new(),
         };
 
         let toggle = if current_reasoning_collapsed {
@@ -272,12 +269,6 @@ impl TuiApp {
 
         if !current_reasoning_collapsed {
             Self::push_wrapped_lines(lines, current_reasoning, area_width, "  ");
-            for tool_line in thinking_tools {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", tool_line),
-                    Style::default().fg(Color::Cyan),
-                )));
-            }
         }
 
         lines.push(Line::from(Span::raw("")));
@@ -290,26 +281,20 @@ impl TuiApp {
 
         // Build flat lines for all messages with role-based styling.
         let mut lines: Vec<Line> = Vec::new();
-        let mut live_rendered = false;
-
         for (msg_idx, msg) in self.messages.iter().enumerate() {
             let text_style = match msg.role.as_str() {
                 "system" => Style::default().fg(Color::Yellow),
-                _ if msg.thinking => Style::default().fg(Color::DarkGray),
                 _ => Style::default(),
             };
 
             if let Some(reasoning) = &msg.reasoning {
-                let duration_str = msg.reasoning_duration_ms.map_or_else(
-                    || String::new(),
-                    |ms| {
-                        if ms >= 1000 {
-                            format!(" for {:.1}s", ms as f64 / 1000.0)
-                        } else {
-                            format!(" for {}ms", ms)
-                        }
-                    },
-                );
+                let duration_str = msg.reasoning_duration_ms.map_or_else(String::new, |ms| {
+                    if ms >= 1000 {
+                        format!(" for {:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!(" for {}ms", ms)
+                    }
+                });
 
                 let toggle = if msg.reasoning_collapsed {
                     "▶"
@@ -331,33 +316,9 @@ impl TuiApp {
 
                 if !msg.reasoning_collapsed {
                     Self::push_wrapped_lines(&mut lines, reasoning, area.width, "  ");
-                    for tool_line in &msg.thinking_tools {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", tool_line),
-                            Style::default().fg(Color::Cyan),
-                        )));
-                    }
                 }
 
                 lines.push(Line::from(Span::raw("")));
-            }
-
-            // If this is the last message being streamed and live reasoning exists,
-            // render the live block before the content (so interleaved thinking
-            // appears above the generating text for OpenAI Compatible models).
-            let is_last = msg_idx + 1 == self.messages.len();
-            if is_last && msg.role == "assistant" && !self.current_reasoning.is_empty() {
-                Self::push_live_reasoning_block(
-                    &mut self.reasoning_header_positions,
-                    &mut lines,
-                    &self.current_reasoning,
-                    self.current_reasoning_collapsed,
-                    self.reasoning_start_time,
-                    self.current_reasoning_duration,
-                    area.width,
-                    &self.current_thinking_tools,
-                );
-                live_rendered = true;
             }
 
             if msg.role == "user" {
@@ -382,7 +343,7 @@ impl TuiApp {
                     bottom,
                     Style::default().fg(Color::Cyan),
                 )));
-            } else if msg.role == "assistant" && !msg.thinking {
+            } else if msg.role == "assistant" {
                 let md_lines = markdown::render_markdown(&msg.content, area.width);
                 for line in md_lines {
                     lines.push(line);
@@ -394,18 +355,15 @@ impl TuiApp {
             }
         }
 
-        // If the live block wasn't rendered inline (no assistant message yet),
-        // render it at the end for the pure thinking phase.
-        if !live_rendered && !self.current_reasoning.is_empty() {
+        // A live thinking phase always follows committed history chronologically.
+        if !self.current_reasoning.is_empty() {
             Self::push_live_reasoning_block(
                 &mut self.reasoning_header_positions,
                 &mut lines,
                 &self.current_reasoning,
                 self.current_reasoning_collapsed,
                 self.reasoning_start_time,
-                self.current_reasoning_duration,
                 area.width,
-                &self.current_thinking_tools,
             );
         }
 
@@ -869,12 +827,16 @@ impl TuiApp {
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
-            format!("  Risk:   {}", prompt.risk_level),
+            format!("  Risk: {}", prompt.risk_level),
             Style::default().fg(risk_color),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  [y] Allow once    [Y] Always allow    [n] Deny once    [N] Always deny",
+            "  [y] Allow once       [Y] Always allow",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  [n] Deny once        [N] Always deny       [Esc] Cancel",
             Style::default().fg(Color::Cyan),
         )));
         let block = Block::default()

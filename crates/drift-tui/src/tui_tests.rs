@@ -94,3 +94,150 @@ fn provider_picker_edit_key_opens_selected_config() {
         Ok(TuiCommand::GetProviderConfig(name)) if name == "alternate"
     ));
 }
+
+#[test]
+fn permission_prompt_displays_risk_and_response_keys() {
+    let config = LlmConfig::Anthropic {
+        api_key: String::new(),
+        model: "test-model".into(),
+        base_url: "https://example.com".into(),
+        reasoning_effort: None,
+    };
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+    let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+    app.handle_app_event(AppEvent::PermissionRequest {
+        request_id: "perm-1".into(),
+        tool_name: "bash".into(),
+        args_summary: "git push origin main".into(),
+        reason: "Command changes remote state".into(),
+        risk_level: "High".into(),
+    });
+    let backend = ratatui::backend::TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    // Flatten the frame so the complete user-visible permission instructions are asserted.
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect::<Vec<_>>()
+                .concat()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Permission Required — bash"));
+    assert!(rendered.contains("Risk: High"));
+    assert!(rendered.contains("[y] Allow once"));
+    assert!(rendered.contains("[Y] Always allow"));
+    assert!(rendered.contains("[n] Deny once"));
+    assert!(rendered.contains("[N] Always deny"));
+    assert!(rendered.contains("[Esc] Cancel"));
+}
+
+#[test]
+fn tool_iteration_creates_independent_thinking_blocks() {
+    let config = LlmConfig::Anthropic {
+        api_key: String::new(),
+        model: "test-model".into(),
+        base_url: "https://example.com".into(),
+        reasoning_effort: None,
+    };
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+    let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+
+    app.handle_app_event(AppEvent::Reasoning("first thought".into()));
+    app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 120 });
+    app.handle_app_event(AppEvent::ToolCallStart {
+        name: "bash".into(),
+    });
+    app.handle_app_event(AppEvent::ToolExecStart {
+        name: "bash".into(),
+    });
+    app.handle_app_event(AppEvent::ToolExecEnd);
+
+    assert_eq!(app.status_text, "Thinking...");
+    assert!(app.current_reasoning.is_empty());
+    assert!(app.reasoning_start_time.is_none());
+
+    app.handle_app_event(AppEvent::Reasoning("second thought".into()));
+    assert!(app.reasoning_start_time.is_some());
+    app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 240 });
+
+    let thinking: Vec<_> = app
+        .messages
+        .iter()
+        .filter_map(|message| message.reasoning.as_deref())
+        .collect();
+    assert_eq!(thinking, ["first thought", "second thought"]);
+    assert_eq!(app.messages[0].reasoning_duration_ms, Some(120));
+    assert_eq!(app.messages[1].reasoning_duration_ms, Some(240));
+}
+
+#[test]
+fn starting_next_turn_keeps_completed_thinking_history() {
+    let config = LlmConfig::Anthropic {
+        api_key: String::new(),
+        model: "test-model".into(),
+        base_url: "https://example.com".into(),
+        reasoning_effort: None,
+    };
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+    let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+
+    app.begin_user_turn("first question".into());
+    app.handle_app_event(AppEvent::Reasoning("preserved thought".into()));
+    app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 50 });
+    app.handle_app_event(AppEvent::Token("first answer".into()));
+    app.handle_app_event(AppEvent::Done);
+    app.begin_user_turn("second question".into());
+
+    assert!(app.messages.iter().any(|message| {
+        message.reasoning.as_deref() == Some("preserved thought")
+            && message.reasoning_duration_ms == Some(50)
+    }));
+}
+
+#[test]
+fn tool_calls_never_render_in_chat_history() {
+    let config = LlmConfig::Anthropic {
+        api_key: String::new(),
+        model: "test-model".into(),
+        base_url: "https://example.com".into(),
+        reasoning_effort: None,
+    };
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+    let mut app = TuiApp::new(&config, event_rx, cmd_tx);
+    app.handle_app_event(AppEvent::Reasoning("inspect workspace".into()));
+    app.handle_app_event(AppEvent::ReasoningComplete { duration_ms: 10 });
+    app.handle_app_event(AppEvent::ToolCallStart {
+        name: "secret-tool-name".into(),
+    });
+    app.handle_app_event(AppEvent::ToolExecStart {
+        name: "secret-tool-name".into(),
+    });
+    app.handle_app_event(AppEvent::ToolExecEnd);
+    let backend = ratatui::backend::TestBackend::new(100, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height)
+        .flat_map(|y| {
+            (0..buffer.area.width)
+                .filter_map(move |x| buffer.cell((x, y)))
+                .map(|cell| cell.symbol())
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    assert!(!rendered.contains("secret-tool-name"));
+    assert!(rendered.contains("Thinking..."));
+}

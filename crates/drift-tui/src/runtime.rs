@@ -178,29 +178,7 @@ impl TuiApp {
                                                         if text.starts_with('/') {
                                                             self.handle_command(&text);
                                                         } else {
-                                                            if self.history.last() != Some(&text) {
-                                                                self.history.push(text.clone());
-                                                            }
-                                                            self.messages.push(ChatMessage {
-                                                                role: "user".into(),
-                                                                content: text.clone(),
-                                                                reasoning: None,
-                                                                thinking: false,
-                                                                reasoning_duration_ms: None,
-                                                                reasoning_collapsed: false,
-                                                                thinking_tools: Vec::new(),
-                                                            });
-                                                            self.current_response.clear();
-                                                            self.current_reasoning.clear();
-                                                            self.current_thinking_tools.clear();
-                                                            self.reasoning_start_time = None;
-                                                            self.current_reasoning_collapsed = true;
-                                                            self.chat_scroll_offset = 0;
-                                                            self.selection.clear();
-                                                            self.status_text = "Waiting...".into();
-                                                            let _ = self
-                                                                .cmd_tx
-                                                                .send(TuiCommand::Chat(text));
+                                                            self.begin_user_turn(text);
                                                         }
                                                         self.input_buffer.clear();
                                                         self.cursor_position = 0;

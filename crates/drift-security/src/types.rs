@@ -304,39 +304,19 @@ impl Default for SecurityConfig {
     }
 }
 
-/// Default per-tool pattern rules: safe dev commands auto-allow, destructive ones deny.
+/// Default per-tool pattern rules: workspace-scoped commands auto-allow, risky ones stay gated.
 ///
 /// Rules are evaluated **last-match-wins**: broad patterns like `"*"` go first,
 /// more specific patterns like `"git push *"` go later.
 fn default_tool_rules() -> ToolPermissionSet {
     let mut set = HashMap::new();
 
-    // bash: dev commands auto-allow, mutating commands ask, destructive commands deny
+    // Bash runs inside the workspace sandbox by default; later risky matches override the allow.
     set.insert(
         "bash".into(),
         vec![
             PatternRule {
-                pattern: "rm -rf /*".into(),
-                action: PermissionAction::Deny,
-            },
-            PatternRule {
-                pattern: "git push --force *".into(),
-                action: PermissionAction::Ask,
-            },
-            PatternRule {
-                pattern: "git push *".into(),
-                action: PermissionAction::Ask,
-            },
-            PatternRule {
-                pattern: "git *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "cargo *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "npm *".into(),
+                pattern: "*".into(),
                 action: PermissionAction::Allow,
             },
             PatternRule {
@@ -344,70 +324,26 @@ fn default_tool_rules() -> ToolPermissionSet {
                 action: PermissionAction::Ask,
             },
             PatternRule {
-                pattern: "grep *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "rg *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "ls *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "dir *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "pwd".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "echo *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "cat *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "head *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "tail *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "wc *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "sort *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "uniq *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "find *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "which *".into(),
-                action: PermissionAction::Allow,
-            },
-            PatternRule {
-                pattern: "*".into(),
+                pattern: "git push *".into(),
                 action: PermissionAction::Ask,
+            },
+            PatternRule {
+                pattern: "git push --force *".into(),
+                action: PermissionAction::Ask,
+            },
+            PatternRule {
+                pattern: "rm -rf /*".into(),
+                action: PermissionAction::Deny,
             },
         ],
     );
 
-    // edit/write: deny sensitive paths, ask for everything else
+    // Workspace file mutations auto-run, while sensitive project metadata stays protected.
     let file_mutate_rules = vec![
+        PatternRule {
+            pattern: "*".into(),
+            action: PermissionAction::Allow,
+        },
         PatternRule {
             pattern: "*.env".into(),
             action: PermissionAction::Deny,
@@ -423,10 +359,6 @@ fn default_tool_rules() -> ToolPermissionSet {
         PatternRule {
             pattern: ".drift/*".into(),
             action: PermissionAction::Deny,
-        },
-        PatternRule {
-            pattern: "*".into(),
-            action: PermissionAction::Ask,
         },
     ];
     set.insert("edit".into(), file_mutate_rules.clone());

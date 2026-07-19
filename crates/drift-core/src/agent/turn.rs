@@ -1,6 +1,9 @@
 use super::history::to_persisted_messages;
 use super::*;
 
+// Recover a user-facing handoff when a provider stops after tool execution.
+const FINAL_RESPONSE_INSTRUCTION: &str = "Tool execution has ended. Do not call more tools. Provide a concise final user-facing handoff now. Report the outcome first, then important changed files, validation performed, and any blocker or remaining work. Base every claim on the conversation and tool results.";
+
 // Track state of a tool call being accumulated from streaming chunks.
 struct ActiveToolCall {
     id: String,
@@ -53,14 +56,32 @@ impl Agent {
             reasoning: None,
         });
 
-        let max_iterations = self.config.agent.max_iterations;
+        let max_iterations = self.config.agent.max_iterations.max(1);
         // Suppress Done after any failure while still returning the agent to Idle.
         let mut turn_failed = false;
+        let mut tools_executed = false;
+        let mut force_final_response = false;
+        let mut final_response_emitted = false;
 
-        // Tool calling loop: iterate until LLM stops requesting tools or max reached
-        for iteration in 0..max_iterations {
+        // Reserve one tool-disabled request beyond the normal cap when a final answer is missing.
+        for iteration in 0..=max_iterations {
+            let final_response_only = force_final_response;
+            force_final_response = false;
+            if iteration == max_iterations && !final_response_only {
+                break;
+            }
+            // Every LLM pass after a tool execution starts a fresh visible thinking phase.
+            if iteration > 0 {
+                let _ = self
+                    .event_tx
+                    .send(EventMsg::AgentState(AgentState::Thinking));
+            }
             // Collect tool definitions for the LLM
-            let tool_defs = self.tool_registry.definitions().await;
+            let tool_defs = if final_response_only {
+                Vec::new()
+            } else {
+                self.tool_registry.definitions().await
+            };
             let should_compact =
                 self.config.agent.auto_compaction && self.context.needs_compaction(&tool_defs);
             if should_compact {
@@ -116,14 +137,23 @@ impl Agent {
             }
 
             // Stream from LLM
+            let mut system_prompt = built_context.system_prompt;
+            let tools = if final_response_only {
+                let prompt = system_prompt.get_or_insert_with(String::new);
+                prompt.push_str("\n\nFINALIZATION REQUIREMENT:\n");
+                prompt.push_str(FINAL_RESPONSE_INSTRUCTION);
+                None
+            } else {
+                built_context.tools
+            };
             let stream_result = self
                 .llm
                 .stream_chat(
                     built_context.messages,
-                    built_context.system_prompt,
+                    system_prompt,
                     self.config.agent.temperature,
                     Some(4096),
-                    built_context.tools,
+                    tools,
                 )
                 .await;
 
@@ -262,9 +292,13 @@ impl Agent {
                     .send(EventMsg::ReasoningComplete { duration_ms });
             }
 
-            // If no tool calls were completed, this is a text-only response — finalize
+            if turn_failed {
+                break;
+            }
+
+            // A turn is complete only after a non-empty user-facing text response.
             if completed_tool_calls.is_empty() {
-                if !full_response.is_empty() {
+                if !full_response.trim().is_empty() {
                     self.context
                         .push_message(LlmMessage::assistant(full_response.clone()));
                     // Write assistant message to SessionStore
@@ -278,7 +312,28 @@ impl Agent {
                         content: full_response,
                         reasoning: reasoning_opt,
                     });
+                    final_response_emitted = true;
+                    break;
                 }
+                if tools_executed && !final_response_only {
+                    force_final_response = true;
+                    continue;
+                }
+                turn_failed = true;
+                let _ = self.event_tx.send(EventMsg::Error {
+                    message: "The model returned no final response after tool execution".into(),
+                    recoverable: true,
+                });
+                break;
+            }
+
+            if final_response_only {
+                turn_failed = true;
+                let _ = self.event_tx.send(EventMsg::Error {
+                    message: "The model attempted another tool call while finalizing the response"
+                        .into(),
+                    recoverable: true,
+                });
                 break;
             }
 
@@ -592,6 +647,10 @@ impl Agent {
                 role: "user".into(),
                 content: tool_result_parts,
             });
+            tools_executed = true;
+            if iteration + 1 >= max_iterations {
+                force_final_response = true;
+            }
 
             // Warn if we're approaching the iteration limit
             if iteration >= max_iterations.saturating_sub(2) {
@@ -602,9 +661,17 @@ impl Agent {
             }
         }
 
-        // Finalize
+        if !turn_failed && !final_response_emitted {
+            turn_failed = true;
+            let _ = self.event_tx.send(EventMsg::Error {
+                message: "The turn ended before a final response was produced".into(),
+                recoverable: true,
+            });
+        }
+
+        // Finalize only after a visible final response or a surfaced error.
         let _ = self.event_tx.send(EventMsg::AgentState(AgentState::Idle));
-        if !turn_failed {
+        if !turn_failed && final_response_emitted {
             let _ = self.event_tx.send(EventMsg::Done);
         }
     }

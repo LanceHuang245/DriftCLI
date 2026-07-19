@@ -15,48 +15,29 @@ pub(crate) fn translate_events_to_chat_messages(
                 content,
                 reasoning,
             } => {
-                messages.push(ChatMessage {
-                    role: role.clone(),
-                    content: content.clone(),
-                    reasoning: reasoning.clone(),
-                    thinking: false,
-                    reasoning_duration_ms: None,
-                    reasoning_collapsed: true,
-                    thinking_tools: Vec::new(),
-                });
-            }
-            drift_storage::SessionEvent::ToolCall {
-                call_id: _,
-                name,
-                args,
-            } => {
-                if let Some(last) = messages.last_mut() {
-                    if last.role == "assistant" {
-                        last.thinking_tools
-                            .push(format!("> Calling tool: {} with {}", name, args));
-                    }
+                // Restore reasoning as its own block so tool iterations keep their boundaries.
+                if let Some(reasoning) = reasoning.as_ref().filter(|text| !text.is_empty()) {
+                    messages.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: String::new(),
+                        reasoning: Some(reasoning.clone()),
+                        reasoning_duration_ms: None,
+                        reasoning_collapsed: true,
+                    });
+                }
+                if !content.is_empty() || role != "assistant" {
+                    messages.push(ChatMessage {
+                        role: role.clone(),
+                        content: content.clone(),
+                        reasoning: None,
+                        reasoning_duration_ms: None,
+                        reasoning_collapsed: false,
+                    });
                 }
             }
-            drift_storage::SessionEvent::ToolResult {
-                call_id: _,
-                name,
-                success,
-                content: _,
-                error,
-            } => {
-                if let Some(last) = messages.last_mut() {
-                    if last.role == "assistant" {
-                        last.thinking_tools.push(format!(
-                            "> Tool {} {}",
-                            name,
-                            if *success { "completed" } else { "failed" }
-                        ));
-                        if let Some(err) = error {
-                            last.thinking_tools.push(format!("  Error: {}", err));
-                        }
-                    }
-                }
-            }
+            // Tool events remain in storage for context reconstruction, not chat history.
+            drift_storage::SessionEvent::ToolCall { .. }
+            | drift_storage::SessionEvent::ToolResult { .. } => {}
             // Compaction snapshots are internal context state, not chat messages.
             drift_storage::SessionEvent::ContextCompacted { .. } => {}
         }
@@ -124,22 +105,14 @@ pub(crate) fn spawn_event_bridge(
                         saved_tokens
                     )));
                 }
-                Ok(EventMsg::ToolCallStart { id, name }) => {
-                    let _ = tui_tx.send(AppEvent::ToolCallStart { id, name });
+                Ok(EventMsg::ToolCallStart { name, .. }) => {
+                    let _ = tui_tx.send(AppEvent::ToolCallStart { name });
                 }
-                Ok(EventMsg::ToolCallArgs { id, delta }) => {
-                    let _ = tui_tx.send(AppEvent::ToolCallArgs { id, delta });
+                Ok(EventMsg::ToolExecStart { name, .. }) => {
+                    let _ = tui_tx.send(AppEvent::ToolExecStart { name });
                 }
-                Ok(EventMsg::ToolCallEnd { id }) => {
-                    let _ = tui_tx.send(AppEvent::ToolCallEnd { id });
-                }
-                Ok(EventMsg::ToolExecStart { id, name }) => {
-                    let _ = tui_tx.send(AppEvent::ToolExecStart { id, name });
-                }
-                Ok(EventMsg::ToolExecEnd {
-                    id, name, success, ..
-                }) => {
-                    let _ = tui_tx.send(AppEvent::ToolExecEnd { id, name, success });
+                Ok(EventMsg::ToolExecEnd { .. }) => {
+                    let _ = tui_tx.send(AppEvent::ToolExecEnd);
                 }
                 Ok(EventMsg::SessionList(meta_list)) => {
                     let _ = tui_tx.send(AppEvent::SessionList(meta_list));
@@ -155,13 +128,14 @@ pub(crate) fn spawn_event_bridge(
                     tool_name,
                     args_summary,
                     reason,
-                    ..
+                    risk_level,
                 }) => {
                     let _ = tui_tx.send(AppEvent::PermissionRequest {
                         request_id,
                         tool_name,
                         args_summary,
                         reason,
+                        risk_level,
                     });
                 }
                 Ok(EventMsg::PermissionResolved {
@@ -178,3 +152,7 @@ pub(crate) fn spawn_event_bridge(
         }
     })
 }
+
+#[cfg(test)]
+#[path = "bridge_tests.rs"]
+mod tests;

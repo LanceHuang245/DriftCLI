@@ -59,31 +59,16 @@ pub enum AppEvent {
         name: String,
         config: LlmConfig,
     },
-    // Tool call started with id and name
+    // Tool call started; only its name is needed for the transient status bar.
     ToolCallStart {
-        id: String,
         name: String,
-    },
-    // Tool call arguments streaming
-    ToolCallArgs {
-        id: String,
-        delta: String,
-    },
-    // Tool call completed
-    ToolCallEnd {
-        id: String,
     },
     // Tool execution started
     ToolExecStart {
-        id: String,
         name: String,
     },
-    // Tool execution finished with result summary
-    ToolExecEnd {
-        id: String,
-        name: String,
-        success: bool,
-    },
+    // Tool execution finished; the next model pass may begin.
+    ToolExecEnd,
     // Carry session metadata arrays back to TUI for /sessions modal list
     SessionList(Vec<drift_storage::SessionMeta>),
     // Signal TUI that a specific session has been reconstructed from store
@@ -97,6 +82,7 @@ pub enum AppEvent {
         tool_name: String,
         args_summary: String,
         reason: String,
+        risk_level: String,
     },
     // Permission was granted or denied.
     PermissionResolved {
@@ -171,10 +157,8 @@ pub struct TuiApp {
     messages: Vec<ChatMessage>,
     current_response: String,
     current_reasoning: String,
-    current_reasoning_duration: Option<u64>,
     reasoning_start_time: Option<Instant>,
     current_reasoning_collapsed: bool,
-    current_thinking_tools: Vec<String>,
     reasoning_header_positions: Vec<(ReasoningTarget, usize)>,
     total_chat_lines: usize,
     input_buffer: String,
@@ -226,10 +210,8 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub reasoning: Option<String>,
-    pub thinking: bool,
     pub reasoning_duration_ms: Option<u64>,
     pub reasoning_collapsed: bool,
-    pub thinking_tools: Vec<String>,
 }
 
 impl TuiApp {
@@ -247,10 +229,8 @@ impl TuiApp {
             messages: Vec::new(),
             current_response: String::new(),
             current_reasoning: String::new(),
-            current_reasoning_duration: None,
             reasoning_start_time: None,
             current_reasoning_collapsed: true,
-            current_thinking_tools: Vec::new(),
             reasoning_header_positions: Vec::new(),
             total_chat_lines: 0,
             input_buffer: String::new(),

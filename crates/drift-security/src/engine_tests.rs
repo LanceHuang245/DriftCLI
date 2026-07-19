@@ -89,3 +89,41 @@ fn read_only_boundary_survives_disabled_approval_checks() {
         ));
     }
 }
+
+#[test]
+fn default_profile_allows_common_workspace_tools() {
+    let config = SecurityConfig::default();
+    let mut engine = PermissionEngine::new(&config, "default");
+
+    for (tool, args) in [
+        ("write", serde_json::json!({ "filePath": "src/new.rs" })),
+        ("edit", serde_json::json!({ "filePath": "src/lib.rs" })),
+        (
+            "bash",
+            serde_json::json!({ "command": "mkdir -p target/tmp" }),
+        ),
+    ] {
+        assert!(
+            matches!(
+                engine.check_tool_permission(tool, &args),
+                PermissionDecision::Allowed { .. }
+            ),
+            "{tool} should run without a permission prompt inside the workspace"
+        );
+    }
+}
+
+#[test]
+fn default_profile_keeps_sensitive_operations_gated() {
+    let config = SecurityConfig::default();
+    let mut engine = PermissionEngine::new(&config, "default");
+
+    assert!(matches!(
+        engine.check_tool_permission("write", &serde_json::json!({ "filePath": ".env" })),
+        PermissionDecision::Denied { .. }
+    ));
+    assert!(is_ask(engine.check_tool_permission(
+        "bash",
+        &serde_json::json!({ "command": "git push origin main" })
+    )));
+}

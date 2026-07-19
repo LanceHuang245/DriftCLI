@@ -211,6 +211,154 @@ impl tokio_stream::Stream for EmptyStream {
     }
 }
 
+// Finite chunk stream used to script complete multi-request agent turns.
+struct ChunkStream(std::collections::VecDeque<Result<LlmChunk, LlmError>>);
+
+impl tokio_stream::Stream for ChunkStream {
+    type Item = Result<LlmChunk, LlmError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.0.pop_front())
+    }
+}
+
+// Provider fixture that first calls a tool, then stays silent, then summarizes on forced finalization.
+struct ScriptedTurnProvider {
+    responses: std::sync::Mutex<std::collections::VecDeque<Vec<LlmChunk>>>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(bool, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for ScriptedTurnProvider {
+    fn provider_id(&self) -> &str {
+        "scripted"
+    }
+
+    fn model_name(&self) -> &str {
+        "scripted"
+    }
+
+    fn context_window(&self) -> usize {
+        128_000
+    }
+
+    async fn stream_chat(
+        &self,
+        _messages: Vec<LlmMessage>,
+        system_prompt: Option<String>,
+        _temperature: Option<f64>,
+        _max_output_tokens: Option<usize>,
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> Result<drift_llm::LlmResponseStream, LlmError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((tools.is_some(), system_prompt.unwrap_or_default()));
+        let chunks = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected provider request");
+        Ok(drift_llm::LlmResponseStream::new(ChunkStream(
+            chunks.into_iter().map(Ok).collect(),
+        )))
+    }
+}
+
+// Verify a tool turn cannot silently finish when the provider's first follow-up is empty.
+#[tokio::test]
+async fn tool_turn_forces_a_user_facing_final_response() {
+    let root = std::env::temp_dir().join(format!("drift-final-response-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut config = AppConfig::load_for_workspace(&root, None, None, None).unwrap();
+    config.agent.max_iterations = 2;
+    config.agent.auto_compaction = false;
+    let permission_engine = PermissionEngine::new(&config.security, "default");
+    let file_access = std::sync::Arc::new(permission_engine.file_access_guard(&root).unwrap());
+    let network = std::sync::Arc::new(permission_engine.network_guard());
+    let process_sandbox =
+        std::sync::Arc::new(ProcessSandbox::new(permission_engine.sandbox_mode(), &root).unwrap());
+    let session_store =
+        std::sync::Arc::new(drift_storage::SessionStore::new(root.join("store")).unwrap());
+    let (session_id, _) = session_store
+        .create(root.to_string_lossy().as_ref(), "scripted")
+        .unwrap();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedTurnProvider {
+        responses: std::sync::Mutex::new(
+            vec![
+                vec![
+                    LlmChunk::ToolCallStart {
+                        id: "call-1".into(),
+                        name: "todowrite".into(),
+                    },
+                    LlmChunk::ToolCallArgs {
+                        id: "call-1".into(),
+                        delta: r#"{"todos":[]}"#.into(),
+                    },
+                    LlmChunk::ToolCallEnd {
+                        id: "call-1".into(),
+                    },
+                    LlmChunk::Done,
+                ],
+                vec![LlmChunk::Done],
+                vec![
+                    LlmChunk::TextDelta("Task completed and verified.".into()),
+                    LlmChunk::Done,
+                ],
+            ]
+            .into(),
+        ),
+        requests: requests.clone(),
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register_builtin(std::sync::Arc::new(
+        drift_tools::tools::todowrite::TodoWriteTool,
+    ));
+    let (event_tx, _) = broadcast::channel(64);
+    let mut agent = Agent {
+        config,
+        llm: Box::new(provider),
+        tool_registry: std::sync::Arc::new(registry),
+        permission_engine,
+        permission_rx: None,
+        event_tx,
+        context: ContextManager::new(128_000, 0.75, 0.4),
+        cwd: root.clone(),
+        session_id,
+        session_store: session_store.clone(),
+        file_access,
+        network,
+        process_sandbox,
+    };
+    let mut events = agent.subscribe();
+
+    agent.submit("update the task".into()).await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[2].0, "forced finalization must disable tools");
+    assert!(requests[2].1.contains("final user-facing handoff"));
+    drop(requests);
+    let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(emitted.iter().any(
+        |event| matches!(event, EventMsg::Token(text) if text == "Task completed and verified.")
+    ));
+    assert!(emitted.iter().any(|event| matches!(event, EventMsg::Done)));
+    let stored = session_store.read_events(session_id).unwrap();
+    assert!(stored.iter().any(|event| matches!(
+        event,
+        drift_storage::SessionEvent::Message { role, content, .. }
+            if role == "assistant" && content == "Task completed and verified."
+    )));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 // Provider fixture that fails during summary generation without network access.
 struct FailingSummaryProvider;
 

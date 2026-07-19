@@ -53,10 +53,13 @@ impl TuiApp {
             "/quit" | "/exit" => {
                 self.should_quit = true;
             }
-            // Clear all chat messages and the in-progress response.
+            // Clear both committed history and every transient turn accumulator.
             "/clear" => {
                 self.messages.clear();
                 self.current_response.clear();
+                self.current_reasoning.clear();
+                self.reasoning_start_time = None;
+                self.current_reasoning_collapsed = true;
             }
             // Unknown command — show a help message.
             _ => {
@@ -67,10 +70,8 @@ impl TuiApp {
                         cmd
                     ),
                     reasoning: None,
-                    thinking: false,
                     reasoning_duration_ms: None,
                     reasoning_collapsed: false,
-                    thinking_tools: Vec::new(),
                 });
             }
         }
@@ -318,40 +319,28 @@ impl TuiApp {
                         role: "assistant".into(),
                         content: text,
                         reasoning: None,
-                        thinking: false,
                         reasoning_duration_ms: None,
                         reasoning_collapsed: false,
-                        thinking_tools: Vec::new(),
                     });
                 } else if let Some(last) = self.messages.last_mut() {
-                    if last.role == "assistant" {
+                    if last.role == "assistant" && last.reasoning.is_none() {
                         last.content = self.current_response.clone();
                     }
                 }
                 self.status_text = "Generating...".into();
             }
-            // Accumulate reasoning/thinking text (displayed as dim text in response).
+            // A reasoning delta always belongs to the current independent thinking phase.
             AppEvent::Reasoning(text) => {
-                if self.reasoning_start_time.is_none() {
+                if self.current_reasoning.is_empty() {
                     self.reasoning_start_time = Some(Instant::now());
+                    self.current_reasoning_collapsed = false;
                 }
                 self.current_reasoning.push_str(&text);
+                self.status_text = "Thinking...".into();
             }
-            // Reasoning/thinking phase completed — accumulate elapsed time
-            // across multiple tool-call iterations so the total thinking
-            // time reflects all bursts within the same submit.
-            // Uses max(self timer, agent duration) to prevent the live
-            // timer from visually backtracking when the agent's measured
-            // duration arrives slightly behind the TUI's own elapsed.
+            // Complete and persist this phase before a tool or response begins.
             AppEvent::ReasoningComplete { duration_ms } => {
-                let prev = self.current_reasoning_duration.unwrap_or(0);
-                let burst = self
-                    .reasoning_start_time
-                    .take()
-                    .map(|start| start.elapsed().as_millis() as u64)
-                    .unwrap_or(duration_ms)
-                    .max(duration_ms);
-                self.current_reasoning_duration = Some(prev + burst);
+                self.finish_current_reasoning(Some(duration_ms));
             }
             // Update the status bar text directly.
             AppEvent::AgentStatus(status) => {
@@ -370,22 +359,20 @@ impl TuiApp {
                         role: "system".into(),
                         content: format!("Error: {}", msg),
                         reasoning: None,
-                        thinking: false,
                         reasoning_duration_ms: None,
                         reasoning_collapsed: false,
-                        thinking_tools: Vec::new(),
                     });
                     self.status_text = "Error".into();
                 }
             }
             // Response streaming complete — finalize the message and reset.
             AppEvent::Done => {
-                self.commit_current_response(false);
+                self.finish_current_turn();
                 self.status_text = "Idle".into();
             }
             // Keep any partial response visible, but return the TUI to an idle state.
             AppEvent::Interrupted => {
-                self.commit_current_response(true);
+                self.finish_current_turn();
                 self.status_text = "Interrupted".into();
             }
             // Received model list — populate the dropdown in connect mode.
@@ -419,36 +406,19 @@ impl TuiApp {
                 self.connect_form = connect::ConnectForm::from_entry(&name, &config);
                 self.mode = TuiMode::ConnectSettings;
             }
-            // Tool call requested by LLM — update status, but keep current_reasoning
-            // accumulating so that multiple tool-call iterations (OpenAI Compatible,
-            // Anthropic extended thinking) produce a single unified thinking block.
-            AppEvent::ToolCallStart { name, .. } => {
+            // Tool details are transient: close the current blocks and use only the status bar.
+            AppEvent::ToolCallStart { name } => {
+                self.finish_current_reasoning(None);
+                self.finish_current_response_segment();
                 self.status_text = format!("Calling tool: {}", name);
-                self.current_thinking_tools
-                    .push(format!("> Calling tool: {}", name));
             }
-            // Tool call args streaming — not surfaced to TUI yet.
-            AppEvent::ToolCallArgs { .. } => {}
-            // Tool call complete — no UI action needed.
-            AppEvent::ToolCallEnd { .. } => {}
             // Tool execution started.
-            AppEvent::ToolExecStart { name, .. } => {
+            AppEvent::ToolExecStart { name } => {
                 self.status_text = format!("Running: {}", name);
-                self.current_thinking_tools
-                    .push(format!("> Running: {}", name));
             }
-            // Tool execution finished — update status with result.
-            AppEvent::ToolExecEnd { name, success, .. } => {
-                self.status_text = if success {
-                    format!("Tool {} completed", name)
-                } else {
-                    format!("Tool {} failed", name)
-                };
-                self.current_thinking_tools.push(format!(
-                    "> Tool {} {}",
-                    name,
-                    if success { "completed" } else { "failed" }
-                ));
+            // Once execution ends, the agent is preparing the next model pass.
+            AppEvent::ToolExecEnd => {
+                self.status_text = "Thinking...".into();
             }
             AppEvent::SessionList(meta_list) => {
                 self.session_list = meta_list;
@@ -467,7 +437,7 @@ impl TuiApp {
                 self.messages = messages;
                 self.current_response.clear();
                 self.current_reasoning.clear();
-                self.current_thinking_tools.clear();
+                self.reasoning_start_time = None;
                 self.chat_scroll_offset = 0;
                 self.status_text = format!("Loaded session {}", &session_id.to_string()[..8]);
                 self.mode = TuiMode::Normal;
@@ -477,7 +447,7 @@ impl TuiApp {
                 tool_name,
                 args_summary,
                 reason,
-                ..
+                risk_level,
             } => {
                 // Set the interactive permission prompt — blocks normal input until resolved.
                 self.permission_prompt = Some(PermissionPromptState {
@@ -485,7 +455,7 @@ impl TuiApp {
                     tool_name,
                     args_summary,
                     reason,
-                    risk_level: "medium".into(),
+                    risk_level,
                 });
                 // Also push a system message so it appears in the chat transcript.
                 let msg = format!(
@@ -498,10 +468,8 @@ impl TuiApp {
                     role: "system".into(),
                     content: msg,
                     reasoning: None,
-                    thinking: false,
                     reasoning_duration_ms: None,
                     reasoning_collapsed: false,
-                    thinking_tools: Vec::new(),
                 });
             }
             AppEvent::PermissionResolved { .. } => {
@@ -509,35 +477,56 @@ impl TuiApp {
             }
         }
     }
-    // Save the current in-progress response as a complete message and clear for the next turn.
-    pub(super) fn commit_current_response(&mut self, is_thinking: bool) {
-        if !self.current_response.is_empty() || !self.current_reasoning.is_empty() {
-            if let Some(last) = self.messages.last_mut() {
-                if last.role == "assistant" {
-                    last.content = self.current_response.clone();
-                    if !self.current_reasoning.is_empty() {
-                        last.reasoning = Some(self.current_reasoning.clone());
-                    }
-                    last.reasoning_duration_ms = {
-                        let accumulated = self.current_reasoning_duration.take().unwrap_or(0);
-                        let remaining = self
-                            .reasoning_start_time
-                            .take()
-                            .map(|start| start.elapsed().as_millis() as u64)
-                            .unwrap_or(0);
-                        Some(accumulated + remaining)
-                    };
-                    last.reasoning_collapsed = self.current_reasoning_collapsed;
-                    last.thinking = is_thinking;
-                    last.thinking_tools = std::mem::take(&mut self.current_thinking_tools);
-                }
-            }
-            self.current_response.clear();
-            self.current_reasoning.clear();
-            self.current_thinking_tools.clear();
-            self.current_reasoning_collapsed = true;
-            self.current_reasoning_duration = None;
+    // Start a user turn without mutating any completed thinking history.
+    pub(super) fn begin_user_turn(&mut self, text: String) {
+        self.finish_current_turn();
+        if self.history.last() != Some(&text) {
+            self.history.push(text.clone());
         }
+        self.messages.push(ChatMessage {
+            role: "user".into(),
+            content: text.clone(),
+            reasoning: None,
+            reasoning_duration_ms: None,
+            reasoning_collapsed: false,
+        });
+        self.chat_scroll_offset = 0;
+        self.selection.clear();
+        self.status_text = "Waiting...".into();
+        let _ = self.cmd_tx.send(TuiCommand::Chat(text));
+    }
+
+    // Persist a completed thinking phase as its own chat block and reset its timer.
+    fn finish_current_reasoning(&mut self, duration_hint: Option<u64>) {
+        let elapsed = self
+            .reasoning_start_time
+            .take()
+            .map(|start| start.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        if self.current_reasoning.is_empty() {
+            self.current_reasoning_collapsed = true;
+            return;
+        }
+        let duration_ms = elapsed.max(duration_hint.unwrap_or(0));
+        self.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning: Some(std::mem::take(&mut self.current_reasoning)),
+            reasoning_duration_ms: Some(duration_ms),
+            reasoning_collapsed: true,
+        });
+        self.current_reasoning_collapsed = true;
+    }
+
+    // The streamed text already lives in its message; only its live accumulator is transient.
+    fn finish_current_response_segment(&mut self) {
+        self.current_response.clear();
+    }
+
+    // Flush any live blocks when a turn completes or a new user turn begins.
+    fn finish_current_turn(&mut self) {
+        self.finish_current_reasoning(None);
+        self.finish_current_response_segment();
     }
 
     // Render the full TUI frame: content area, input line, and status bar.
